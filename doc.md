@@ -1,13 +1,15 @@
 
-https://mermaid.live/edit#pako:eNqFk0uP2jAUhf-KZbYBQd64UiUGGJWKtmgy6qJJF258HaImduQ4MzCI_94k5lWpQ6Ms7rW_c2yfxAecSgaY4OFwmAid6wIImqmsqdFaZmijZAp1nYsMRaBe8hTQpzzbojW8QJGIXsQL-ZpuqdLoeZEI1D6zuNM-5gWglaga_ZMQkncFGg4_ood-dkNVDaqbqfrKKB96Yn7Wa1B1h_C-NMi8RxbxLMsUZFRLg9BLa7BFjy3jp2X0jGabFXqCupKiBkNXeSIMuOzBx0k8X69Q1JQlVfsOkY1ud_wXY8efo29f0XJXSaXfYZx4Hn3_B5KItKB1vQCOTBTtmQqCBmkKHudWrZX83UY_cJwp5eNTP3zNmd4SZFe7DzcGJjHjMGAuMEavBnZIA9e7b2DyPBlwzp2UXQ04Tyfj4L7BNe3zOcBmU-5cXXzu2unkPy5VfpZzDt4v92YTLICJe19uor04hCy4zYGljvdODtjCJaiS5qz98Q_d50uw3kIJCSZtyYDTptAJTsSxRWmjZbQXKSZaNWBhJZtsiwmnRd12TcWohkVOM0XLy2hFxQ8py7OkbTE54B0mzng6Cv3QDmzf88bTwLfwHpPAGfm2Ow09v32D0J4cLfzW68ejMPAsDCxvs_5irmp_Yy2cqW7_pwUVCAZqLhuh20Xc8PgH8FBBDQ
+[Link](https://mermaid.live/edit#pako:eNqFk0uP2jAUhf-KZbYBQd64UiUGGJWKtmgy6qJJF258HaImduQ4MzCI_94k5lWpQ6Ms7rW_c2yfxAecSgaY4OFwmAid6wIImqmsqdFaZmijZAp1nYsMRaBe8hTQpzzbojW8QJGIXsQL-ZpuqdLoeZEI1D6zuNM-5gWglaga_ZMQkncFGg4_ood-dkNVDaqbqfrKKB96Yn7Wa1B1h_C-NMi8RxbxLMsUZFRLg9BLa7BFjy3jp2X0jGabFXqCupKiBkNXeSIMuOzBx0k8X69Q1JQlVfsOkY1ud_wXY8efo29f0XJXSaXfYZx4Hn3_B5KItKB1vQCOTBTtmQqCBmkKHudWrZX83UY_cJwp5eNTP3zNmd4SZFe7DzcGJjHjMGAuMEavBnZIA9e7b2DyPBlwzp2UXQ04Tyfj4L7BNe3zOcBmU-5cXXzu2unkPy5VfpZzDt4v92YTLICJe19uor04hCy4zYGljvdODtjCJaiS5qz98Q_d50uw3kIJCSZtyYDTptAJTsSxRWmjZbQXKSZaNWBhJZtsiwmnRd12TcWohkVOM0XLy2hFxQ8py7OkbTE54B0mzng6Cv3QDmzf88bTwLfwHpPAGfm2Ow09v32D0J4cLfzW68ejMPAsDCxvs_5irmp_Yy2cqW7_pwUVCAZqLhuh20Xc8PgH8FBBDQ)
 
 
 ## Parse Logs
 
+```bash
 curl --location 'http://localhost:9000/api/v1/logs/parse?file=src%2Fmain%2Fresources%2Flogs%2Fapp.json'
+```
 
 ### Response
-
+```json
 [
     {
         "timestamp": "2025-09-19T22:21:35.306482Z",
@@ -34,9 +36,11 @@ curl --location 'http://localhost:9000/api/v1/logs/parse?file=src%2Fmain%2Fresou
         }
     }
 ]
+```
 
 ## Filter logs
 
+```bash
 curl --location 'http://localhost:9000/api/v1/logs/filter' \
 --header 'Content-Type: application/json' \
 --data '{
@@ -46,9 +50,10 @@ curl --location 'http://localhost:9000/api/v1/logs/filter' \
   "levels": ["ERROR"],
   "regex": "/api/orders"
 }'
+```
 
 ### Response
-
+```json
 [
     {
         "timestamp": "2025-09-19T23:17:10.340412Z",
@@ -63,18 +68,21 @@ curl --location 'http://localhost:9000/api/v1/logs/filter' \
         }
     }
 ]
+```
 
 ## Aggregate V1 Logs
 
+```bash
 curl --location 'http://localhost:9000/api/v1/logs/aggregate' \
 --header 'Content-Type: application/json' \
 --data '{
   "file": "src/main/resources/logs/app.json",
   "topN": 5
 }'
+```
 
 ### Response
-
+```json
 {
     "errorRate": [
         {
@@ -117,17 +125,20 @@ curl --location 'http://localhost:9000/api/v1/logs/aggregate' \
         "WARN": 6373
     }
 }
+```
 
 ## Aggregate V2 Logs
-
+```bash
 curl --location 'http://localhost:9000/api/v1/logs/aggregateV2' \
 --header 'Content-Type: application/json' \
 --data '{
   "file": "src/main/resources/logs/app.json",
   "topN": 5
 }'
+```
 
 ### Response
+```json
 {
     "totalLogs": 25000,
     "byLevel": {
@@ -165,16 +176,20 @@ curl --location 'http://localhost:9000/api/v1/logs/aggregateV2' \
         }
     ]
 }
+```
 
 ## Export to CSV endpoint
 
+```bash
 curl --location 'http://localhost:9000/api/v1/logs/export/csv' \
 --header 'Content-Type: application/json' \
 --data '{
   "file": "src/main/resources/logs/app.json"
 }'
+```
 
 ### Response
+```csv
 "minute","total","errors","errorRate"
 "2025-09-19T04:50:00Z","2","1","0.5"
 "2025-09-19T04:51:00Z","5","1","0.2"
@@ -186,17 +201,20 @@ curl --location 'http://localhost:9000/api/v1/logs/export/csv' \
 "2025-09-19T04:57:00Z","13","5","0.38461538461538464"
 "2025-09-19T04:58:00Z","18","5","0.2777777777777778"
 "2025-09-19T04:59:00Z","9","3","0.3333333333333333"
+```
 
 ## CLI Summary
 
+```bash
 curl --location 'http://localhost:9000/api/v1/logs/cli-summary' \
 --header 'Content-Type: application/json' \
 --data '{
   "file": "src/main/resources/logs/app.json"
 }'
+```
 
 ### Response for CLI Summary (Log Level Type - ERROR)
-
+```text
 Total    Level    Time Range
 210      ERROR    logs between 2025-09-20T04:00:00Z–2025-09-20T04:00:00Z:59
 235      ERROR    logs between 2025-09-20T03:00:00Z–2025-09-20T03:00:00Z:59
@@ -227,3 +245,4 @@ Total    Level    Time Range
 203      ERROR    logs between 2025-09-19T20:00:00Z–2025-09-19T20:00:00Z:59
 205      ERROR    logs between 2025-09-19T22:00:00Z–2025-09-19T22:00:00Z:59
 245      ERROR    logs between 2025-09-19T23:00:00Z–2025-09-19T23:00:00Z:59
+```
