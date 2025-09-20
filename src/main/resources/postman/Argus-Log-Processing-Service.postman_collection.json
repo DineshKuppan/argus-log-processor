@@ -1,0 +1,255 @@
+{
+	"info": {
+		"_postman_id": "efed95d9-deb2-4066-8f39-bec7e8edb1b2",
+		"name": "Argus Log Processing Service",
+		"description": "Postman collection for Argus Web APIs (parse, filter, aggregate, export)",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "23539412"
+	},
+	"item": [
+		{
+			"name": "Parse Logs",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "http://localhost:9000/api/v1/logs/parse?file={{filePath}}",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "9000",
+					"path": [
+						"api",
+						"v1",
+						"logs",
+						"parse"
+					],
+					"query": [
+						{
+							"key": "file",
+							"value": "{{filePath}}"
+						}
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Filter Logs",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"file\": \"{{filePath}}\",\n  \"from\": \"2025-09-19T23:00:00Z\",\n  \"to\": \"2025-09-19T23:29:59.689027Z\",\n  \"levels\": [\"ERROR\"],\n  \"regex\": \"/api/orders\"\n}"
+				},
+				"url": {
+					"raw": "http://localhost:9000/api/v1/logs/filter",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "9000",
+					"path": [
+						"api",
+						"v1",
+						"logs",
+						"filter"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Aggregate Logs",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"file\": \"{{filePath}}\",\n  \"topN\": 5\n}"
+				},
+				"url": {
+					"raw": "http://localhost:9000/api/v1/logs/aggregate",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "9000",
+					"path": [
+						"api",
+						"v1",
+						"logs",
+						"aggregate"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Aggregate Logs V2",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"file\": \"{{filePath}}\",\n  \"topN\": 5\n}"
+				},
+				"url": {
+					"raw": "http://localhost:9000/api/v1/logs/aggregateV2",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "9000",
+					"path": [
+						"api",
+						"v1",
+						"logs",
+						"aggregateV2"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Export JSON",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"file\": \"{{filePath}}\",\n  \"topN\": 3\n}"
+				},
+				"url": {
+					"raw": "http://localhost:9000/api/v1/logs/export/json",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "9000",
+					"path": [
+						"api",
+						"v1",
+						"logs",
+						"export",
+						"json"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Export CSV",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"file\": \"{{filePath}}\"\n}"
+				},
+				"url": {
+					"raw": "http://localhost:9000/api/v1/logs/export/csv",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "9000",
+					"path": [
+						"api",
+						"v1",
+						"logs",
+						"export",
+						"csv"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "CLI Summary",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n  \"file\": \"{{filePath}}\"\n}"
+				},
+				"url": {
+					"raw": "http://localhost:9000/api/v1/logs/cli-summary",
+					"protocol": "http",
+					"host": [
+						"localhost"
+					],
+					"port": "9000",
+					"path": [
+						"api",
+						"v1",
+						"logs",
+						"cli-summary"
+					]
+				}
+			},
+			"response": []
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "filePath",
+			"value": "src/main/resources/logs/app.json"
+		}
+	]
+}

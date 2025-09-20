@@ -1,0 +1,2 @@
+2025-08-21T12:00:00.000000000Z stdout F Application started
+2025-08-21T12:35:05.000000000Z stderr F NullPointerException in OrderService
