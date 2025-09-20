@@ -1,5 +1,39 @@
+# Documentation
 
-[Link](https://mermaid.live/edit#pako:eNqFk0uP2jAUhf-KZbYBQd64UiUGGJWKtmgy6qJJF258HaImduQ4MzCI_94k5lWpQ6Ms7rW_c2yfxAecSgaY4OFwmAid6wIImqmsqdFaZmijZAp1nYsMRaBe8hTQpzzbojW8QJGIXsQL-ZpuqdLoeZEI1D6zuNM-5gWglaga_ZMQkncFGg4_ood-dkNVDaqbqfrKKB96Yn7Wa1B1h_C-NMi8RxbxLMsUZFRLg9BLa7BFjy3jp2X0jGabFXqCupKiBkNXeSIMuOzBx0k8X69Q1JQlVfsOkY1ud_wXY8efo29f0XJXSaXfYZx4Hn3_B5KItKB1vQCOTBTtmQqCBmkKHudWrZX83UY_cJwp5eNTP3zNmd4SZFe7DzcGJjHjMGAuMEavBnZIA9e7b2DyPBlwzp2UXQ04Tyfj4L7BNe3zOcBmU-5cXXzu2unkPy5VfpZzDt4v92YTLICJe19uor04hCy4zYGljvdODtjCJaiS5qz98Q_d50uw3kIJCSZtyYDTptAJTsSxRWmjZbQXKSZaNWBhJZtsiwmnRd12TcWohkVOM0XLy2hFxQ8py7OkbTE54B0mzng6Cv3QDmzf88bTwLfwHpPAGfm2Ow09v32D0J4cLfzW68ejMPAsDCxvs_5irmp_Yy2cqW7_pwUVCAZqLhuh20Xc8PgH8FBBDQ)
+
+## Architecture Diagram
+
+### High Level Design of Argus Log Processing Service
+
+![alt text](assets/log-processing-framework-high-level-design.png)
+
+[Mermaid Link](https://mermaid.live/edit#pako:eNqFk0uP2jAUhf-KZbYBQd64UiUGGJWKtmgy6qJJF258HaImduQ4MzCI_94k5lWpQ6Ms7rW_c2yfxAecSgaY4OFwmAid6wIImqmsqdFaZmijZAp1nYsMRaBe8hTQpzzbojW8QJGIXsQL-ZpuqdLoeZEI1D6zuNM-5gWglaga_ZMQkncFGg4_ood-dkNVDaqbqfrKKB96Yn7Wa1B1h_C-NMi8RxbxLMsUZFRLg9BLa7BFjy3jp2X0jGabFXqCupKiBkNXeSIMuOzBx0k8X69Q1JQlVfsOkY1ud_wXY8efo29f0XJXSaXfYZx4Hn3_B5KItKB1vQCOTBTtmQqCBmkKHudWrZX83UY_cJwp5eNTP3zNmd4SZFe7DzcGJjHjMGAuMEavBnZIA9e7b2DyPBlwzp2UXQ04Tyfj4L7BNe3zOcBmU-5cXXzu2unkPy5VfpZzDt4v92YTLICJe19uor04hCy4zYGljvdODtjCJaiS5qz98Q_d50uw3kIJCSZtyYDTptAJTsSxRWmjZbQXKSZaNWBhJZtsiwmnRd12TcWohkVOM0XLy2hFxQ8py7OkbTE54B0mzng6Cv3QDmzf88bTwLfwHpPAGfm2Ow09v32D0J4cLfzW68ejMPAsDCxvs_5irmp_Yy2cqW7_pwUVCAZqLhuh20Xc8PgH8FBBDQ)
+```mermaid
+---
+title: Argus Log Processing Service High Level
+---
+flowchart TD
+    A[Log File Input]:::input --> B[Log Parser]:::parser
+    B --> C[Log Filters]:::filter
+    C --> D[Aggregators]:::aggregator
+    D --> E[REST API Responses]:::api
+
+    E --> F1[CLI Summary]:::output
+    E --> F2[JSON Export]:::output
+    E --> F3[CSV Export]:::output
+
+classDef input fill: #cce5ff,stroke: #339af0,stroke-width: 2px;
+classDef parser fill:#d4edda,stroke: #28a745,stroke-width: 2px;
+classDef filter fill:#fff3cd,stroke: #ffc107,stroke-width: 2px;
+classDef aggregator fill: #e2d9f3,stroke: #6f42c1,stroke-width: 2px;
+classDef api fill: #ffe5b4,stroke: #fd7e14,stroke-width: 2px;
+classDef output fill: #f8d7da,stroke: #dc3545,stroke-width: 2px;
+```
+
+# Argus Log Processing Service API Documentation
+
+Swagger UI - [http://localhost:9000/swagger-ui.html](http://localhost:9000/swagger-ui.html)
+![alt text](assets/swagger-rest-api.png)
 
 
 ## Parse Logs
