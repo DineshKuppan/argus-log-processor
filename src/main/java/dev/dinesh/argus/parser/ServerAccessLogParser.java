@@ -14,7 +14,8 @@ public class ServerAccessLogParser implements LogParser {
 
   private static final Pattern P =
       Pattern.compile(
-          "^(\\S+) \\S+ \\S+ \\[(.+?)] \"(.+?)\" (\\d{3}) (\\d+|-) \"(.*?)\" \"(.*?)\"$");
+          "^(\\S+) (\\S+) (\\S+) \\[([^\\]]+)] \"([^\"]*)\" (\\d{3}) (\\d+|-) \"([^\"]*)\" \"([^\"]*)\"$");
+
   private static final DateTimeFormatter DTF =
       DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z");
 
@@ -30,12 +31,12 @@ public class ServerAccessLogParser implements LogParser {
       throw new IllegalArgumentException("Bad access line");
     }
     String ip = m.group(1);
-    Instant ts = OffsetDateTime.parse(m.group(2), DTF).toInstant();
-    String req = m.group(3);
-    int status = Integer.parseInt(m.group(4));
-    String bytes = m.group(5);
-    String ref = m.group(6);
-    String ua = m.group(7);
+    Instant ts = OffsetDateTime.parse(m.group(4), DTF).toInstant();
+    String req = m.group(5);
+    int status = Integer.parseInt(m.group(6));
+    String bytes = m.group(7);
+    String ref = m.group(8);
+    String ua = m.group(9);
 
     return new LogRecord(
         ts, null, req, Map.of("ip", ip, "status", status, "bytes", bytes, "ref", ref, "ua", ua));

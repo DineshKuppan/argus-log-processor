@@ -30,6 +30,9 @@ public class KeyValueLogParser implements LogParser {
       }
       map.put(k, v);
     }
+    if (map.isEmpty()) {
+      throw new IllegalArgumentException("Invalid key-value log line: " + line);
+    }
     Instant ts =
         map.containsKey("timestamp") ? Instant.parse((String) map.get("timestamp")) : Instant.EPOCH;
     String lvl = (String) map.getOrDefault("level", null);
