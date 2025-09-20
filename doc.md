@@ -5,7 +5,7 @@
 
 ### High Level Design of Argus Log Processing Service
 
-![alt text](assets/log-processing-framework-high-level-design.png)
+<img src="assets/log-processing-framework-high-level-design.png" alt="Log Processing Diagram" style="border:2px solid #333; border-radius:8px; width:400px;">
 
 ### Mermaid Diagram
 [Mermaid Link](https://mermaid.live/edit#pako:eNqFk0uP2jAUhf-KZbYBQd64UiUGGJWKtmgy6qJJF258HaImduQ4MzCI_94k5lWpQ6Ms7rW_c2yfxAecSgaY4OFwmAid6wIImqmsqdFaZmijZAp1nYsMRaBe8hTQpzzbojW8QJGIXsQL-ZpuqdLoeZEI1D6zuNM-5gWglaga_ZMQkncFGg4_ood-dkNVDaqbqfrKKB96Yn7Wa1B1h_C-NMi8RxbxLMsUZFRLg9BLa7BFjy3jp2X0jGabFXqCupKiBkNXeSIMuOzBx0k8X69Q1JQlVfsOkY1ud_wXY8efo29f0XJXSaXfYZx4Hn3_B5KItKB1vQCOTBTtmQqCBmkKHudWrZX83UY_cJwp5eNTP3zNmd4SZFe7DzcGJjHjMGAuMEavBnZIA9e7b2DyPBlwzp2UXQ04Tyfj4L7BNe3zOcBmU-5cXXzu2unkPy5VfpZzDt4v92YTLICJe19uor04hCy4zYGljvdODtjCJaiS5qz98Q_d50uw3kIJCSZtyYDTptAJTsSxRWmjZbQXKSZaNWBhJZtsiwmnRd12TcWohkVOM0XLy2hFxQ8py7OkbTE54B0mzng6Cv3QDmzf88bTwLfwHpPAGfm2Ow09v32D0J4cLfzW68ejMPAsDCxvs_5irmp_Yy2cqW7_pwUVCAZqLhuh20Xc8PgH8FBBDQ)
@@ -33,9 +33,9 @@ classDef output fill: #f8d7da,stroke: #dc3545,stroke-width: 2px;
 
 # Argus Log Processing Service API Documentation
 
-Swagger UI - [http://localhost:9000/swagger-ui.html](http://localhost:9000/swagger-ui.html)
-![alt text](assets/swagger-rest-api.png)
+**Swagger UI** [http://localhost:9000/swagger-ui.html](http://localhost:9000/swagger-ui.html)
 
+<img src="assets/swagger-rest-api.png" alt="Swagger Documentation" style="border:2px solid #333; border-radius:8px; width:400px;">
 
 ## Parse Logs
 
