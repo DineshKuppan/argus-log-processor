@@ -3,7 +3,7 @@ package dev.dinesh.argus.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.opencsv.CSVWriter;
 import dev.dinesh.argus.aggregate.impl.CountByLevelAggregator;
-import dev.dinesh.argus.aggregate.impl.ErrorRateAggregator;
+import dev.dinesh.argus.aggregate.impl.DurationAggregator;
 import dev.dinesh.argus.aggregate.impl.TopNEndpointsAggregator;
 import dev.dinesh.argus.filter.FilterSpec;
 import dev.dinesh.argus.filter.LogFilter;
@@ -11,6 +11,10 @@ import dev.dinesh.argus.model.LogRecord;
 import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -18,6 +22,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.Predicate;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
@@ -78,9 +83,7 @@ public class LogService {
   }
 
   private List<String> readLines(String filePath) throws Exception {
-    log.info("parsing file: {}", filePath);
     Path path = Path.of(filePath);
-    log.info("Path exists: {}", Files.exists(path));
     long maxSize = maxFileSize > 0 ? maxFileSize : DEFAULT_MAX_FILE_SIZE;
     long fileSize = Files.size(path);
     log.info("File size: {}", formatSmartSize(fileSize));
@@ -94,21 +97,50 @@ public class LogService {
 
   private LogRecord parseLineSafely(String line) {
     try {
-      if (line.trim().startsWith("{")) {
-        Map<String, Object> map = mapper.readValue(line, Map.class);
-        return LogRecord.builder()
-            .timestamp(
-                map.containsKey("timestamp")
-                    ? java.time.Instant.parse((String) map.get("timestamp"))
-                    : java.time.Instant.now())
-            .level((String) map.get("level"))
-            .message((String) map.get("message"))
-            .meta(map)
-            .build();
+      Pattern P =
+          Pattern.compile(
+              "^(\\S+) (\\S+) (\\S+) \\[([^\\]]+)] \"([^\"]*)\" (\\d{3}) (\\d+|-) \"([^\"]*)\" \"([^\"]*)\"$");
+      DateTimeFormatter DTF = DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z");
+      Matcher m = P.matcher(line);
+      if (!m.matches()) {
+        throw new IllegalArgumentException("Bad access line");
       }
+      String ip = m.group(1);
+      Instant ts = OffsetDateTime.parse(m.group(4), DTF).toInstant();
+      String req = m.group(5);
+      int status = Integer.parseInt(m.group(6));
+      String bytes = m.group(7);
+      String ref = m.group(8);
+      String ua = m.group(9);
+      String customName = "";
+      return new LogRecord(
+          ts,
+          levelForStatus(status),
+          req,
+          Map.of(
+              "ip",
+              ip,
+              "status",
+              status,
+              "bytes",
+              bytes,
+              "ref",
+              ref,
+              "ua",
+              ua,
+              "category",
+              customName));
     } catch (Exception ignored) {
     }
     return null;
+  }
+
+  // Access logs carry no level, so derive one from the HTTP status class.
+  private static String levelForStatus(int status) {
+    if (status >= 500) {
+      return "ERROR";
+    }
+    return status >= 400 ? "WARN" : "INFO";
   }
 
   public List<LogRecord> applyFilters(List<LogRecord> logs, List<LogFilter> filters) {
@@ -121,7 +153,8 @@ public class LogService {
     results.put("totalLogs", logs.size());
     results.put("byLevel", new CountByLevelAggregator().compute(logs));
     results.put("topEndpoints", new TopNEndpointsAggregator(topN).compute(logs));
-    results.put("errorRate", new ErrorRateAggregator().compute(logs));
+    // results.put("errorRate", new ErrorRateAggregator().compute(logs));
+    results.put("duration", new DurationAggregator(ChronoUnit.HOURS).compute(logs));
 
     return results;
   }

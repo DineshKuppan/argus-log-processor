@@ -16,8 +16,17 @@ import lombok.extern.slf4j.Slf4j;
 public class DataSeeder {
 
   public static void generate() throws Exception {
-    String filePath = "src/main/resources/logs/app.json";
-    generate(filePath);
+    String filePath = "src/main/resources/logs/nginx_app.log";
+    generateNginxLogs(filePath);
+    //    generate(filePath);
+  }
+
+  public static void main(String[] args) {
+    try {
+      generate();
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
   }
 
   public static void generate(String filePath) throws Exception {

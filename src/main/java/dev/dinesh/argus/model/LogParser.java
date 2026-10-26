@@ -10,5 +10,7 @@ public interface LogParser {
 
   LogRecord parseLine(String line) throws Exception;
 
+  LogRecord parseLine(String line, String pattern) throws Exception;
+
   String name();
 }

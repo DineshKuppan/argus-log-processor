@@ -26,6 +26,11 @@ public class JsonLogParser implements LogParser {
   }
 
   @Override
+  public LogRecord parseLine(String line, String pattern) throws Exception {
+    return null;
+  }
+
+  @Override
   public String name() {
     return "json";
   }
