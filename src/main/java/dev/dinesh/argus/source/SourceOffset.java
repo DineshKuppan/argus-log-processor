@@ -1,5 +1,7 @@
 package dev.dinesh.argus.source;
 
+import java.util.regex.Pattern;
+
 /**
  * Resumable position in a file source.
  *
@@ -9,4 +11,18 @@ package dev.dinesh.argus.source;
  *     null where the filesystem does not expose one
  * @param byteOffset first byte that has not yet been committed
  */
-public record SourceOffset(String sourceId, String path, String fileKey, long byteOffset) {}
+public record SourceOffset(String sourceId, String path, String fileKey, long byteOffset) {
+
+  /** Source ids become file and directory names, so restrict them to prevent path traversal. */
+  private static final Pattern SOURCE_ID = Pattern.compile("[A-Za-z0-9._-]{1,128}");
+
+  public static String requireValidSourceId(String sourceId) {
+    if (sourceId == null
+        || !SOURCE_ID.matcher(sourceId).matches()
+        || sourceId.chars().allMatch(c -> c == '.')) {
+      throw new IllegalArgumentException(
+          "Invalid source id (allowed: 1-128 of A-Z a-z 0-9 . _ -): " + sourceId);
+    }
+    return sourceId;
+  }
+}

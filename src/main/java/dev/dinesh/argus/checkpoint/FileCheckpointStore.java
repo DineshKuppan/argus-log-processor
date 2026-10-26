@@ -11,7 +11,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Optional;
-import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -22,9 +21,6 @@ import org.springframework.stereotype.Component;
 @Slf4j
 @Component
 public class FileCheckpointStore implements CheckpointStore {
-
-  /** Source ids become file names, so restrict them to prevent path traversal. */
-  public static final Pattern SOURCE_ID = Pattern.compile("[A-Za-z0-9._-]{1,128}");
 
   private final Path dir;
   private final ObjectMapper mapper;
@@ -73,9 +69,6 @@ public class FileCheckpointStore implements CheckpointStore {
   }
 
   private Path fileFor(String sourceId) {
-    if (sourceId == null || !SOURCE_ID.matcher(sourceId).matches()) {
-      throw new IllegalArgumentException("Invalid source id: " + sourceId);
-    }
-    return dir.resolve(sourceId + ".json");
+    return dir.resolve(SourceOffset.requireValidSourceId(sourceId) + ".json");
   }
 }
