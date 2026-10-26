@@ -8,12 +8,10 @@ import dev.dinesh.argus.aggregate.impl.TopNEndpointsAggregator;
 import dev.dinesh.argus.filter.FilterSpec;
 import dev.dinesh.argus.filter.LogFilter;
 import dev.dinesh.argus.model.LogRecord;
+import dev.dinesh.argus.parser.LineParser;
 import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
-import java.time.OffsetDateTime;
-import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -22,7 +20,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.Predicate;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
@@ -38,11 +35,16 @@ import org.springframework.stereotype.Service;
 public class LogService {
 
   private final ObjectMapper mapper = new ObjectMapper();
+  private final LineParser lineParser;
 
   @Value("${log.max-file-size}")
   private long maxFileSize;
 
   private static final long DEFAULT_MAX_FILE_SIZE = 50L * 1024 * 1024;
+
+  public LogService(LineParser lineParser) {
+    this.lineParser = lineParser;
+  }
 
   public static String getFileSizeInfo(Path path) throws Exception {
     long bytes = Files.size(path);
@@ -66,7 +68,7 @@ public class LogService {
   public List<LogRecord> parseFile(String filePath) throws Exception {
     return readLines(filePath).stream()
         .filter(l -> !l.isBlank())
-        .map(this::parseLineSafely)
+        .map(lineParser::parse)
         .filter(Objects::nonNull)
         .toList();
   }
@@ -77,7 +79,7 @@ public class LogService {
     return readLines(filePath).stream()
         .filter(l -> !l.isBlank())
         .filter(l -> linePattern.matcher(l).matches())
-        .map(this::parseLineSafely)
+        .map(lineParser::parse)
         .filter(Objects::nonNull)
         .toList();
   }
@@ -93,54 +95,6 @@ public class LogService {
     List<String> lines = Files.readAllLines(path);
     log.info("Total lines: {}", lines.size());
     return lines;
-  }
-
-  private LogRecord parseLineSafely(String line) {
-    try {
-      Pattern P =
-          Pattern.compile(
-              "^(\\S+) (\\S+) (\\S+) \\[([^\\]]+)] \"([^\"]*)\" (\\d{3}) (\\d+|-) \"([^\"]*)\" \"([^\"]*)\"$");
-      DateTimeFormatter DTF = DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z");
-      Matcher m = P.matcher(line);
-      if (!m.matches()) {
-        throw new IllegalArgumentException("Bad access line");
-      }
-      String ip = m.group(1);
-      Instant ts = OffsetDateTime.parse(m.group(4), DTF).toInstant();
-      String req = m.group(5);
-      int status = Integer.parseInt(m.group(6));
-      String bytes = m.group(7);
-      String ref = m.group(8);
-      String ua = m.group(9);
-      String customName = "";
-      return new LogRecord(
-          ts,
-          levelForStatus(status),
-          req,
-          Map.of(
-              "ip",
-              ip,
-              "status",
-              status,
-              "bytes",
-              bytes,
-              "ref",
-              ref,
-              "ua",
-              ua,
-              "category",
-              customName));
-    } catch (Exception ignored) {
-    }
-    return null;
-  }
-
-  // Access logs carry no level, so derive one from the HTTP status class.
-  private static String levelForStatus(int status) {
-    if (status >= 500) {
-      return "ERROR";
-    }
-    return status >= 400 ? "WARN" : "INFO";
   }
 
   public List<LogRecord> applyFilters(List<LogRecord> logs, List<LogFilter> filters) {
