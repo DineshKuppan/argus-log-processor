@@ -27,8 +27,15 @@ public record IngestJobStatus(
   public static IngestJobStatus of(IngestJob job) {
     IngestProgress p = job.progress();
     long toRead = p.totalBytes() - p.startOffset();
-    double percent =
-        toRead <= 0 ? 100.0 : Math.min(100.0, 100.0 * (p.bytesRead() - p.startOffset()) / toRead);
+    double percent;
+    if (job.state() == IngestJob.State.COMPLETED) {
+      percent = 100.0;
+    } else if (toRead <= 0) {
+      // Not started yet (sizes unknown), or nothing new to read.
+      percent = 0.0;
+    } else {
+      percent = Math.min(100.0, 100.0 * (p.bytesRead() - p.startOffset()) / toRead);
+    }
     return new IngestJobStatus(
         job.id(),
         job.sourceId(),
