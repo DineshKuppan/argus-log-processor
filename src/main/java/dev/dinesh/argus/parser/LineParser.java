@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -22,7 +23,7 @@ public class LineParser {
       Pattern.compile(
           "^(\\S+) (\\S+) (\\S+) \\[([^\\]]+)] \"([^\"]*)\" (\\d{3}) (\\d+|-) \"([^\"]*)\" \"([^\"]*)\"$");
   private static final DateTimeFormatter TIMESTAMP =
-      DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z");
+      DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z", Locale.ROOT);
 
   /** Returns the parsed record, or null if the line is not a valid access-log line. */
   public LogRecord parse(String line) {

@@ -5,6 +5,7 @@ import dev.dinesh.argus.model.LogRecord;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -23,7 +24,7 @@ public class ServerAccessLogParser implements LogParser {
           "^(\\S+) (\\S+) (\\S+) \\[([^\\]]+)] \"([^\"]*)\" (\\d{3}) (\\d+|-) \"([^\"]*)\" \"([^\"]*)\"$");
 
   private static final DateTimeFormatter DTF =
-      DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z");
+      DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z", Locale.ROOT);
 
   @Override
   public boolean canParse(String s) {

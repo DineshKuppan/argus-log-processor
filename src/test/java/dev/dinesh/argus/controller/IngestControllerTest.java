@@ -1,6 +1,7 @@
 package dev.dinesh.argus.controller;
 
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -137,6 +138,27 @@ class IngestControllerTest {
         .andExpect(status().isBadRequest())
         .andExpect(jsonPath("$.error").exists());
     submit(Map.of("path", ROOT.resolve("missing.log").toString())).andExpect(status().isNotFound());
+  }
+
+  @Test
+  void outsideTheRootsAMissingFileLooksTheSameAsAnExistingOne() throws Exception {
+    String existing =
+        submit(Map.of("path", "/etc/hosts")).andReturn().getResponse().getContentAsString();
+    String missing =
+        submit(Map.of("path", "/etc/argus-no-such-file"))
+            .andExpect(status().isBadRequest())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+    String traversal =
+        submit(Map.of("path", ROOT.resolve("../argus-no-such-file").toString()))
+            .andExpect(status().isBadRequest())
+            .andReturn()
+            .getResponse()
+            .getContentAsString();
+
+    assertEquals(existing, missing);
+    assertEquals(existing, traversal);
   }
 
   @Test

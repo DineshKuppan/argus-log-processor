@@ -28,6 +28,14 @@ class LineParserTest {
   }
 
   @Test
+  void parsesNginxMonthAbbreviationsRegardlessOfTheDefaultLocale() {
+    // Nginx always writes English 3-letter months; en_GB/en_IN expect "Sept", de_DE "Okt.".
+    String september = accessLine(200).replace("09/Oct/2025", "12/Sep/2025");
+
+    assertEquals(Instant.parse("2025-09-12T01:11:40Z"), parser.parse(september).getTimestamp());
+  }
+
+  @Test
   void derivesLevelFromHttpStatusClass() {
     assertEquals("INFO", parser.parse(accessLine(302)).getLevel());
     assertEquals("WARN", parser.parse(accessLine(404)).getLevel());

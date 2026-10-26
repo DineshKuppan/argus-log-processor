@@ -2,6 +2,7 @@ package dev.dinesh.argus.source;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -110,13 +111,67 @@ class FileSourceTest {
   }
 
   @Test
-  void handlesCrlfAndAFinalLineWithoutNewline() throws IOException {
-    Path file = write("a\r\nb\r\nc");
+  void handlesCrlf() throws IOException {
+    Path file = write("a\r\nb\r\n");
 
     List<RawBatch> batches = readAll(file, 0, linesOnly(100));
 
-    assertEquals(List.of("a", "b", "c"), linesOf(batches));
+    assertEquals(List.of("a", "b"), linesOf(batches));
     assertEquals(Files.size(file), batches.get(batches.size() - 1).endOffset());
+  }
+
+  @Test
+  void holdsBackATrailingLineThatHasNoNewlineYet() throws IOException {
+    Path file = write("a\nb\npartial-wri");
+
+    List<RawBatch> batches = readAll(file, 0, linesOnly(100));
+
+    assertEquals(List.of("a", "b"), linesOf(batches));
+    assertEquals(4, batches.get(batches.size() - 1).endOffset());
+    assertTrue(batches.get(batches.size() - 1).lastInSegment());
+  }
+
+  @Test
+  void resumingAfterTheWriterFinishesTheLineReadsItWhole() throws IOException {
+    Path file = write("a\npartial-wri");
+    long end = readAll(file, 0, linesOnly(100)).get(0).endOffset();
+
+    Files.writeString(file, "te\nnext\n", StandardOpenOption.APPEND);
+
+    assertEquals(List.of("partial-write", "next"), linesOf(readAll(file, end, linesOnly(100))));
+  }
+
+  @Test
+  void fileWithoutAnyCompleteLineYieldsNoBatches() throws IOException {
+    Path file = write("no newline yet");
+    try (FileSource source = FileSource.open(file, "src", 0, linesOnly(10))) {
+      assertEquals(0, source.limit());
+      assertEquals(14, source.size());
+      assertNull(source.nextBatch());
+    }
+  }
+
+  @Test
+  void fingerprintCoversOnlyTheRequestedLeadingBytes() throws IOException {
+    Path file = write("same head\nfirst tail\n");
+    String head;
+    try (FileSource source = FileSource.open(file, "src", linesOnly(10))) {
+      head = source.sha256OfFirst(9);
+      assertEquals(64, head.length());
+    }
+    write("same head\nother tail\n");
+    try (FileSource source = FileSource.open(file, "src", linesOnly(10))) {
+      assertEquals(head, source.sha256OfFirst(9));
+      assertNotEquals(head, source.sha256OfFirst(12));
+    }
+  }
+
+  @Test
+  void readingBeforeStartAtIsRejected() throws IOException {
+    Path file = write("a\n");
+    try (FileSource source = FileSource.open(file, "src", linesOnly(10))) {
+      assertThrows(IllegalStateException.class, source::nextBatch);
+    }
   }
 
   @Test

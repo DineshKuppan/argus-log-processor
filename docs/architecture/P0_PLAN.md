@@ -225,3 +225,13 @@ Verification of the final output (`verify.py`, which reads every committed file)
 - **`LogSink` is synchronous** (`SegmentWriter.commit` returns once durable). Async acknowledgements come with the multi-sink router in P2.
 - **Found while running the real app:** the application didn't start (`FileCheckpointStore` had two constructors), and a not-yet-started job reported 100%. Both are fixed; a full-context test now guards wiring.
 
+### Review fixes (`/code-review high` on PR #1)
+- **Partial last line:** a run now stops at the last `\n`. Before, a line still being written was committed as a fragment and its remainder read as a second line on the next run.
+- **Rotation:** checkpoints carry a `generation`, and output goes to `gen=G/`. A replaced, truncated or `copytruncate`d-and-regrown file (detected by inode, size, and a SHA-256 of its first 1KB) restarts at 0 in a new generation instead of deleting the previous file's committed `0-*.ndjson`.
+- **Power loss:** renames of segments and checkpoints are followed by a directory fsync (`DurableFiles`), so a checkpoint can no longer be durable while its segment's rename is not.
+- **Open race:** the file is opened first and its inode, size and fingerprint are read from the opened file (the path's inode is checked before and after the open).
+- **Path probing:** `allowed-roots` is checked on the normalized path before existence, so a missing file outside the roots gets the same 400 as an existing one.
+- **Outcome:** `COMPLETED` when the end of the file was committed, even if a cancel arrived afterwards.
+- **Canonical line:** one `Ingest finished` line per run in a `finally` block, with outcome, error, offsets, counts and `durationMs`.
+- **Locale:** access-log dates parse with `Locale.ROOT`.
+- **Sink writes** stream through one `JsonGenerator` per segment instead of a `byte[]` per record. 1GB load test after the fixes: peak heap 195MB of 256MB, ≈957k lines/s.

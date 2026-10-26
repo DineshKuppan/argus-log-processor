@@ -10,6 +10,7 @@ import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 import java.util.Random;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.util.unit.DataSize;
@@ -31,7 +32,7 @@ public class DataSeeder {
     "curl/8.0", "Mozilla/5.0", "k8s-probe", "PostmanRuntime/7.32.0"
   };
   private static final DateTimeFormatter NGINX_TIMESTAMP =
-      DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z").withZone(ZoneOffset.UTC);
+      DateTimeFormatter.ofPattern("dd/MMM/yyyy:HH:mm:ss Z", Locale.ROOT).withZone(ZoneOffset.UTC);
 
   public static void generate() throws Exception {
     String filePath = "src/main/resources/logs/nginx_app.log";

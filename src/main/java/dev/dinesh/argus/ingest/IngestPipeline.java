@@ -2,6 +2,7 @@ package dev.dinesh.argus.ingest;
 
 import dev.dinesh.argus.checkpoint.CheckpointStore;
 import dev.dinesh.argus.checkpoint.ResumePoint;
+import dev.dinesh.argus.checkpoint.ResumePoint.Reason;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.model.LogRecord;
 import dev.dinesh.argus.parser.LineParser;
@@ -11,10 +12,11 @@ import dev.dinesh.argus.source.FileSource;
 import dev.dinesh.argus.source.LogBatch;
 import dev.dinesh.argus.source.RawBatch;
 import dev.dinesh.argus.source.SourceOffset;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -54,6 +56,8 @@ public class IngestPipeline {
   private static final long HANDOFF_POLL_MS = 100;
   private static final int REJECTED_SAMPLES_LOGGED = 10;
   private static final int SAMPLE_CHARS = 200;
+  private static final Set<Reason> FILE_CHANGED =
+      EnumSet.of(Reason.FILE_REPLACED, Reason.FILE_TRUNCATED, Reason.FILE_REWRITTEN);
   private static final RawBatch END_OF_RAW =
       new RawBatch(null, -1, -1, List.of(), -1, -1, false, 0);
   private static final LogBatch END_OF_PARSED =
@@ -79,28 +83,85 @@ public class IngestPipeline {
   public Outcome run(Request request, IngestProgress progress, AtomicBoolean cancel)
       throws Exception {
     String sourceId = SourceOffset.requireValidSourceId(request.sourceId());
-    Path path = request.path();
+    long startNanos = System.nanoTime();
+    Outcome outcome = null;
+    Throwable error = null;
+    try {
+      outcome = ingest(request.path(), sourceId, request.fromBeginning(), progress, cancel);
+      return outcome;
+    } catch (Throwable t) {
+      error = t;
+      throw t;
+    } finally {
+      // Canonical line: one per run, success or not.
+      log.info(
+          "Ingest finished source={} outcome={} error={} resumeReason={} startOffset={}"
+              + " committedOffset={} totalBytes={} segments={} lines={} rejected={} truncated={}"
+              + " durationMs={}",
+          sourceId,
+          outcome == null ? "FAILED" : outcome,
+          error == null ? null : error.getClass().getSimpleName() + ": " + error.getMessage(),
+          progress.resumeReason(),
+          progress.startOffset(),
+          progress.committedOffset(),
+          progress.totalBytes(),
+          progress.segmentsCommitted(),
+          progress.lines(),
+          progress.rejected(),
+          progress.truncated(),
+          TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+    }
+  }
+
+  private Outcome ingest(
+      Path path,
+      String sourceId,
+      boolean fromBeginning,
+      IngestProgress progress,
+      AtomicBoolean cancel)
+      throws Exception {
     sink.discardUncommitted(sourceId);
-    String fileKey = FileSource.fileKey(path);
-    ResumePoint resume =
-        ResumePoint.resolve(
-            checkpoints.load(sourceId), fileKey, Files.size(path), request.fromBeginning());
-    if (resume.reason() == ResumePoint.Reason.FILE_REPLACED
-        || resume.reason() == ResumePoint.Reason.FILE_TRUNCATED) {
-      log.warn("Source {} ({}): {}; restarting from offset 0", sourceId, path, resume.reason());
+    // Open first, then compare the opened file with the checkpoint, so a rotation between the two
+    // steps cannot pair this file's offsets with another file's identity.
+    FileSource source = FileSource.open(path, sourceId, props);
+    Stages stages;
+    try {
+      ResumePoint resume = ResumePoint.resolve(checkpoints.load(sourceId), source, fromBeginning);
+      if (FILE_CHANGED.contains(resume.reason())) {
+        log.warn(
+            "Source {} ({}): {}; restarting from offset 0 as generation {}",
+            sourceId,
+            path,
+            resume.reason(),
+            resume.generation());
+      }
+      source.startAt(resume.offset());
+      int headBytes = (int) Math.min(FileSource.FINGERPRINT_BYTES, source.limit());
+      SourceOffset template =
+          new SourceOffset(
+              sourceId,
+              path.toString(),
+              source.fileKey(),
+              resume.generation(),
+              resume.offset(),
+              headBytes,
+              source.sha256OfFirst(headBytes));
+      progress.started(resume.offset(), source.limit(), resume.reason().name());
+      log.info(
+          "Ingest start source={} path={} offset={} limit={} size={} generation={} reason={}",
+          sourceId,
+          path,
+          resume.offset(),
+          source.limit(),
+          source.size(),
+          resume.generation(),
+          resume.reason());
+      stages = new Stages(source, template, progress, cancel);
+    } catch (Exception e) {
+      source.close();
+      throw e;
     }
 
-    FileSource source = FileSource.open(path, sourceId, resume.offset(), props);
-    progress.started(resume.offset(), source.limit(), resume.reason().name());
-    log.info(
-        "Ingest start source={} path={} offset={} size={} reason={}",
-        sourceId,
-        path,
-        resume.offset(),
-        source.limit(),
-        resume.reason());
-
-    Stages stages = new Stages(source, sourceId, path.toString(), fileKey, progress, cancel);
     try {
       stages.start();
       stages.write();
@@ -113,16 +174,9 @@ public class IngestPipeline {
       Throwable failure = stages.failure.get();
       throw failure instanceof Exception e ? e : new IllegalStateException(failure);
     }
-    Outcome outcome = cancel.get() ? Outcome.CANCELLED : Outcome.COMPLETED;
-    log.info(
-        "Ingest {} source={} committedOffset={} segments={} lines={} rejected={}",
-        outcome,
-        sourceId,
-        progress.committedOffset(),
-        progress.segmentsCommitted(),
-        progress.lines(),
-        progress.rejected());
-    return outcome;
+    // Decided by what was committed, not by the flag: a cancel that arrives after the last commit
+    // still leaves a fully ingested file.
+    return stages.committedOffset >= source.limit() ? Outcome.COMPLETED : Outcome.CANCELLED;
   }
 
   /** State shared by the three stages of one run. */
@@ -130,8 +184,7 @@ public class IngestPipeline {
 
     private final FileSource source;
     private final String sourceId;
-    private final String path;
-    private final String fileKey;
+    private final SourceOffset checkpointTemplate;
     private final IngestProgress progress;
     private final AtomicBoolean cancel;
     private final BlockingQueue<RawBatch> raw;
@@ -141,17 +194,18 @@ public class IngestPipeline {
     private final AtomicInteger rejectedSamples = new AtomicInteger();
     private final List<Thread> threads = new ArrayList<>();
 
+    /** Written and read only by the writer (caller) thread. */
+    private long committedOffset;
+
     Stages(
         FileSource source,
-        String sourceId,
-        String path,
-        String fileKey,
+        SourceOffset checkpointTemplate,
         IngestProgress progress,
         AtomicBoolean cancel) {
       this.source = source;
-      this.sourceId = sourceId;
-      this.path = path;
-      this.fileKey = fileKey;
+      this.sourceId = checkpointTemplate.sourceId();
+      this.checkpointTemplate = checkpointTemplate;
+      this.committedOffset = checkpointTemplate.byteOffset();
       this.progress = progress;
       this.cancel = cancel;
       this.raw = new ArrayBlockingQueue<>(props.rawQueueCapacity());
@@ -241,13 +295,14 @@ public class IngestPipeline {
             return;
           }
           if (segment == null) {
-            segment = sink.open(sourceId, batch.startOffset());
+            segment = sink.open(sourceId, checkpointTemplate.generation(), batch.startOffset());
           }
           segment.write(batch);
           if (batch.lastInSegment()) {
             String location = segment.commit(batch.endOffset());
             segment = null;
-            checkpoints.save(new SourceOffset(sourceId, path, fileKey, batch.endOffset()));
+            checkpoints.save(checkpointAt(batch.endOffset()));
+            committedOffset = batch.endOffset();
             progress.committed(batch.endOffset(), location);
             log.info(
                 "Segment committed source={} endOffset={} location={}",
@@ -261,6 +316,18 @@ public class IngestPipeline {
           segment.abort();
         }
       }
+    }
+
+    private SourceOffset checkpointAt(long offset) {
+      SourceOffset t = checkpointTemplate;
+      return new SourceOffset(
+          t.sourceId(),
+          t.path(),
+          t.fileKey(),
+          t.generation(),
+          offset,
+          t.headBytes(),
+          t.headSha256());
     }
 
     void fail(Throwable t) {

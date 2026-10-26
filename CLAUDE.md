@@ -85,10 +85,10 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
 
 Read → parse → write stages in separate threads, connected by bounded queues (raw 2, parsed 4 batches). A full queue blocks the stage before it, so heap use is set by queue capacity, not file size.
 - **Batch** (≤10,000 lines / ≤8MB) is the in-memory unit; **segment** (~500MB of source) is the durability unit: one output file and one checkpoint.
-- **Commit protocol:** a segment is fsynced and renamed into place *before* its end offset is checkpointed. A crash replays at most the open segment, and its output is replaced, not duplicated.
-- `source.FileSource`: `FileChannel` reader with exact byte offsets; batches end only on line boundaries.
-- `checkpoint.FileCheckpointStore`: one JSON file per source (temp file + fsync + atomic rename). `ResumePoint` restarts from 0 if the file was replaced (inode changed) or truncated.
-- `sink.LocalVolumeSink`: NDJSON at `tenant=default/dt=YYYY-MM-DD/source=ID/START-END.ndjson`. `dt` comes from the segment's first record and the name from offsets, so replays land on the same path.
+- **Commit protocol:** a segment is fsynced and renamed into place (and its directory fsynced) *before* its end offset is checkpointed. A crash or power loss replays at most the open segment, and its output is replaced, not duplicated. Use `utils.DurableFiles` for any rename that must survive power loss.
+- `source.FileSource`: `FileChannel` reader with exact byte offsets; batches end only on line boundaries. A run stops at the last `\n`: a trailing line without one may still be being written, so it waits for the next run (as Filebeat / Fluent Bit do).
+- `checkpoint.FileCheckpointStore`: one JSON file per source (temp file + fsync + atomic rename + directory fsync). The checkpoint stores the inode, a SHA-256 of the first 1KB and a **generation**. `ResumePoint` compares them with the *opened* file and restarts from 0 in a new generation if it was replaced (inode), truncated (size) or truncated-and-regrown (head hash, e.g. `copytruncate`).
+- `sink.LocalVolumeSink`: NDJSON at `tenant=default/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson`. `dt` comes from the segment's first record and the name from offsets, so replays land on the same path; `gen` keeps a rotated file's output from replacing the previous file's.
 - `ingest.IngestPipeline` runs one job; `ingest.IngestJobService` runs jobs on `max-concurrent-jobs` slots with no queue (rejects instead of buffering), and only one job per source at a time.
 - `parser.LineParser`: the access-log parsing shared by v1 and v2 (replaced by a parser registry in P1).
 - Source ids become directory names, so `SourceOffset.requireValidSourceId` limits them to `[A-Za-z0-9._-]`. Ingest paths must resolve (after symlinks) under `argus.ingest.allowed-roots`.
@@ -130,7 +130,7 @@ Verified against the code; fix these before or alongside scaling work:
 - **v1 still reads whole files:** `LogService.readLines` uses `Files.readAllLines` behind a 50MB guard. Use `/api/v2/ingest` for large files; v1 moves onto the pipeline once aggregation streams (P1).
 - **v1 has no path restriction:** `?file=` / `"file"` accepts any readable path on the host (arbitrary file read). v2 enforces `allowed-roots`.
 - **Parsers not wired in:** `LineParser` (used by v1 and v2) only understands Nginx access lines and ignores the `parser/*` classes, so JSON and key-value logs are rejected (counted as `rejected` in v2).
-- **Locale-dependent dates:** access-log timestamps are parsed with the JVM default locale (`dd/MMM/yyyy`). On `en_GB` September is `Sept`, so real Nginx `Sep` lines fail there; on other locales the bundled `nginx.log` (which contains `Sept`) fails. Fix with `Locale.ROOT` in P1.
+- **Access-log dates use `Locale.ROOT`** (English `Sep`, as Nginx writes). Local `nginx.log` files generated before this change on an `en_GB` / `en_IN` JVM contain `Sept` and are now rejected; regenerate them with `DataSeeder`.
 - **Most `LogParserTest` cases are commented out** (WIP commit `1f6beaf`).
 - **ISP violation:** `LogParser.parseLine(line, pattern)` is stubbed by most implementations (`JsonLogParser` returns `null`).
 - **Non-streaming aggregation:** `Aggregator.compute(List<LogRecord>)` requires every record in memory.

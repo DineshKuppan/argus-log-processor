@@ -3,12 +3,12 @@ package dev.dinesh.argus.checkpoint;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.source.SourceOffset;
+import dev.dinesh.argus.utils.DurableFiles;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Optional;
 import lombok.extern.slf4j.Slf4j;
@@ -17,7 +17,8 @@ import org.springframework.stereotype.Component;
 
 /**
  * One JSON file per source. Writes go to a temp file that is fsynced and then atomically renamed
- * over the previous checkpoint, so a crash never leaves a half-written checkpoint behind.
+ * over the previous checkpoint (with the directory fsynced too), so a crash never leaves a
+ * half-written checkpoint behind and a saved checkpoint survives power loss.
  */
 @Slf4j
 @Component
@@ -54,7 +55,7 @@ public class FileCheckpointStore implements CheckpointStore {
   public void save(SourceOffset offset) throws IOException {
     Path file = fileFor(offset.sourceId());
     Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
-    Files.createDirectories(dir);
+    DurableFiles.createDirectories(dir);
     try (FileChannel channel =
         FileChannel.open(
             tmp,
@@ -67,7 +68,7 @@ public class FileCheckpointStore implements CheckpointStore {
       }
       channel.force(true);
     }
-    Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    DurableFiles.moveAtomically(tmp, file);
   }
 
   private Path fileFor(String sourceId) {

@@ -152,11 +152,12 @@ flowchart LR
 
 ### Sink object layout
 ```
-<bucket-or-pvc-root>/tenant=<tenantId>/dt=YYYY-MM-DD/hour=HH/source=<sourceId>/<startOffset>-<endOffset>.parquet
+<bucket-or-pvc-root>/tenant=<tenantId>/dt=YYYY-MM-DD/hour=HH/source=<sourceId>/gen=<generation>/<startOffset>-<endOffset>.parquet
 ```
 - Names come from **offsets**, so a retry overwrites the same object rather than creating a duplicate (idempotent).
 - `dt`/`hour` come from the segment's **first record**, not the ingest date, so a segment replayed on a later day still lands on the same path.
 - Each source gets its own `source=<id>/` folder: source ids may contain `-`, so a flat `<sourceId>-<start>-*` name pattern could match another source's files.
+- `gen=` increments when the path holds a different file (rotation, truncation): offsets restart at 0, and without it the new file's first segment would replace the old file's.
 - Hive-style partitions (`tenant=`, `dt=`, `hour=`) let Athena and BigQuery skip whole folders when a query filters on them.
 - Roll a file at **128–256MB or 5 minutes**, whichever comes first, to avoid both tiny files and long latency.
 
@@ -193,7 +194,7 @@ Implementation choice (Reactor vs. bounded queues vs. virtual threads): see ADR-
 ### Offsets per source
 | Source | `SourceOffset` |
 |---|---|
-| File / tail | `path`, `inode` (detects rotation), `byteOffset` |
+| File / tail | `path`, `inode` (detects rotation), SHA-256 of the first 1KB (detects `copytruncate`), `generation`, `byteOffset` |
 | Kafka | `topic`, `partition`, `offset` |
 | Elasticsearch export | PIT id + `search_after` sort values |
 | Coralogix export | query window `[from, to)` + page cursor |

@@ -248,6 +248,70 @@ class IngestPipelineTest {
   }
 
   @Test
+  void cancelArrivingAfterTheFinalCommitStillReportsCompleted() throws Exception {
+    Path file = writeLog(10); // well under one segment
+    AtomicBoolean cancel = new AtomicBoolean();
+    LogSink cancellingSink =
+        new ForwardingSink(localSink(dir.resolve("out"))) {
+          @Override
+          void afterCommit() {
+            cancel.set(true);
+          }
+        };
+
+    Outcome outcome =
+        pipeline(cancellingSink, checkpoints(dir.resolve("cp")))
+            .run(new Request(file, "app", false), new IngestProgress(), cancel);
+
+    assertEquals(Outcome.COMPLETED, outcome);
+  }
+
+  @Test
+  void aLineStillBeingWrittenIsIngestedWholeOnTheNextRun() throws Exception {
+    Path file = writeLog(5);
+    String line = accessLine(5);
+    Files.writeString(file, line.substring(0, 30), StandardOpenOption.APPEND);
+    Path out = dir.resolve("out");
+    FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
+
+    IngestProgress first = new IngestProgress();
+    pipeline(localSink(out), cps).run(new Request(file, "app", false), first, new AtomicBoolean());
+    Files.writeString(file, line.substring(30) + "\n", StandardOpenOption.APPEND);
+    IngestProgress second = new IngestProgress();
+    pipeline(localSink(out), cps).run(new Request(file, "app", false), second, new AtomicBoolean());
+
+    assertEquals(5, first.lines());
+    assertEquals(1, second.lines());
+    assertEquals(0, first.rejected() + second.rejected());
+    assertEquals(Files.size(file), cps.load("app").orElseThrow().byteOffset());
+  }
+
+  @Test
+  void copytruncateRotationKeepsTheEarlierFilesOutputAndIngestsTheNewOne() throws Exception {
+    Path file = writeLog(30);
+    Path out = dir.resolve("out");
+    FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
+    pipeline(localSink(out), cps)
+        .run(new Request(file, "app", false), new IngestProgress(), new AtomicBoolean());
+    Map<String, String> beforeRotation = outputFiles(out);
+
+    // Truncated in place (same inode), then regrown past the old checkpoint with new lines.
+    StringBuilder rotated = new StringBuilder();
+    IntStream.range(100, 160).forEach(i -> rotated.append(accessLine(i)).append('\n'));
+    Files.writeString(file, rotated);
+    IngestProgress rerun = new IngestProgress();
+    pipeline(localSink(out), cps).run(new Request(file, "app", false), rerun, new AtomicBoolean());
+
+    assertEquals("FILE_REWRITTEN", rerun.resumeReason());
+    assertEquals(0, rerun.startOffset());
+    assertEquals(60, rerun.lines());
+    Map<String, String> after = outputFiles(out);
+    assertTrue(after.entrySet().containsAll(beforeRotation.entrySet()), "old output was replaced");
+    assertEquals(90, recordCount(after));
+    assertEquals(1, cps.load("app").orElseThrow().generation());
+  }
+
+  @Test
   void rerunResumesFromCheckpointAndReadsOnlyAppendedLines() throws Exception {
     Path file = writeLog(30);
     Path out = dir.resolve("out");
@@ -293,8 +357,9 @@ class IngestPipelineTest {
     }
 
     @Override
-    public SegmentWriter open(String sourceId, long startOffset) throws IOException {
-      SegmentWriter writer = delegate.open(sourceId, startOffset);
+    public SegmentWriter open(String sourceId, int generation, long startOffset)
+        throws IOException {
+      SegmentWriter writer = delegate.open(sourceId, generation, startOffset);
       return new SegmentWriter() {
         @Override
         public void write(LogBatch batch) throws IOException {

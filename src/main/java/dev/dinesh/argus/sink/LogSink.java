@@ -12,7 +12,11 @@ public interface LogSink {
   /** Removes uncommitted output a crashed run left behind for {@code sourceId}. */
   void discardUncommitted(String sourceId) throws IOException;
 
-  SegmentWriter open(String sourceId, long startOffset) throws IOException;
+  /**
+   * Starts a segment beginning at {@code startOffset}. Segments of different {@code generation}s
+   * (successive files at the same path) never replace each other, even at the same offsets.
+   */
+  SegmentWriter open(String sourceId, int generation, long startOffset) throws IOException;
 
   /** Writes one segment. Not thread-safe: owned by a single writer thread. */
   interface SegmentWriter {

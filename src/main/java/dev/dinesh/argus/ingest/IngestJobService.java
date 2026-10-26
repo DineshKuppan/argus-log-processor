@@ -91,10 +91,13 @@ public class IngestJobService {
     if (rawPath == null || rawPath.isBlank()) {
       throw new IllegalArgumentException("path is required");
     }
-    Path path = Path.of(rawPath);
+    // Check the roots before existence, so a 404 never reveals whether a path outside them exists.
+    Path path = Path.of(rawPath).toAbsolutePath().normalize();
+    requireAllowed(path);
     if (!Files.exists(path)) {
       throw new NoSuchFileException(rawPath);
     }
+    // Again after resolving symlinks, which may point outside the roots.
     Path realPath = path.toRealPath();
     requireAllowed(realPath);
     if (!Files.isRegularFile(realPath)) {
@@ -164,9 +167,12 @@ public class IngestJobService {
     }
   }
 
-  private void requireAllowed(Path realPath) throws IOException {
+  /** {@code path} must be absolute and normalized; compared with each root as written and real. */
+  private void requireAllowed(Path path) throws IOException {
     for (Path root : allowedRoots) {
-      if (Files.isDirectory(root) && realPath.startsWith(root.toRealPath())) {
+      if (Files.isDirectory(root)
+          && (path.startsWith(root.toRealPath())
+              || path.startsWith(root.toAbsolutePath().normalize()))) {
         return;
       }
     }
