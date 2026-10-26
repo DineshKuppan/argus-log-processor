@@ -12,6 +12,7 @@ import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Optional;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -25,6 +26,7 @@ public class FileCheckpointStore implements CheckpointStore {
   private final Path dir;
   private final ObjectMapper mapper;
 
+  @Autowired
   public FileCheckpointStore(IngestProperties props, ObjectMapper mapper) {
     this(props.checkpointDir(), mapper);
   }
