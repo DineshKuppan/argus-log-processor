@@ -18,6 +18,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
 import java.util.function.Predicate;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -58,6 +59,25 @@ public class LogService {
   }
 
   public List<LogRecord> parseFile(String filePath) throws Exception {
+    return readLines(filePath).stream()
+        .filter(l -> !l.isBlank())
+        .map(this::parseLineSafely)
+        .filter(Objects::nonNull)
+        .toList();
+  }
+
+  /** Parses only the lines that fully match {@code pattern}. */
+  public List<LogRecord> parseFile(String filePath, String pattern) throws Exception {
+    Pattern linePattern = Pattern.compile(pattern);
+    return readLines(filePath).stream()
+        .filter(l -> !l.isBlank())
+        .filter(l -> linePattern.matcher(l).matches())
+        .map(this::parseLineSafely)
+        .filter(Objects::nonNull)
+        .toList();
+  }
+
+  private List<String> readLines(String filePath) throws Exception {
     log.info("parsing file: {}", filePath);
     Path path = Path.of(filePath);
     log.info("Path exists: {}", Files.exists(path));
@@ -69,11 +89,7 @@ public class LogService {
     }
     List<String> lines = Files.readAllLines(path);
     log.info("Total lines: {}", lines.size());
-    return lines.stream()
-        .filter(l -> !l.isBlank())
-        .map(this::parseLineSafely)
-        .filter(Objects::nonNull)
-        .toList();
+    return lines;
   }
 
   private LogRecord parseLineSafely(String line) {

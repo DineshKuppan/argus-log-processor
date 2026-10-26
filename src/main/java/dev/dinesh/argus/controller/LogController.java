@@ -58,6 +58,21 @@ public class LogController {
   }
 
   /**
+   * Parses only the lines of the specified file that match the given regex.
+   *
+   * @param file the log file path
+   * @param pattern regex a line must fully match to be parsed
+   * @return list of parsed LogRecord objects
+   * @throws Exception if parsing fails
+   */
+  @GetMapping("/parse/regexp")
+  public List<LogRecord> parseLogsWithPattern(
+      @RequestParam String file, @RequestParam String pattern) throws Exception {
+
+    return logService.parseFile(file, pattern);
+  }
+
+  /**
    * Filters logs based on criteria in the request body.
    *
    * @param body filter parameters (file, from, to, levels, regex)
@@ -104,7 +119,7 @@ public class LogController {
       throws Exception {
     String file = (String) body.get("file");
     List<LogRecord> logs = logService.parseFile(file);
-
+    log.debug("Total Logs Present - [{}]", logs.size());
     // Apply filters before aggregating
     List<LogFilter> filters = new ArrayList<>();
     if (body.containsKey("from") || body.containsKey("to")) {
