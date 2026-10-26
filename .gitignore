@@ -68,3 +68,5 @@ target/
 
 .DS_Store
 **/*.DS_Store
+# Argus runtime data (checkpoints, ingest output)
+/data/
