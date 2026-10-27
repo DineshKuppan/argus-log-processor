@@ -11,6 +11,12 @@ public class Suppressor {
   /** Tenant ids start every store key (guardrail 4), so they may not contain the ':' separator. */
   private static final Pattern TENANT_ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
 
+  /**
+   * Each check hashes the whole message (and template mode scans it three times), so its size is
+   * capped to keep a decision well under a millisecond.
+   */
+  public static final int MAX_MESSAGE_CHARS = 64 * 1024;
+
   private final SuppressionStore store;
   private final MessageFingerprint fingerprint;
 
@@ -20,7 +26,7 @@ public class Suppressor {
   }
 
   /**
-   * @throws IllegalArgumentException for an invalid tenant id or a null message
+   * @throws IllegalArgumentException for an invalid tenant id, or a null or too long message
    */
   public SuppressionDecision check(String tenantId, String message) {
     if (tenantId == null || !TENANT_ID.matcher(tenantId).matches()) {
@@ -29,6 +35,10 @@ public class Suppressor {
     }
     if (message == null) {
       throw new IllegalArgumentException("message is required");
+    }
+    if (message.length() > MAX_MESSAGE_CHARS) {
+      throw new IllegalArgumentException(
+          "message is longer than " + MAX_MESSAGE_CHARS + " characters: " + message.length());
     }
     return store.acquire(key(tenantId, message), message);
   }

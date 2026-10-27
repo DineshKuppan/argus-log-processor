@@ -24,6 +24,12 @@ public record SuppressionProperties(
 
   public SuppressionProperties {
     window = window != null ? window : Duration.ofSeconds(10);
+    // Redis expiries are in whole milliseconds: a shorter window would become PX 0, which Redis
+    // rejects, so every check would silently fail open.
+    if (window.compareTo(Duration.ofMillis(1)) < 0) {
+      throw new IllegalArgumentException(
+          "argus.suppression.window must be at least 1ms: " + window);
+    }
     maxKeys = maxKeys > 0 ? maxKeys : 100_000;
     store = store != null ? store : Store.LOCAL;
     templateFingerprint = templateFingerprint != null && templateFingerprint;

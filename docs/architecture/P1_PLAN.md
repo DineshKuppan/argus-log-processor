@@ -191,3 +191,19 @@ v2 output lines change from `LogRecord` to `LogEnvelope`:
   - Testcontainers is pinned to 1.21.4: Spring Boot 3.3.3 manages 1.19.8, which Docker Engine 29 rejects (API 1.32 < minimum 1.40).
   - Real-app testing found that Redis-mode `windowEndsAt` was dated from before the call, so a slow first round trip made it 330ms early. It is now dated from the reply (`c82ec25`).
   - The streaming-vs-list test generates its access lines rather than reading `src/main/resources/logs/nginx.log`: that file is git-ignored (`*.log`), so a clean checkout doesn't have it.
+
+### Review fixes (`/code-review high` on P1b)
+| # | Finding | Fix |
+|---|---|---|
+| 1 | v1 aggregations lost the 50MB cap with nothing in its place | `log.max-concurrent-aggregations` (2) slots; more get 429 + `Retry-After` (guardrail 2). v1 now maps `IllegalArgumentException` → 400 and a missing file → 404 instead of 500. Path restriction is still open (see Known Gaps) |
+| 2 | Tenant from an unauthenticated header | Accepted until P3's API keys; documented as a known gap |
+| 3 | Aggregator state grows with distinct levels | At most 64 distinct levels, the rest under `other`. Time buckets are bounded by the file's time span (documented) |
+| 4 | v1 silently cut lines at 1MB | v1 reads lines up to 16MB; the canonical scan line reports `truncated` and `dropped` |
+| 5 | Canonical lines | Suppression: in `finally`, failures included (still DEBUG: one per message). v1: one INFO `v1 scan finished` line per scan |
+| 6 | Denied copy missed by a window's summary | `compute` (under the eviction lock) instead of `putIfAbsent` + increment; a custom `Expiry` keeps updates from extending the window |
+| 7 | Sub-millisecond `window` silently disabled Redis suppression | Rejected at startup |
+| 8 | Negative `topN` failed after the whole scan | Rejected when the aggregator is built (400) |
+| 9 | `split()` per record for the endpoint | Two `indexOf` calls, property-tested against `split` |
+| 10 | Unbounded message, digest looked up per call | 64K-character cap (400); one `MessageDigest` per thread |
+
+After the fixes: 193 tests pass; `SuppressionLatencyIT` p99 9.4µs.

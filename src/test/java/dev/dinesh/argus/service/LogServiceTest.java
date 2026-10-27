@@ -19,6 +19,9 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -125,5 +128,62 @@ class LogServiceTest {
     Map<String, Object> aggregates = service.aggregate(file.toString(), List.of(), 3);
     assertEquals(2L, aggregates.get("totalLogs"));
     assertEquals(Map.of("ERROR", 1L, "INFO", 1L), aggregates.get("byLevel"));
+  }
+
+  @Test
+  void rejectsAggregationsBeyondTheSlotsInsteadOfQueueing() throws Exception {
+    LogService oneSlot = new LogService(new ParserRegistry(), DEFAULTS, 1);
+    String file = write("{\"level\":\"INFO\",\"message\":\"a\"}");
+    CountDownLatch scanning = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    CompletableFuture<Void> first =
+        CompletableFuture.runAsync(
+            () -> {
+              try {
+                oneSlot.forEachRecord(
+                    file,
+                    r -> {
+                      scanning.countDown();
+                      awaitQuietly(release);
+                    });
+              } catch (IOException e) {
+                throw new RuntimeException(e);
+              }
+            });
+    assertTrue(scanning.await(5, TimeUnit.SECONDS));
+
+    assertThrows(
+        LogService.AggregationSlotsBusyException.class,
+        () -> oneSlot.aggregate(file, List.of(), 3));
+    release.countDown();
+    first.get(5, TimeUnit.SECONDS);
+    assertEquals(1L, oneSlot.aggregate(file, List.of(), 3).get("totalLogs"));
+  }
+
+  private static void awaitQuietly(CountDownLatch latch) {
+    try {
+      latch.await(5, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  @Test
+  void linesLongerThanIngestsLimitStillParse() throws Exception {
+    String payload = "x".repeat(2 * 1024 * 1024);
+    String file =
+        write(
+            "{\"timestamp\":\"2025-09-19T22:21:35Z\",\"level\":\"ERROR\",\"message\":\""
+                + payload
+                + "\"}");
+
+    assertEquals(1L, service.aggregate(file, List.of(), 3).get("totalLogs"));
+  }
+
+  @Test
+  void aNegativeTopNFailsBeforeTheFileIsRead() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> service.aggregate("/no/such/file/is/read", List.of(), -1));
   }
 }

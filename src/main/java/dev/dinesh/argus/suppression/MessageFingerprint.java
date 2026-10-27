@@ -26,6 +26,10 @@ public final class MessageFingerprint {
       Pattern.compile("\\b(?:0x)?(?=[0-9a-fA-F]*[0-9])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{8,}\\b");
   private static final Pattern NUMBER = Pattern.compile("\\d+(?:\\.\\d+)?");
 
+  // MessageDigest is not thread-safe; one per thread avoids a provider lookup per check.
+  private static final ThreadLocal<MessageDigest> SHA_256 =
+      ThreadLocal.withInitial(MessageFingerprint::newSha256);
+
   private final boolean template;
 
   public MessageFingerprint(boolean template) {
@@ -37,7 +41,7 @@ public final class MessageFingerprint {
     if (template) {
       normalized = template(normalized);
     }
-    byte[] digest = sha256().digest(normalized.getBytes(StandardCharsets.UTF_8));
+    byte[] digest = SHA_256.get().digest(normalized.getBytes(StandardCharsets.UTF_8));
     return Base64.getUrlEncoder()
         .withoutPadding()
         .encodeToString(Arrays.copyOf(digest, HASH_BYTES));
@@ -49,7 +53,7 @@ public final class MessageFingerprint {
     return NUMBER.matcher(s).replaceAll("<num>");
   }
 
-  private static MessageDigest sha256() {
+  private static MessageDigest newSha256() {
     try {
       return MessageDigest.getInstance("SHA-256");
     } catch (NoSuchAlgorithmException e) {

@@ -2,6 +2,7 @@ package dev.dinesh.argus.suppression;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.Expiry;
 import com.github.benmanes.caffeine.cache.RemovalCause;
 import com.github.benmanes.caffeine.cache.Scheduler;
 import com.github.benmanes.caffeine.cache.Ticker;
@@ -71,7 +72,7 @@ public final class LocalSuppressionStore implements SuppressionStore {
     this.clock = clock;
     this.windows =
         Caffeine.newBuilder()
-            .expireAfterWrite(window)
+            .expireAfter(new FixedWindow(window))
             .maximumSize(maxKeys)
             .ticker(ticker)
             .scheduler(scheduler)
@@ -87,14 +88,47 @@ public final class LocalSuppressionStore implements SuppressionStore {
 
   @Override
   public SuppressionDecision acquire(String key, String message) {
-    Window fresh = new Window(abbreviate(message), clock.instant().plus(window));
-    // Atomic: concurrent first calls for a key see exactly one null. An ended window that has not
-    // been evicted yet counts as absent and is replaced.
-    Window current = windows.asMap().putIfAbsent(key, fresh);
-    if (current == null) {
-      return SuppressionDecision.allow(fresh.endsAt);
+    SuppressionDecision[] decision = new SuppressionDecision[1];
+    // compute() runs under the entry's lock, which eviction also takes, so exactly one of
+    // concurrent first calls opens the window, and a copy denied as the window ends is counted
+    // before its summary reads the count. An ended window not yet evicted counts as absent.
+    windows
+        .asMap()
+        .compute(
+            key,
+            (k, current) -> {
+              if (current == null) {
+                Window fresh = new Window(abbreviate(message), clock.instant().plus(window));
+                decision[0] = SuppressionDecision.allow(fresh.endsAt);
+                return fresh;
+              }
+              decision[0] =
+                  SuppressionDecision.deny(current.endsAt, current.denied.incrementAndGet());
+              return current;
+            });
+    return decision[0];
+  }
+
+  /**
+   * A window lasts {@code window} from its first message; counting a denied copy (an update) must
+   * not extend it, as {@code expireAfterWrite} would.
+   */
+  private record FixedWindow(Duration window) implements Expiry<String, Window> {
+    @Override
+    public long expireAfterCreate(String key, Window value, long currentTime) {
+      return window.toNanos();
     }
-    return SuppressionDecision.deny(current.endsAt, current.denied.incrementAndGet());
+
+    @Override
+    public long expireAfterUpdate(
+        String key, Window value, long currentTime, long currentDuration) {
+      return currentDuration;
+    }
+
+    @Override
+    public long expireAfterRead(String key, Window value, long currentTime, long currentDuration) {
+      return currentDuration;
+    }
   }
 
   /** Runs pending evictions now (and so pending summaries); for tests with a fake ticker. */

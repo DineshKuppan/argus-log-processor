@@ -7,6 +7,8 @@ import dev.dinesh.argus.filter.impl.RegexFilter;
 import dev.dinesh.argus.filter.impl.TimeRangeFilter;
 import dev.dinesh.argus.model.LogRecord;
 import dev.dinesh.argus.service.LogService;
+import dev.dinesh.argus.service.LogService.AggregationSlotsBusyException;
+import java.nio.file.NoSuchFileException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -16,8 +18,10 @@ import java.util.Set;
 import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -33,6 +37,9 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/v1/logs")
 @Slf4j
 public class LogController {
+
+  /** Seconds a client should wait before retrying when all aggregation slots are busy. */
+  static final String RETRY_AFTER_SECONDS = "5";
 
   private final LogService logService;
 
@@ -178,5 +185,24 @@ public class LogController {
     log.info("*********** CLI Summary - Processed ***********");
 
     return ResponseEntity.ok(summary);
+  }
+
+  /** Bad input (a negative topN, a file over the size limit, a bad regex) is the client's error. */
+  @ExceptionHandler(IllegalArgumentException.class)
+  ResponseEntity<Map<String, String>> badRequest(IllegalArgumentException e) {
+    return ResponseEntity.badRequest().body(Map.of("error", String.valueOf(e.getMessage())));
+  }
+
+  @ExceptionHandler(NoSuchFileException.class)
+  ResponseEntity<Map<String, String>> notFound(NoSuchFileException e) {
+    return ResponseEntity.status(HttpStatus.NOT_FOUND)
+        .body(Map.of("error", "File not found: " + e.getFile()));
+  }
+
+  @ExceptionHandler(AggregationSlotsBusyException.class)
+  ResponseEntity<Map<String, String>> tooManyRequests(AggregationSlotsBusyException e) {
+    return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+        .header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS)
+        .body(Map.of("error", e.getMessage()));
   }
 }

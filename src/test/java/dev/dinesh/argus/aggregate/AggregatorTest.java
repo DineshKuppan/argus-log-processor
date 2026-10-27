@@ -95,6 +95,21 @@ public class AggregatorTest {
   }
 
   @Test
+  public void freeTextLevelsAreCappedSoTheStateStaysBounded() {
+    List<LogRecord> records =
+        IntStream.range(0, 1_000)
+            .mapToObj(i -> new LogRecord(T0, "level-" + i, "m", null))
+            .toList();
+
+    Map<String, Long> byLevel = new CountByLevelAggregator().compute(records);
+
+    assertEquals(CountByLevelAggregator.MAX_LEVELS + 1, byLevel.size());
+    assertEquals(
+        1_000L - CountByLevelAggregator.MAX_LEVELS,
+        byLevel.get(CountByLevelAggregator.OTHER_LEVELS));
+  }
+
+  @Test
   public void topEndpointsAreExactUpToCapacity() {
     TopNEndpointsAggregator top = new TopNEndpointsAggregator(2, 3);
     List<LogRecord> records =

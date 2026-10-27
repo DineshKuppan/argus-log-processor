@@ -29,6 +29,9 @@ public class TopNEndpointsAggregator
   }
 
   public TopNEndpointsAggregator(int n, int capacity) {
+    if (n < 0) {
+      throw new IllegalArgumentException("topN must not be negative: " + n);
+    }
     if (capacity < 1) {
       throw new IllegalArgumentException("capacity must be positive: " + capacity);
     }
@@ -36,9 +39,17 @@ public class TopNEndpointsAggregator
     this.capacity = capacity;
   }
 
+  /** The second space-separated token, as {@code message.split(" ")[1]} but without the array. */
   static String endpointOf(String message) {
-    String[] parts = message.split(" ");
-    return parts.length >= 2 ? parts[1] : NO_ENDPOINT;
+    int start = message.indexOf(' ') + 1;
+    if (start == 0) {
+      return NO_ENDPOINT;
+    }
+    int end = message.indexOf(' ', start);
+    String endpoint = end < 0 ? message.substring(start) : message.substring(start, end);
+    // split() drops trailing empty tokens: in "GET " or "GET   " there is no second token.
+    boolean onlySpacesLeft = message.chars().skip(start).allMatch(c -> c == ' ');
+    return endpoint.isEmpty() && onlySpacesLeft ? NO_ENDPOINT : endpoint;
   }
 
   @Override

@@ -13,6 +13,7 @@ import dev.dinesh.argus.filter.FilterSpec;
 import dev.dinesh.argus.filter.LogFilter;
 import dev.dinesh.argus.model.LogRecord;
 import dev.dinesh.argus.parser.FormatDetector;
+import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserChain;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.source.FileSource;
@@ -26,17 +27,22 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.Semaphore;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.util.unit.DataSize;
 
 /**
  * Service for parsing, filtering, analyzing, and exporting log records. Aggregations stream the
- * file in bounded batches, so they work on files of any size. Methods that return every record load
- * the whole file and are limited to {@code log.max-file-size} (50MB by default).
+ * file in bounded batches, so they work on files of any size; at most {@code
+ * log.max-concurrent-aggregations} run at once (more are rejected, never queued). Methods that
+ * return every record load the whole file and are limited to {@code log.max-file-size} (50MB by
+ * default).
  */
 @Service
 @Slf4j
@@ -45,9 +51,26 @@ public class LogService {
   /** Source id for v1's one-off reads; v1 keeps no checkpoints, so it only labels batches. */
   private static final String V1_SOURCE_ID = "v1";
 
+  public static final int DEFAULT_MAX_CONCURRENT_AGGREGATIONS = 2;
+
+  /**
+   * v1 used {@code readAllLines}, which never cut a line. Streaming needs some bound, so it is far
+   * above ingest's 1MB: one buffer of this size per running aggregation, at most.
+   */
+  static final DataSize V1_MAX_LINE_BYTES = DataSize.ofMegabytes(16);
+
+  /** Thrown when every aggregation slot is busy; the API answers 429 with Retry-After. */
+  public static class AggregationSlotsBusyException extends RuntimeException {
+    public AggregationSlotsBusyException(int slots) {
+      super("All " + slots + " aggregation slots are busy; retry later");
+    }
+  }
+
   private final ObjectMapper mapper = new ObjectMapper();
   private final ParserRegistry parsers;
   private final IngestProperties ingest;
+  private final int aggregationSlots;
+  private final Semaphore aggregations;
 
   @Value("${log.max-file-size}")
   private long maxFileSize;
@@ -55,8 +78,37 @@ public class LogService {
   private static final long DEFAULT_MAX_FILE_SIZE = 50L * 1024 * 1024;
 
   public LogService(ParserRegistry parsers, IngestProperties ingest) {
+    this(parsers, ingest, DEFAULT_MAX_CONCURRENT_AGGREGATIONS);
+  }
+
+  @Autowired
+  public LogService(
+      ParserRegistry parsers,
+      IngestProperties ingest,
+      @Value("${log.max-concurrent-aggregations:" + DEFAULT_MAX_CONCURRENT_AGGREGATIONS + "}")
+          int maxConcurrentAggregations) {
+    if (maxConcurrentAggregations < 1) {
+      throw new IllegalArgumentException(
+          "log.max-concurrent-aggregations must be positive: " + maxConcurrentAggregations);
+    }
     this.parsers = parsers;
-    this.ingest = ingest;
+    this.ingest = withMaxLineBytes(ingest, V1_MAX_LINE_BYTES);
+    this.aggregationSlots = maxConcurrentAggregations;
+    this.aggregations = new Semaphore(maxConcurrentAggregations);
+  }
+
+  private static IngestProperties withMaxLineBytes(IngestProperties p, DataSize maxLineBytes) {
+    return new IngestProperties(
+        p.batchMaxLines(),
+        p.batchMaxBytes(),
+        p.segmentBytes(),
+        p.rawQueueCapacity(),
+        p.parsedQueueCapacity(),
+        maxLineBytes,
+        p.maxConcurrentJobs(),
+        p.allowedRoots(),
+        p.checkpointDir(),
+        p.keepUnparsed());
   }
 
   public static String getFileSizeInfo(Path path) throws Exception {
@@ -152,22 +204,54 @@ public class LogService {
   /**
    * Feeds every parsed record of {@code filePath} to {@code consumer}, reading ≤10,000-line batches
    * (guardrail 1), so memory does not grow with the file. Lines no parser understands are skipped.
+   * Takes one of the aggregation slots for the duration of the scan.
+   *
+   * @throws AggregationSlotsBusyException if every slot is taken
    */
   public void forEachRecord(String filePath, Consumer<LogRecord> consumer) throws IOException {
+    if (!aggregations.tryAcquire()) {
+      throw new AggregationSlotsBusyException(aggregationSlots);
+    }
+    long start = System.nanoTime();
+    long lines = 0;
+    long records = 0;
+    long truncated = 0;
+    String format = null;
+    String outcome = "FAILED";
     try (FileSource source = FileSource.open(Path.of(filePath), V1_SOURCE_ID, ingest)) {
       // v1 reads finished files, so the last line counts even without a trailing newline.
       source.startAt(0, true);
       List<String> sample =
           source.headLines(FormatDetector.SAMPLE_BYTES, FormatDetector.SAMPLE_LINES);
-      ParserChain chain = parsers.chain(parsers.detect(sample).parser(), false);
+      LogParser primary = parsers.detect(sample).parser();
+      format = primary.name();
+      ParserChain chain = parsers.chain(primary, false);
       for (RawBatch batch = source.nextBatch(); batch != null; batch = source.nextBatch()) {
+        lines += batch.lines().size();
+        truncated += batch.truncatedLines();
         for (String line : batch.lines()) {
           ParserChain.Parsed parsed = chain.parse(line);
           if (parsed != null) {
+            records++;
             consumer.accept(parsed.record());
           }
         }
       }
+      outcome = "COMPLETED";
+    } finally {
+      aggregations.release();
+      // Canonical line per request (guardrail 9).
+      log.info(
+          "v1 scan finished file={} outcome={} format={} lines={} records={} dropped={}"
+              + " truncated={} durationMs={}",
+          filePath,
+          outcome,
+          format,
+          lines,
+          records,
+          lines - records,
+          truncated,
+          (System.nanoTime() - start) / 1_000_000);
     }
   }
 

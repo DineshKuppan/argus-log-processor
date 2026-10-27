@@ -30,9 +30,10 @@ public class DurationAggregator
     if (r.getTimestamp() == null) {
       return;
     }
-    buckets
-        .computeIfAbsent(r.getTimestamp().truncatedTo(unit), k -> new TreeMap<>())
-        .merge(CountByLevelAggregator.levelOf(r), 1L, Long::sum);
+    CountByLevelAggregator.count(
+        buckets.computeIfAbsent(r.getTimestamp().truncatedTo(unit), k -> new TreeMap<>()),
+        CountByLevelAggregator.levelOf(r),
+        1);
   }
 
   @Override
@@ -42,7 +43,8 @@ public class DurationAggregator
         (bucket, levels) ->
             levels.forEach(
                 (level, n) ->
-                    left.computeIfAbsent(bucket, k -> new TreeMap<>()).merge(level, n, Long::sum)));
+                    CountByLevelAggregator.count(
+                        left.computeIfAbsent(bucket, k -> new TreeMap<>()), level, n)));
     return left;
   }
 

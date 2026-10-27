@@ -37,6 +37,9 @@ class SuppressorTest {
     assertThrows(IllegalArgumentException.class, () -> suppressor.check("", "m"));
     assertThrows(IllegalArgumentException.class, () -> suppressor.check(null, "m"));
     assertThrows(IllegalArgumentException.class, () -> suppressor.check("acme", null));
+    String longest = "x".repeat(Suppressor.MAX_MESSAGE_CHARS);
+    assertTrue(suppressor.check("acme", longest).allowed());
+    assertThrows(IllegalArgumentException.class, () -> suppressor.check("acme", longest + "x"));
   }
 
   @Test

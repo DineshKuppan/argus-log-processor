@@ -78,14 +78,14 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
 
 **Service Layer** (`dev.dinesh.argus.service`)
 - `LogService`: Central service orchestrating parsing, filtering, aggregation, and export operations
-  - Aggregations (`summarize`, `aggregate`, `errorRateOverTime`, `errorSummary`) stream the file through `FileSource` and the parser registry in one pass, with no size limit
+  - Aggregations (`summarize`, `aggregate`, `errorRateOverTime`, `errorSummary`) stream the file through `FileSource` and the parser registry in one pass, with no size limit. At most `log.max-concurrent-aggregations` (2) run at once; more get `AggregationSlotsBusyException` (429), never a queue. Lines up to 16MB (not ingest's 1MB). One `v1 scan finished …` canonical line per scan
   - Methods that return every record (`parseFile`) keep the 50MB limit (`log.max-file-size`)
   - Filter application using composite pattern
   - Multiple aggregation strategies
   - Export to JSON and CSV formats
 
 **Controller** (`dev.dinesh.argus.controller`)
-- `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous. `/aggregate`, `/aggregateV2`, `/export/*` and `/cli-summary` stream files of any size; `/parse`, `/parse/regexp` and `/filter` return every record and keep the 50MB cap
+- `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous. `/aggregate`, `/aggregateV2`, `/export/*` and `/cli-summary` stream files of any size; `/parse`, `/parse/regexp` and `/filter` return every record and keep the 50MB cap. Errors: 400 bad input (`IllegalArgumentException`, e.g. over the size cap or a negative `topN`), 404 missing file, 429 + `Retry-After` when the aggregation slots are busy
 - `SuppressionController` (`/api/v2/suppression`): `POST /check` `{"message"}` → `{"decision":"ALLOW"|"DENY","windowEndsAt","suppressedCount"}`; tenant from the `X-Argus-Tenant` header (default `default`, never from the body); 400 for a bad tenant or missing message
 - `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` with `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` slots busy), `GET` and `DELETE /jobs/{id}`
 
@@ -115,8 +115,8 @@ Read → parse → write stages in separate threads, connected by bounded queues
 
 ### Suppression (P1b)
 
-`dev.dinesh.argus.suppression`: `Suppressor.check(tenant, message)` allows a message once per tenant per window (10s) and denies and counts copies until the window ends. Key = `<tenant>:supp:` + SHA-256/128 of the trimmed message (`template-fingerprint` also replaces UUIDs, hex ids and numbers). Uses ingest time; file ingest bypasses it (guardrail 8).
-- `SuppressionStore` port. `LocalSuppressionStore` (default): Caffeine, `putIfAbsent` is the atomic decision, bounded by `max-keys`; a window that denied copies logs one `Suppressed key=… count=N` summary when it ends. `RedisSuppressionStore`: one Lua call (`SET NX PX`, else `INCR` + `PTTL`), fails open (ALLOW) on any Redis error with at most one warning per window; no end-of-window summaries yet (P4)
+`dev.dinesh.argus.suppression`: `Suppressor.check(tenant, message)` allows a message once per tenant per window (10s) and denies and counts copies until the window ends. Messages over 64K characters are rejected (400). Key = `<tenant>:supp:` + SHA-256/128 of the trimmed message (`template-fingerprint` also replaces UUIDs, hex ids and numbers). Uses ingest time; file ingest bypasses it (guardrail 8).
+- `SuppressionStore` port. `LocalSuppressionStore` (default): Caffeine, `asMap().compute` is the atomic decision (and counts a copy under the same lock eviction takes), a fixed expiry that updates don't extend, bounded by `max-keys`; a window that denied copies logs one `Suppressed key=… count=N` summary when it ends. `RedisSuppressionStore`: one Lua call (`SET NX PX`, else `INCR` + `PTTL`), fails open (ALLOW) on any Redis error with at most one warning per window; no end-of-window summaries yet (P4)
 - Wired by `config.SuppressionConfig` from `argus.suppression.store`
 
 ### Aggregation Architecture
@@ -129,6 +129,7 @@ Read → parse → write stages in separate threads, connected by bounded queues
 - `CountByLevelAggregator`: Groups logs by severity level and counts
 - `TopNEndpointsAggregator`: Extracts endpoints from HTTP request logs and ranks by frequency (Misra–Gries, 100k counters: exact up to 100k distinct endpoints, bounded error beyond)
 - `CountAggregator`: number of records
+- Level counts keep at most 64 distinct levels (JSON/kv levels are free text); later ones go under `other`
 - `ErrorRateAggregator`: Calculates error rate per time bucket (hourly by default; v1 `/aggregate` uses minutes)
 - `DurationAggregator`: Computes time duration statistics (configurable time unit)
 
@@ -151,7 +152,9 @@ Verified against the code; fix these before or alongside scaling work:
 - **Records without an event time** (JSON / kv lines with no timestamp field, or a Logback layout whose `%d` has no date, e.g. `%d{HH:mm:ss.SSS}`, whose time is kept as the `timestamp` attribute) land in `dt=unknown`, and v1's time filters and time buckets skip them.
 - **Durability is local only:** v2 checkpoints and writes NDJSON to a local/PVC volume. No object storage, WAL watermarks or retries yet (P2).
 - **Redis is only used by the optional Redis suppression store:** `spring.cache.type=redis` is configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
-- **Suppression is API-only:** no ingest path calls it yet (HTTP push ingest, P3). Redis-mode windows have no end-of-window summary; the tenant header is a stand-in until API keys (P3).
+- **Suppression is API-only:** no ingest path calls it yet (HTTP push ingest, P3). Redis-mode windows have no end-of-window summary.
+- **Suppression tenants are unauthenticated:** `X-Argus-Tenant` is caller-chosen, so a caller can probe or pre-open another tenant's windows. A stand-in until API keys (P3); breaks guardrail 4 until then.
+- **v1 aggregation reads any path:** like the rest of v1 there is no `allowed-roots` check; the slot limit bounds concurrency, not which files. Time buckets (`errorRate`, `duration`) grow with the time span the file covers (per-minute buckets: ~525k a year).
 - **No tenancy:** no tenant id, quotas, or isolation.
 
 ## Target Architecture & Guardrails
@@ -191,9 +194,10 @@ Planned packages: `framing`, `tail`, `tenant`, alongside the existing `source`, 
 
 Key properties in `application.properties`:
 - `server.port=9000`: Service port
-- `log.max-file-size=52428800`: Max file size in bytes (50MB default)
+- `log.max-file-size=52428800`: Max file size in bytes (50MB default) for the v1 endpoints that return every record
+- `log.max-concurrent-aggregations=2`: v1 streaming aggregations at once; more get 429
 - `spring.cache.type=redis` + `spring.data.redis.*`: Redis settings (caching is not enabled in code; Redis is used only by the Redis suppression store). `timeout=100ms` / `connect-timeout=200ms` so that store fails open quickly
-- `argus.suppression.*`: `window` (`10s`), `max-keys` (`100000` windows in the local store), `store` (`local` | `redis`), `template-fingerprint` (`false`)
+- `argus.suppression.*`: `window` (`10s`, at least 1ms), `max-keys` (`100000` windows in the local store), `store` (`local` | `redis`), `template-fingerprint` (`false`)
 - `spring.devtools.*`: LiveReload and restart configuration for local development
 - `argus.ingest.*`: streaming ingest. `batch-max-lines` / `batch-max-bytes` (in-memory unit), `segment-bytes` (commit unit), `raw-queue-capacity` / `parsed-queue-capacity`, `max-line-bytes` (longer lines are truncated and counted), `max-concurrent-jobs`, `allowed-roots`, `checkpoint-dir`, `keep-unparsed` (default `true`)
 - `argus.sink.local.*`: `root` (output volume) and `min-free-bytes` (a new segment fails fast below this)

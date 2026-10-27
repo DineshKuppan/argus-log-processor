@@ -40,15 +40,20 @@ public class SuppressionController {
           String tenantId,
       @RequestBody CheckRequest request) {
     long start = System.nanoTime();
-    SuppressionDecision decision = suppressor.check(tenantId, request.message());
-    // Canonical line per request (guardrail 9); DEBUG because it is on a per-message path.
-    log.debug(
-        "Suppression check tenant={} decision={} suppressedCount={} durationUs={}",
-        tenantId,
-        decision.decision(),
-        decision.suppressedCount(),
-        (System.nanoTime() - start) / 1_000);
-    return decision;
+    SuppressionDecision decision = null;
+    try {
+      decision = suppressor.check(tenantId, request.message());
+      return decision;
+    } finally {
+      // Canonical line per request (guardrail 9), failures included. DEBUG because this endpoint
+      // is called once per log message: at 4k checks/s an INFO line would outweigh the logs.
+      log.debug(
+          "Suppression check tenant={} decision={} suppressedCount={} durationUs={}",
+          tenantId,
+          decision == null ? "REJECTED" : decision.decision(),
+          decision == null ? 0 : decision.suppressedCount(),
+          (System.nanoTime() - start) / 1_000);
+    }
   }
 
   @ExceptionHandler(IllegalArgumentException.class)
