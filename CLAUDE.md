@@ -85,9 +85,16 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
   - Export to JSON and CSV formats
 
 **Controller** (`dev.dinesh.argus.controller`)
-- `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous. `/aggregate`, `/aggregateV2`, `/export/*` and `/cli-summary` stream files of any size; `/parse`, `/parse/regexp` and `/filter` return every record and keep the 50MB cap. Errors: 400 bad input (`IllegalArgumentException`, e.g. over the size cap or a negative `topN`), 404 missing file, 429 + `Retry-After` when the aggregation slots are busy
-- `SuppressionController` (`/api/v2/suppression`): `POST /check` `{"message"}` → `{"decision":"ALLOW"|"DENY","windowEndsAt","suppressedCount"}`; tenant from the `X-Argus-Tenant` header (default `default`, never from the body); 400 for a bad tenant or missing message
-- `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` with `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` slots busy), `GET` and `DELETE /jobs/{id}`
+- `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous. `/aggregate`, `/aggregateV2`, `/export/*` and `/cli-summary` stream files of any size; `/parse`, `/parse/regexp` and `/filter` return every record and keep the 50MB cap. Files must be under `argus.ingest.allowed-roots`, as for v2 (`log.enforce-allowed-roots=false` only warns, for a migration window). No tenancy (v1 persists nothing). Errors: 400 bad input (`IllegalArgumentException`, e.g. outside the roots, over the size cap or a negative `topN`), 404 missing file, 429 + `Retry-After` when the aggregation slots are busy
+- `SuppressionController` (`/api/v2/suppression`): `POST /check` `{"message"}` → `{"decision":"ALLOW"|"DENY","windowEndsAt","suppressedCount"}`; tenant from the caller's API key (see Tenancy); 400 for a missing or too long message, 401 without a valid key
+- `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` with `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` slots busy), `GET` and `DELETE /jobs/{id}` (401 without a valid key; another tenant's job is 404). Sources, checkpoints, output and jobs are per tenant
+
+### Tenancy
+
+`dev.dinesh.argus.tenant`: every v2 request acts for one tenant, resolved from credentials, never from the body (guardrail 4). Controllers take it as a `@CurrentTenant String tenantId` parameter (`CurrentTenantArgumentResolver`, wired by `config.TenancyConfig`).
+- `ApiKeyTenantResolver` (default, `argus.tenancy.mode=api-key`): `X-Argus-Api-Key: <key>` or `Authorization: Bearer <key>`. Configuration holds only each key's SHA-256: `argus.tenancy.api-keys[i].tenant` / `.key-sha256` (`printf %s "$KEY" | shasum -a 256`). Missing or unknown key → 401 + `WWW-Authenticate` (`TenantExceptionHandler`). With no keys configured the app starts, warns, and v2 answers 401
+- `HeaderTenantResolver` (`mode=header`): trusts a caller-chosen `X-Argus-Tenant` (default `default`). Local development only; warns at startup
+- `TenantIds.requireValid`: `[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}`, safe in keys (no `:`) and paths (no `/`, no leading `.`)
 
 ### Streaming Ingest (P0)
 
@@ -95,12 +102,12 @@ Read → parse → write stages in separate threads, connected by bounded queues
 - **Batch** (≤10,000 lines / ≤8MB) is the in-memory unit; **segment** (~500MB of source) is the durability unit: one output file and one checkpoint.
 - **Commit protocol:** a segment is fsynced and renamed into place (and its directory fsynced) *before* its end offset is checkpointed. A crash or power loss replays at most the open segment, and its output is replaced, not duplicated. Use `utils.DurableFiles` for any rename that must survive power loss.
 - `source.FileSource`: `FileChannel` reader with exact byte offsets; batches end only on line boundaries. A run stops at the last `\n`: a trailing line without one may still be being written, so it waits for the next run (as Filebeat / Fluent Bit do).
-- `checkpoint.FileCheckpointStore`: one JSON file per source (temp file + fsync + atomic rename + directory fsync). The checkpoint stores the inode, a SHA-256 of the first 1KB and a **generation**. `ResumePoint` compares them with the *opened* file and restarts from 0 in a new generation if it was replaced (inode), truncated (size) or truncated-and-regrown (head hash, e.g. `copytruncate`).
-- `sink.LocalVolumeSink`: NDJSON at `tenant=default/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson`. `dt` comes from the first event time in the segment (`unknown` if none) and the name from offsets, so replays land on the same path; `gen` keeps a rotated file's output from replacing the previous file's.
+- `checkpoint.FileCheckpointStore`: one JSON file per tenant and source, `checkpoint-dir/tenant=T/<source>.json` (temp file + fsync + atomic rename + directory fsync). The checkpoint stores the inode, a SHA-256 of the first 1KB and a **generation**. `ResumePoint` compares them with the *opened* file and restarts from 0 in a new generation if it was replaced (inode), truncated (size) or truncated-and-regrown (head hash, e.g. `copytruncate`).
+- `sink.LocalVolumeSink`: NDJSON at `tenant=T/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson`. `dt` comes from the first event time in the segment (`unknown` if none) and the name from offsets, so replays land on the same path; `gen` keeps a rotated file's output from replacing the previous file's.
 - `ingest.IngestPipeline` runs one job; `ingest.IngestJobService` runs jobs on `max-concurrent-jobs` slots with no queue (rejects instead of buffering), and only one job per source at a time.
 - **Formats (P1):** the primary parser is detected from the file's first 100 lines (or requested with `format` / `pattern`). Each line tries the primary, then the other parsers, then `raw`; job status reports `format`, `formatSource`, `fallbackParsed`, `unparsed` and `rejected`. Lines no parser understands are kept as `raw` records with `attributes["argus.unparsed"]` (`keep-unparsed=false` drops them instead).
 - `pipeline.EnvelopeFactory` turns parsed lines into `LogEnvelope`s: `eventId = UUIDv3(tenant, source, generation, line offset)`, so replays reproduce the same ids; trace/span ids and `service.name` are lifted out of the attributes.
-- Source ids become directory names, so `SourceOffset.requireValidSourceId` limits them to `[A-Za-z0-9._-]`. Ingest paths must resolve (after symlinks) under `argus.ingest.allowed-roots`.
+- Source ids become directory names, so `SourceOffset.requireValidSourceId` limits them to `[A-Za-z0-9._-]`. Ingest paths (v1 and v2, `source.AllowedPaths`) must resolve (after symlinks) under `argus.ingest.allowed-roots`; the roots are checked before existence, so a 404 never reveals a path outside them.
 
 ### Filter Architecture
 
@@ -146,16 +153,14 @@ mvn fmt:format -P local
 
 Verified against the code; fix these before or alongside scaling work:
 - **v1 `/parse`, `/parse/regexp` and `/filter` still read whole files:** they return every record, so `LogService.readLines` keeps `Files.readAllLines` behind the 50MB guard (over it, v1 answers 500, as it always has: v1 has no error mapping). Aggregations stream.
-- **v1 has no path restriction:** `?file=` / `"file"` accepts any readable path on the host (arbitrary file read). v2 enforces `allowed-roots`.
 - **Access-log dates use `Locale.ROOT`** (English `Sep`, as Nginx writes). Local `nginx.log` files generated before this change on an `en_GB` / `en_IN` JVM contain `Sept` and are now rejected; regenerate them with `DataSeeder`.
 - **No multiline framing:** a Java stack trace becomes one record per line (each continuation line is `raw` / `unparsed` unless it matches a format). Logback `%ex` is ignored for the same reason.
 - **Records without an event time** (JSON / kv lines with no timestamp field, or a Logback layout whose `%d` has no date, e.g. `%d{HH:mm:ss.SSS}`, whose time is kept as the `timestamp` attribute) land in `dt=unknown`, and v1's time filters and time buckets skip them.
 - **Durability is local only:** v2 checkpoints and writes NDJSON to a local/PVC volume. No object storage, WAL watermarks or retries yet (P2).
 - **Redis is only used by the optional Redis suppression store:** `spring.cache.type=redis` is configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
 - **Suppression is API-only:** no ingest path calls it yet (HTTP push ingest, P3). Redis-mode windows have no end-of-window summary.
-- **Suppression tenants are unauthenticated:** `X-Argus-Tenant` is caller-chosen, so a caller can probe or pre-open another tenant's windows. A stand-in until API keys (P3); breaks guardrail 4 until then.
-- **v1 aggregation reads any path:** like the rest of v1 there is no `allowed-roots` check; the slot limit bounds concurrency, not which files. Time buckets (`errorRate`, `duration`) grow with the time span the file covers (per-minute buckets: ~525k a year).
-- **No tenancy:** no tenant id, quotas, or isolation.
+- **Static API keys only:** tenants come from configured API keys (no rotation API, expiry or identity provider yet); per-tenant quotas, rate limits and allowed roots are P3.
+- **v1 time buckets** (`errorRate`, `duration`) grow with the time span the file covers (per-minute buckets: ~525k a year).
 
 ## Target Architecture & Guardrails
 
@@ -169,7 +174,7 @@ source → framing → parser (ParserRegistry/FormatDetector) → pipeline (norm
        → WAL → sink (OpenSearch hot 1-14d | Parquet+ZSTD on S3/GCS/PVC cold 1-7y)
                  ↳ tail (SSE live tail, after suppression)      checkpoint ← sink acks
 ```
-Planned packages: `framing`, `tail`, `tenant`, alongside the existing `source`, `parser`, `pipeline`, `sink`, `checkpoint`, `suppression`, `model` (`LogEnvelope`), `filter` and `aggregate` (`StreamingAggregator`).
+Planned packages: `framing`, `tail`, alongside the existing `source`, `parser`, `pipeline`, `sink`, `checkpoint`, `suppression`, `tenant`, `model` (`LogEnvelope`), `filter` and `aggregate` (`StreamingAggregator`).
 
 **Guardrails (every change must follow these):**
 1. **Never load unbounded data.** Stream sources in ≤500MB segments and process ≤10,000-line / ≤8MB micro-batches. No `readAllLines`, no `List` of a whole file.
@@ -196,6 +201,8 @@ Key properties in `application.properties`:
 - `server.port=9000`: Service port
 - `log.max-file-size=52428800`: Max file size in bytes (50MB default) for the v1 endpoints that return every record
 - `log.max-concurrent-aggregations=2`: v1 streaming aggregations at once; more get 429
+- `log.enforce-allowed-roots=true`: v1 reads only under `argus.ingest.allowed-roots`; `false` warns instead (migration window)
+- `argus.tenancy.*`: `mode` (`api-key` | `header`), `api-keys[i].tenant` / `api-keys[i].key-sha256`
 - `spring.cache.type=redis` + `spring.data.redis.*`: Redis settings (caching is not enabled in code; Redis is used only by the Redis suppression store). `timeout=100ms` / `connect-timeout=200ms` so that store fails open quickly
 - `argus.suppression.*`: `window` (`10s`, at least 1ms), `max-keys` (`100000` windows in the local store), `store` (`local` | `redis`), `template-fingerprint` (`false`)
 - `spring.devtools.*`: LiveReload and restart configuration for local development

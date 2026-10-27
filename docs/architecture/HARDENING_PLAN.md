@@ -48,3 +48,12 @@
 3. `tenant` package: resolver port, API-key and header resolvers, `@CurrentTenant`, 401 handling; suppression uses it.
 4. Tenant through ingest: checkpoints, sink, pipeline, job service, controller.
 5. Docs (CLAUDE.md, SCALING_DESIGN.md) and results (§5 here).
+
+## 5. Results
+- **Tests:** 207 pass (`mvn -P ci test`), up from 193 at the end of P1b.
+- **T1:** the 1GB ingest load test runs at 379,337 lines/s with a 201MB peak heap.
+- **Real app** (one key for tenant `acme`):
+  - Suppression: no key → 401; `X-Argus-Tenant: acme` alone → 401; `Authorization: Bearer acme-key` → ALLOW.
+  - Ingest: no key → 401. With the key, `app.json` was ingested as tenant `acme`: 25,000 lines, checkpoint at `data/checkpoints/tenant=acme/app.json`, output under `data/out/tenant=acme/…`, and every envelope carries `"tenantId":"acme"`.
+  - v1: `/parse?file=/etc/hosts` and `/aggregate` on `/etc/hosts` → 400 (outside the roots); a file under the roots → 200; a missing file under the roots → 404.
+- **Deviations:** none from §1. The tenant-id rule also forbids a leading `.` (a tenant becomes a directory name), which `X-Argus-Tenant` used to allow.
