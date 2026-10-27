@@ -56,17 +56,19 @@ public final class RedisSuppressionStore implements SuppressionStore {
 
   @Override
   public SuppressionDecision acquire(String key, String message) {
-    Instant now = clock.instant();
     List<?> reply;
     try {
       reply = redis.execute(SCRIPT, List.of(key), Long.toString(window.toMillis()));
     } catch (RuntimeException e) {
-      return failOpen(now, e);
+      return failOpen(e);
     }
     if (reply == null || reply.size() != 3) {
-      return failOpen(now, new IllegalStateException("Unexpected Redis reply: " + reply));
+      return failOpen(new IllegalStateException("Unexpected Redis reply: " + reply));
     }
-    Instant endsAt = now.plusMillis(((Number) reply.get(1)).longValue());
+    // Read the clock after the reply, so the round trip makes windowEndsAt late rather than early:
+    // a
+    // client that retries at windowEndsAt is then allowed.
+    Instant endsAt = clock.instant().plusMillis(((Number) reply.get(1)).longValue());
     return ((Number) reply.get(0)).longValue() == 1
         ? SuppressionDecision.allow(endsAt)
         : SuppressionDecision.deny(endsAt, ((Number) reply.get(2)).longValue());
@@ -77,7 +79,7 @@ public final class RedisSuppressionStore implements SuppressionStore {
     return failOpens.get();
   }
 
-  private SuppressionDecision failOpen(Instant now, RuntimeException e) {
+  private SuppressionDecision failOpen(RuntimeException e) {
     long count = failOpens.incrementAndGet();
     // At most one warning per window, so an outage at thousands of calls/s doesn't flood the log.
     long nowNanos = System.nanoTime();
@@ -88,6 +90,6 @@ public final class RedisSuppressionStore implements SuppressionStore {
           count,
           e.toString());
     }
-    return SuppressionDecision.allow(now.plus(window));
+    return SuppressionDecision.allow(clock.instant().plus(window));
   }
 }
