@@ -11,13 +11,16 @@ public class ErrorRateAggregator implements Aggregator<List<Map<String, Object>>
   public List<Map<String, Object>> compute(List<LogRecord> records) {
     Map<Instant, long[]> buckets = new TreeMap<>();
 
-    records.forEach(
-        r -> {
-          Instant hour = r.getTimestamp().truncatedTo(ChronoUnit.HOURS);
-          long[] pair = buckets.computeIfAbsent(hour, k -> new long[2]);
-          pair[0]++; // total logs
-          if ("ERROR".equalsIgnoreCase(r.getLevel())) pair[1]++; // error count
-        });
+    // Records without an event time can't be bucketed.
+    records.stream()
+        .filter(r -> r.getTimestamp() != null)
+        .forEach(
+            r -> {
+              Instant hour = r.getTimestamp().truncatedTo(ChronoUnit.HOURS);
+              long[] pair = buckets.computeIfAbsent(hour, k -> new long[2]);
+              pair[0]++; // total logs
+              if ("ERROR".equalsIgnoreCase(r.getLevel())) pair[1]++; // error count
+            });
 
     List<Map<String, Object>> out = new ArrayList<>();
     buckets.forEach(

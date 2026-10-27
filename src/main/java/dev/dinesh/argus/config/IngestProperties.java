@@ -9,6 +9,9 @@ import org.springframework.util.unit.DataSize;
  * Tuning knobs for streaming ingestion. Defaults are sized for a 4GB RAM node: a batch is the
  * in-memory unit passed between stages, a segment is the durability unit (one output file, one
  * checkpoint).
+ *
+ * @param keepUnparsed store lines no parser understands as raw records (default) instead of
+ *     dropping them
  */
 @ConfigurationProperties("argus.ingest")
 public record IngestProperties(
@@ -20,7 +23,8 @@ public record IngestProperties(
     DataSize maxLineBytes,
     int maxConcurrentJobs,
     List<Path> allowedRoots,
-    Path checkpointDir) {
+    Path checkpointDir,
+    Boolean keepUnparsed) {
 
   public IngestProperties {
     batchMaxLines = batchMaxLines > 0 ? batchMaxLines : 10_000;
@@ -32,5 +36,6 @@ public record IngestProperties(
     maxConcurrentJobs = maxConcurrentJobs > 0 ? maxConcurrentJobs : 2;
     allowedRoots = allowedRoots != null ? List.copyOf(allowedRoots) : List.of();
     checkpointDir = checkpointDir != null ? checkpointDir : Path.of("data", "checkpoints");
+    keepUnparsed = keepUnparsed == null || keepUnparsed;
   }
 }

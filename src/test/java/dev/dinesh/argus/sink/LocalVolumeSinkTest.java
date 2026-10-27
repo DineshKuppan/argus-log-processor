@@ -10,7 +10,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import dev.dinesh.argus.config.LocalSinkProperties;
-import dev.dinesh.argus.model.LogRecord;
+import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.sink.LogSink.SegmentWriter;
 import dev.dinesh.argus.source.LogBatch;
 import java.io.IOException;
@@ -40,9 +40,25 @@ class LocalVolumeSinkTest {
   }
 
   private static LogBatch batch(long start, long end, String... messages) {
-    List<LogRecord> records =
-        Stream.of(messages).map(m -> new LogRecord(TS, "INFO", m, Map.of("k", "v"))).toList();
-    return new LogBatch("app", 0, 0, records, start, end, true, 0);
+    List<LogEnvelope> records =
+        Stream.of(messages)
+            .map(
+                m ->
+                    new LogEnvelope(
+                        "id-" + m,
+                        "default",
+                        TS,
+                        TS,
+                        "INFO",
+                        9,
+                        m,
+                        null,
+                        null,
+                        null,
+                        Map.of("k", "v"),
+                        new LogEnvelope.Source("app", 0, start, "json")))
+            .toList();
+    return new LogBatch("app", 0, 0, records, start, end, true, 0, 0, 0);
   }
 
   private List<Path> committedFiles() throws IOException {
@@ -62,7 +78,7 @@ class LocalVolumeSinkTest {
     assertEquals(expected.toString(), location);
     List<String> lines = Files.readAllLines(expected);
     assertEquals(2, lines.size());
-    assertTrue(lines.get(0).contains("\"message\":\"one\""));
+    assertTrue(lines.get(0).contains("\"body\":\"one\""));
     assertTrue(lines.get(0).contains("\"timestamp\":\"2026-10-26T10:15:30Z\""));
     assertFalse(Files.exists(root.resolve("tenant=default/_staging/source=app/0.ndjson.part")));
   }

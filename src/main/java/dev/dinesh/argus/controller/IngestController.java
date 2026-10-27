@@ -42,14 +42,21 @@ public class IngestController {
    * @param path file to ingest; must be under {@code argus.ingest.allowed-roots}
    * @param sourceId optional stable id; defaults to a hash of the file's real path
    * @param fromBeginning ignore any checkpoint and start at byte 0
+   * @param format primary format ({@code nginx_access}, {@code json}, {@code cri}, {@code kv},
+   *     {@code raw}, {@code logback}); detected from the file's first lines when omitted
+   * @param pattern Logback layout such as {@code %d{ISO8601} [%t] %-5p %c - %m%n}; implies {@code
+   *     logback}
    */
-  public record IngestFileRequest(String path, String sourceId, Boolean fromBeginning) {}
+  public record IngestFileRequest(
+      String path, String sourceId, Boolean fromBeginning, String format, String pattern) {}
 
   @PostMapping("/file")
   public ResponseEntity<IngestJobStatus> ingestFile(@RequestBody IngestFileRequest request)
       throws IOException {
     boolean fromBeginning = Boolean.TRUE.equals(request.fromBeginning());
-    var job = jobs.submit(request.path(), request.sourceId(), fromBeginning);
+    var job =
+        jobs.submit(
+            request.path(), request.sourceId(), fromBeginning, request.format(), request.pattern());
     return ResponseEntity.accepted()
         .header(HttpHeaders.LOCATION, "/api/v2/ingest/jobs/" + job.id())
         .body(IngestJobStatus.of(job));

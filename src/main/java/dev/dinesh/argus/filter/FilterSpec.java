@@ -24,6 +24,9 @@ public record FilterSpec(Instant from, Instant to, Set<String> levels, Pattern m
    */
   public Predicate<LogRecord> toPredicate() {
     return record -> {
+      if ((from != null || to != null) && record.getTimestamp() == null) {
+        return false; // a record without an event time cannot be placed in a time range
+      }
       if (from != null && record.getTimestamp().isBefore(from)) {
         return false;
       }

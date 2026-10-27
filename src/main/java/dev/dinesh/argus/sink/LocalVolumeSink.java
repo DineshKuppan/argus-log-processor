@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import dev.dinesh.argus.config.LocalSinkProperties;
-import dev.dinesh.argus.model.LogRecord;
+import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.source.LogBatch;
 import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.utils.DurableFiles;
@@ -30,9 +30,10 @@ import org.springframework.stereotype.Component;
  * root/tenant=default/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson        after commit
  * </pre>
  *
- * <p>Names derive from source offsets, and {@code dt} from the segment's first record, so replaying
- * a segment after a crash lands on the same path and replaces the earlier copy. {@code gen}
- * separates successive files at the same path (rotation, truncation), whose offsets restart at 0.
+ * <p>Names derive from source offsets, and {@code dt} from the first event time in the segment
+ * ({@code unknown} if no record has one; ingest time would change on replay), so replaying a
+ * segment after a crash lands on the same path and replaces the earlier copy. {@code gen} separates
+ * successive files at the same path (rotation, truncation), whose offsets restart at 0.
  */
 @Slf4j
 @Component
@@ -121,9 +122,9 @@ public class LocalVolumeSink implements LogSink {
 
     @Override
     public void write(LogBatch batch) throws IOException {
-      for (LogRecord record : batch.records()) {
+      for (LogEnvelope record : batch.records()) {
         if (firstTimestamp == null) {
-          firstTimestamp = record.getTimestamp();
+          firstTimestamp = record.timestamp();
         }
         writer.writeValue(json, record);
         json.writeRaw('\n');

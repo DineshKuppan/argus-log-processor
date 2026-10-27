@@ -8,7 +8,9 @@ import dev.dinesh.argus.aggregate.impl.TopNEndpointsAggregator;
 import dev.dinesh.argus.filter.FilterSpec;
 import dev.dinesh.argus.filter.LogFilter;
 import dev.dinesh.argus.model.LogRecord;
-import dev.dinesh.argus.parser.LineParser;
+import dev.dinesh.argus.parser.FormatDetector;
+import dev.dinesh.argus.parser.ParserChain;
+import dev.dinesh.argus.parser.ParserRegistry;
 import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -35,15 +37,15 @@ import org.springframework.stereotype.Service;
 public class LogService {
 
   private final ObjectMapper mapper = new ObjectMapper();
-  private final LineParser lineParser;
+  private final ParserRegistry parsers;
 
   @Value("${log.max-file-size}")
   private long maxFileSize;
 
   private static final long DEFAULT_MAX_FILE_SIZE = 50L * 1024 * 1024;
 
-  public LogService(LineParser lineParser) {
-    this.lineParser = lineParser;
+  public LogService(ParserRegistry parsers) {
+    this.parsers = parsers;
   }
 
   public static String getFileSizeInfo(Path path) throws Exception {
@@ -66,21 +68,29 @@ public class LogService {
   }
 
   public List<LogRecord> parseFile(String filePath) throws Exception {
-    return readLines(filePath).stream()
-        .filter(l -> !l.isBlank())
-        .map(lineParser::parse)
-        .filter(Objects::nonNull)
-        .toList();
+    return parseLines(readLines(filePath));
   }
 
   /** Parses only the lines that fully match {@code pattern}. */
   public List<LogRecord> parseFile(String filePath, String pattern) throws Exception {
     Pattern linePattern = Pattern.compile(pattern);
-    return readLines(filePath).stream()
-        .filter(l -> !l.isBlank())
-        .filter(l -> linePattern.matcher(l).matches())
-        .map(lineParser::parse)
+    return parseLines(
+        readLines(filePath).stream().filter(l -> linePattern.matcher(l).matches()).toList());
+  }
+
+  /**
+   * Detects the format from the first lines, then parses every line with the shared parser chain.
+   * Lines no parser understands are dropped: v1 returns only structured records.
+   */
+  private List<LogRecord> parseLines(List<String> lines) {
+    List<String> nonBlank = lines.stream().filter(l -> !l.isBlank()).toList();
+    List<String> sample =
+        nonBlank.subList(0, Math.min(FormatDetector.SAMPLE_LINES, nonBlank.size()));
+    ParserChain chain = parsers.chain(parsers.detect(sample).parser(), false);
+    return nonBlank.stream()
+        .map(chain::parse)
         .filter(Objects::nonNull)
+        .map(ParserChain.Parsed::record)
         .toList();
   }
 
@@ -149,16 +159,17 @@ public class LogService {
 
   public List<Map<String, Object>> errorRateOverTime(List<LogRecord> logs) {
     Map<java.time.Instant, long[]> buckets = new TreeMap<>();
-    logs.forEach(
-        r -> {
-          java.time.Instant minute =
-              r.getTimestamp().truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
-          long[] pair = buckets.computeIfAbsent(minute, k -> new long[2]);
-          pair[0]++;
-          if ("ERROR".equalsIgnoreCase(r.getLevel())) {
-            pair[1]++;
-          }
-        });
+    withTimestamp(logs)
+        .forEach(
+            r -> {
+              java.time.Instant minute =
+                  r.getTimestamp().truncatedTo(java.time.temporal.ChronoUnit.MINUTES);
+              long[] pair = buckets.computeIfAbsent(minute, k -> new long[2]);
+              pair[0]++;
+              if ("ERROR".equalsIgnoreCase(r.getLevel())) {
+                pair[1]++;
+              }
+            });
     List<Map<String, Object>> out = new ArrayList<>();
     buckets.forEach(
         (k, v) -> {
@@ -166,6 +177,11 @@ public class LogService {
           out.add(Map.of("minute", k.toString(), "total", v[0], "errors", v[1], "errorRate", rate));
         });
     return out;
+  }
+
+  /** Time-bucketed views skip records without an event time (possible for JSON and kv logs). */
+  private static List<LogRecord> withTimestamp(List<LogRecord> logs) {
+    return logs.stream().filter(r -> r.getTimestamp() != null).toList();
   }
 
   public String exportToJson(Map<String, Object> results) throws Exception {
@@ -200,7 +216,7 @@ public class LogService {
     //        System.out.printf("%d ERROR logs between %s–%s\n", count, hour, hour + ":59"));
 
     Map<String, Long> errorCounts =
-        logs.stream()
+        withTimestamp(logs).stream()
             .filter(r -> "ERROR".equalsIgnoreCase(r.getLevel()))
             .collect(
                 Collectors.groupingBy(

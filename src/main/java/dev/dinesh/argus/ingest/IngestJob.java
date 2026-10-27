@@ -1,5 +1,6 @@
 package dev.dinesh.argus.ingest;
 
+import dev.dinesh.argus.parser.LogParser;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -23,6 +24,7 @@ public final class IngestJob {
   private final String sourceId;
   private final Path path;
   private final boolean fromBeginning;
+  private final LogParser parser;
   private final Instant createdAt = Instant.now();
   private final IngestProgress progress = new IngestProgress();
   private final AtomicBoolean cancel = new AtomicBoolean();
@@ -30,11 +32,15 @@ public final class IngestJob {
   private volatile String error;
   private volatile Instant finishedAt;
 
-  IngestJob(String id, String sourceId, Path path, boolean fromBeginning) {
+  /**
+   * @param parser requested primary parser, or null to detect it
+   */
+  IngestJob(String id, String sourceId, Path path, boolean fromBeginning, LogParser parser) {
     this.id = id;
     this.sourceId = sourceId;
     this.path = path;
     this.fromBeginning = fromBeginning;
+    this.parser = parser;
   }
 
   void running() {
@@ -61,6 +67,11 @@ public final class IngestJob {
 
   public boolean fromBeginning() {
     return fromBeginning;
+  }
+
+  /** Requested primary parser, or null if the format is detected. */
+  public LogParser parser() {
+    return parser;
   }
 
   public Instant createdAt() {

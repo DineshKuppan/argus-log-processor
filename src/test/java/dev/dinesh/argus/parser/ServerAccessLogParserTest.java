@@ -7,9 +7,9 @@ import dev.dinesh.argus.model.LogRecord;
 import java.time.Instant;
 import org.junit.jupiter.api.Test;
 
-class LineParserTest {
+class ServerAccessLogParserTest {
 
-  private final LineParser parser = new LineParser();
+  private final ServerAccessLogParser parser = new ServerAccessLogParser();
 
   private static String accessLine(int status) {
     return "10.0.0.12 - - [09/Oct/2025:01:11:40 +0000] \"POST /api/orders HTTP/1.1\" "

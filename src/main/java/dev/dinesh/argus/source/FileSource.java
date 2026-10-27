@@ -34,6 +34,7 @@ public final class FileSource implements Closeable {
 
   private static final int READ_BUFFER_BYTES = 64 * 1024;
   private static final int INITIAL_LINE_BYTES = 8 * 1024;
+  private static final int INITIAL_OFFSETS = 1024;
   private static final int OPEN_ATTEMPTS = 3;
 
   private final String sourceId;
@@ -150,6 +151,21 @@ public final class FileSource implements Closeable {
     }
   }
 
+  /**
+   * The first complete, non-blank lines of the file (at most {@code maxLines}, read from at most
+   * {@code maxBytes}), regardless of the start offset. Used to detect the file's format.
+   */
+  public List<String> headLines(int maxBytes, int maxLines) throws IOException {
+    ByteBuffer head = ByteBuffer.allocate((int) Math.min(maxBytes, size));
+    readFully(head, 0);
+    String text = new String(head.array(), 0, head.position(), StandardCharsets.UTF_8);
+    int end = text.lastIndexOf('\n');
+    if (end < 0) {
+      return List.of();
+    }
+    return text.substring(0, end).lines().filter(l -> !l.isBlank()).limit(maxLines).toList();
+  }
+
   private static String fileKey(Path path) throws IOException {
     Object key = Files.readAttributes(path, BasicFileAttributes.class).fileKey();
     return key == null ? null : key.toString();
@@ -163,14 +179,20 @@ public final class FileSource implements Closeable {
     }
     long start = consumed;
     List<String> lines = new ArrayList<>();
+    long[] lineOffsets = new long[Math.min(batchMaxLines, INITIAL_OFFSETS)];
     int truncated = 0;
     while (consumed < limit && lines.size() < batchMaxLines && consumed - start < batchMaxBytes) {
+      long lineStart = consumed;
       readLine();
       if (lineTruncated) {
         truncated++;
       }
       String line = decodeLine();
       if (!line.isBlank()) {
+        if (lines.size() == lineOffsets.length) {
+          lineOffsets = Arrays.copyOf(lineOffsets, lineOffsets.length * 2);
+        }
+        lineOffsets[lines.size()] = lineStart;
         lines.add(line);
       }
     }
@@ -178,7 +200,15 @@ public final class FileSource implements Closeable {
     boolean lastInSegment = endOfSource || consumed - segmentStart >= segmentBytes;
     RawBatch batch =
         new RawBatch(
-            sourceId, segmentIndex, sequence++, lines, start, consumed, lastInSegment, truncated);
+            sourceId,
+            segmentIndex,
+            sequence++,
+            lines,
+            Arrays.copyOf(lineOffsets, lines.size()),
+            start,
+            consumed,
+            lastInSegment,
+            truncated);
     if (lastInSegment && !endOfSource) {
       segmentIndex++;
       segmentStart = consumed;

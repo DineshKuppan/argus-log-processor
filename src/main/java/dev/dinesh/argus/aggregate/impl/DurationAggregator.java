@@ -22,13 +22,16 @@ public class DurationAggregator implements Aggregator<List<Map<String, Object>>>
     // Map<Hour, Map<LogLevel, Count>>
     Map<Instant, Map<String, Long>> buckets = new TreeMap<>();
 
-    records.forEach(
-        r -> {
-          Instant hour = r.getTimestamp().truncatedTo(unit);
-          String level = r.getLevel();
-          Map<String, Long> levelMap = buckets.computeIfAbsent(hour, k -> new TreeMap<>());
-          levelMap.put(level, levelMap.getOrDefault(level, 0L) + 1);
-        });
+    // Records without an event time can't be bucketed.
+    records.stream()
+        .filter(r -> r.getTimestamp() != null)
+        .forEach(
+            r -> {
+              Instant hour = r.getTimestamp().truncatedTo(unit);
+              String level = r.getLevel() == null ? "-" : r.getLevel();
+              Map<String, Long> levelMap = buckets.computeIfAbsent(hour, k -> new TreeMap<>());
+              levelMap.put(level, levelMap.getOrDefault(level, 0L) + 1);
+            });
 
     List<Map<String, Object>> out = new ArrayList<>();
     buckets.forEach(

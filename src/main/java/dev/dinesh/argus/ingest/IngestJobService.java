@@ -4,6 +4,8 @@ import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.ingest.IngestJob.State;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.ingest.IngestPipeline.Request;
+import dev.dinesh.argus.parser.LogParser;
+import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.source.SourceOffset;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
@@ -42,13 +44,15 @@ public class IngestJobService {
   private static final int SOURCE_ID_HASH_BYTES = 6;
 
   private final IngestPipeline pipeline;
+  private final ParserRegistry parsers;
   private final List<Path> allowedRoots;
   private final ThreadPoolExecutor executor;
   private final Map<String, IngestJob> jobs = new ConcurrentHashMap<>();
   private final Map<String, String> activeJobBySource = new ConcurrentHashMap<>();
 
-  public IngestJobService(IngestPipeline pipeline, IngestProperties props) {
+  public IngestJobService(IngestPipeline pipeline, ParserRegistry parsers, IngestProperties props) {
     this.pipeline = pipeline;
+    this.parsers = parsers;
     this.allowedRoots = props.allowedRoots();
     AtomicInteger threadCount = new AtomicInteger();
     this.executor =
@@ -83,10 +87,17 @@ public class IngestJobService {
    * Validates the request and starts a job.
    *
    * @throws NoSuchFileException if the file does not exist
+   * @param format primary format, or null to detect it
+   * @param pattern Logback layout for format {@code logback}
    * @throws IllegalArgumentException if the path is outside the allowed roots, not a regular file,
-   *     or the source id is invalid
+   *     the source id is invalid, or the format or pattern is not supported
    */
-  public IngestJob submit(String rawPath, String requestedSourceId, boolean fromBeginning)
+  public IngestJob submit(
+      String rawPath,
+      String requestedSourceId,
+      boolean fromBeginning,
+      String format,
+      String pattern)
       throws IOException {
     if (rawPath == null || rawPath.isBlank()) {
       throw new IllegalArgumentException("path is required");
@@ -107,8 +118,10 @@ public class IngestJobService {
         requestedSourceId == null || requestedSourceId.isBlank()
             ? defaultSourceId(realPath)
             : SourceOffset.requireValidSourceId(requestedSourceId);
+    LogParser parser = parsers.resolve(format, pattern).orElse(null);
 
-    IngestJob job = new IngestJob(UUID.randomUUID().toString(), sourceId, realPath, fromBeginning);
+    IngestJob job =
+        new IngestJob(UUID.randomUUID().toString(), sourceId, realPath, fromBeginning, parser);
     String existing = activeJobBySource.putIfAbsent(sourceId, job.id());
     if (existing != null) {
       throw new SourceBusyException(sourceId, existing);
@@ -156,7 +169,7 @@ public class IngestJobService {
     try {
       Outcome outcome =
           pipeline.run(
-              new Request(job.path(), job.sourceId(), job.fromBeginning()),
+              new Request(job.path(), job.sourceId(), job.fromBeginning(), job.parser()),
               job.progress(),
               job.cancelFlag());
       job.finished(outcome == Outcome.CANCELLED ? State.CANCELLED : State.COMPLETED, null);
