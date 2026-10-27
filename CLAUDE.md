@@ -10,8 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Java 17 (the build target). **Build with JDK 17 or 21, not 24+**: the Lombok version managed by Spring Boot 3.3.3 (1.18.34) crashes on JDK 24, and every Lombok-generated getter then fails to compile. If your default JDK is newer, prefix Maven commands with e.g. `JAVA_HOME=~/.sdkman/candidates/java/17.0.14-tem`.
 - Maven 3.8+
-- Redis (optional today: configured on localhost:6379 but not used by any code yet)
-- Docker (only for the 4GB-container load check described under Testing)
+- Redis (optional: only with `argus.suppression.store=redis`; the default suppression store is in memory)
+- Docker (optional: `RedisSuppressionStoreTest` uses Testcontainers and is skipped without it; also the 4GB-container load check under Testing)
 
 ## Build and Run Commands
 
@@ -53,7 +53,8 @@ mvn test -Dtest=AggregatorTest
 # Run a specific test method
 mvn test -Dtest=AggregatorTest#testCountByLevel
 
-# Load test (tag "load", excluded by default): ingests a generated file in a JVM capped at 256MB
+# Load tests (tag "load", excluded by default): LargeFileIngestIT ingests a generated file in a JVM capped
+# at 256MB; SuppressionLatencyIT times 1M suppression decisions (p99 < 1ms)
 mvn test -Dgroups=load -DexcludedGroups=none                              # 1GB input
 mvn test -Dgroups=load -DexcludedGroups=none -Dargus.load.input-size=4GB  # needs ~4x input in free disk
 
@@ -77,13 +78,15 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
 
 **Service Layer** (`dev.dinesh.argus.service`)
 - `LogService`: Central service orchestrating parsing, filtering, aggregation, and export operations
-  - File-based parsing with 50MB default limit (configurable via `log.max-file-size`)
+  - Aggregations (`summarize`, `aggregate`, `errorRateOverTime`, `errorSummary`) stream the file through `FileSource` and the parser registry in one pass, with no size limit
+  - Methods that return every record (`parseFile`) keep the 50MB limit (`log.max-file-size`)
   - Filter application using composite pattern
   - Multiple aggregation strategies
   - Export to JSON and CSV formats
 
 **Controller** (`dev.dinesh.argus.controller`)
-- `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous; loads the whole file (50MB cap) and returns results inline
+- `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous. `/aggregate`, `/aggregateV2`, `/export/*` and `/cli-summary` stream files of any size; `/parse`, `/parse/regexp` and `/filter` return every record and keep the 50MB cap
+- `SuppressionController` (`/api/v2/suppression`): `POST /check` `{"message"}` → `{"decision":"ALLOW"|"DENY","windowEndsAt","suppressedCount"}`; tenant from the `X-Argus-Tenant` header (default `default`, never from the body); 400 for a bad tenant or missing message
 - `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` with `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` slots busy), `GET` and `DELETE /jobs/{id}`
 
 ### Streaming Ingest (P0)
@@ -110,15 +113,23 @@ Read → parse → write stages in separate threads, connected by bounded queues
 - `LevelFilter`: Filters by log level (INFO, ERROR, DEBUG, etc.)
 - `RegexFilter`: Pattern matching against log messages
 
+### Suppression (P1b)
+
+`dev.dinesh.argus.suppression`: `Suppressor.check(tenant, message)` allows a message once per tenant per window (10s) and denies and counts copies until the window ends. Key = `<tenant>:supp:` + SHA-256/128 of the trimmed message (`template-fingerprint` also replaces UUIDs, hex ids and numbers). Uses ingest time; file ingest bypasses it (guardrail 8).
+- `SuppressionStore` port. `LocalSuppressionStore` (default): Caffeine, `putIfAbsent` is the atomic decision, bounded by `max-keys`; a window that denied copies logs one `Suppressed key=… count=N` summary when it ends. `RedisSuppressionStore`: one Lua call (`SET NX PX`, else `INCR` + `PTTL`), fails open (ALLOW) on any Redis error with at most one warning per window; no end-of-window summaries yet (P4)
+- Wired by `config.SuppressionConfig` from `argus.suppression.store`
+
 ### Aggregation Architecture
 
-**Interface** (`dev.dinesh.argus.aggregate`)
-- `Aggregator<T>`: Generic interface for computing statistics over log collections
+**Interfaces** (`dev.dinesh.argus.aggregate`)
+- `Aggregator<T>`: `compute(List<LogRecord>)`, for callers that already hold the records
+- `StreamingAggregator<A, T> extends Aggregator<T>`: `newState()`, `accept(state, record)`, `merge(a, b)`, `result(state)` (the `Collector` shape); memory depends on the result, not the input. Every built-in aggregator implements it
 
 **Implementations** (`dev.dinesh.argus.aggregate.impl`)
 - `CountByLevelAggregator`: Groups logs by severity level and counts
-- `TopNEndpointsAggregator`: Extracts endpoints from HTTP request logs and ranks by frequency
-- `ErrorRateAggregator`: Calculates error rate over time windows
+- `TopNEndpointsAggregator`: Extracts endpoints from HTTP request logs and ranks by frequency (Misra–Gries, 100k counters: exact up to 100k distinct endpoints, bounded error beyond)
+- `CountAggregator`: number of records
+- `ErrorRateAggregator`: Calculates error rate per time bucket (hourly by default; v1 `/aggregate` uses minutes)
 - `DurationAggregator`: Computes time duration statistics (configurable time unit)
 
 ### Code Formatting
@@ -133,14 +144,14 @@ mvn fmt:format -P local
 ## Current State & Known Gaps
 
 Verified against the code; fix these before or alongside scaling work:
-- **v1 still reads whole files:** `LogService.readLines` uses `Files.readAllLines` behind a 50MB guard. Use `/api/v2/ingest` for large files; v1 moves onto the pipeline once aggregation streams (P1).
+- **v1 `/parse`, `/parse/regexp` and `/filter` still read whole files:** they return every record, so `LogService.readLines` keeps `Files.readAllLines` behind the 50MB guard (over it, v1 answers 500, as it always has: v1 has no error mapping). Aggregations stream.
 - **v1 has no path restriction:** `?file=` / `"file"` accepts any readable path on the host (arbitrary file read). v2 enforces `allowed-roots`.
 - **Access-log dates use `Locale.ROOT`** (English `Sep`, as Nginx writes). Local `nginx.log` files generated before this change on an `en_GB` / `en_IN` JVM contain `Sept` and are now rejected; regenerate them with `DataSeeder`.
 - **No multiline framing:** a Java stack trace becomes one record per line (each continuation line is `raw` / `unparsed` unless it matches a format). Logback `%ex` is ignored for the same reason.
 - **Records without an event time** (JSON / kv lines with no timestamp field, or a Logback layout whose `%d` has no date, e.g. `%d{HH:mm:ss.SSS}`, whose time is kept as the `timestamp` attribute) land in `dt=unknown`, and v1's time filters and time buckets skip them.
-- **Non-streaming aggregation:** `Aggregator.compute(List<LogRecord>)` requires every record in memory.
 - **Durability is local only:** v2 checkpoints and writes NDJSON to a local/PVC volume. No object storage, WAL watermarks or retries yet (P2).
-- **Redis unused:** configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
+- **Redis is only used by the optional Redis suppression store:** `spring.cache.type=redis` is configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
+- **Suppression is API-only:** no ingest path calls it yet (HTTP push ingest, P3). Redis-mode windows have no end-of-window summary; the tenant header is a stand-in until API keys (P3).
 - **No tenancy:** no tenant id, quotas, or isolation.
 
 ## Target Architecture & Guardrails
@@ -155,7 +166,7 @@ source → framing → parser (ParserRegistry/FormatDetector) → pipeline (norm
        → WAL → sink (OpenSearch hot 1-14d | Parquet+ZSTD on S3/GCS/PVC cold 1-7y)
                  ↳ tail (SSE live tail, after suppression)      checkpoint ← sink acks
 ```
-Planned packages: `source`, `framing`, `pipeline`, `sink`, `checkpoint`, `tail`, `tenant`, alongside the existing `parser`, `model` (`LogEnvelope`), `filter` and `aggregate` (`StreamingAggregator`).
+Planned packages: `framing`, `tail`, `tenant`, alongside the existing `source`, `parser`, `pipeline`, `sink`, `checkpoint`, `suppression`, `model` (`LogEnvelope`), `filter` and `aggregate` (`StreamingAggregator`).
 
 **Guardrails (every change must follow these):**
 1. **Never load unbounded data.** Stream sources in ≤500MB segments and process ≤10,000-line / ≤8MB micro-batches. No `readAllLines`, no `List` of a whole file.
@@ -181,7 +192,8 @@ Planned packages: `source`, `framing`, `pipeline`, `sink`, `checkpoint`, `tail`,
 Key properties in `application.properties`:
 - `server.port=9000`: Service port
 - `log.max-file-size=52428800`: Max file size in bytes (50MB default)
-- `spring.cache.type=redis` + `spring.data.redis.*`: Redis cache settings (see Known Gaps: caching is not enabled in code yet)
+- `spring.cache.type=redis` + `spring.data.redis.*`: Redis settings (caching is not enabled in code; Redis is used only by the Redis suppression store). `timeout=100ms` / `connect-timeout=200ms` so that store fails open quickly
+- `argus.suppression.*`: `window` (`10s`), `max-keys` (`100000` windows in the local store), `store` (`local` | `redis`), `template-fingerprint` (`false`)
 - `spring.devtools.*`: LiveReload and restart configuration for local development
 - `argus.ingest.*`: streaming ingest. `batch-max-lines` / `batch-max-bytes` (in-memory unit), `segment-bytes` (commit unit), `raw-queue-capacity` / `parsed-queue-capacity`, `max-line-bytes` (longer lines are truncated and counted), `max-concurrent-jobs`, `allowed-roots`, `checkpoint-dir`, `keep-unparsed` (default `true`)
 - `argus.sink.local.*`: `root` (output volume) and `min-free-bytes` (a new segment fails fast below this)
@@ -192,7 +204,8 @@ Key properties in `application.properties`:
 - Unit tests use JUnit 5 and Mockito
 - Test files are located in `src/test/java/dev/dinesh/argus/`
 - Parser tests: `ParserContractTest` (every parser: never throws, honours `canParse`, thread-safe), `FormatParsersTest` (format-specific cases), `ParserRegistryTest` (detection and fallback order), `LogParserTest`
-- Aggregator tests verify statistical calculations
+- Aggregator tests verify statistical calculations, that merging split inputs equals one pass (every `StreamingAggregator`), and the top-N bounds
+- Suppression tests: the exact window boundary with a fake clock/ticker, one ALLOW among concurrent calls, summaries and the size bound (`LocalSuppressionStoreTest`), the Redis store against a real Redis (`RedisSuppressionStoreTest`, Testcontainers, skipped without Docker) and fail-open (`RedisSuppressionStoreFailOpenTest`), the API (`SuppressionControllerTest`). `SuppressionLatencyIT` (tag `load`) checks p99 < 1ms
 - Filter tests verify filtering conditions
 - `ArgusWebApplicationTest` starts the full context, so bean wiring and property binding errors fail `mvn test`
 - Ingest tests cover offsets and resume (`FileSourceTest`), crash-safe checkpoints (`FileCheckpointStoreTest`), idempotent segments (`LocalVolumeSinkTest`), backpressure / crash-rerun / cancel (`IngestPipelineTest`), and job slots and path checks (`IngestJobServiceTest`, `IngestControllerTest`)
@@ -206,10 +219,10 @@ Key properties in `application.properties`:
 4. Optionally extend `DataSeeder` to generate sample data in the new format
 
 ### Adding a new aggregation function
-1. Create a class implementing `Aggregator<T>` in `dev.dinesh.argus.aggregate.impl`
+1. Create a class implementing `StreamingAggregator<A, T>` in `dev.dinesh.argus.aggregate.impl` (state must stay bounded however large the file)
 2. Implement `compute(List<LogRecord>)` method
 3. Add unit test in `AggregatorTest`
-4. Integrate in `LogService.runAggregations()`
+4. Add it to `AggregatorTest.aggregators()` (merge equals one pass) and to the aggregator map in `LogService.summarize()` or `aggregate()`
 
 ### Adding a new filter type
 1. Create a class implementing `LogFilter` in `dev.dinesh.argus.filter.impl`
@@ -230,7 +243,9 @@ Key properties in `application.properties`:
 - **OpenCSV**: CSV export functionality
 - **SpringDoc OpenAPI 2.5.0**: Swagger/OpenAPI documentation
 - **Lombok**: Reduces boilerplate (annotations like `@Data`, `@Slf4j`)
-- **Spring Data Redis**: Caching layer
+- **Spring Data Redis**: the optional Redis suppression store (Lettuce)
+- **Caffeine**: the local suppression store
+- **Testcontainers** (test, pinned to 1.21.4 for Docker Engine 29+): a real Redis for `RedisSuppressionStoreTest`
 - **Spring DevTools**: Live reload and restart during development
 
 ---

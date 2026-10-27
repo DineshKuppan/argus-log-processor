@@ -2,7 +2,7 @@
 
 > Phase P1 of [`SCALING_DESIGN.md`](SCALING_DESIGN.md) §12. Builds on P0 ([`P0_PLAN.md`](P0_PLAN.md)).
 > Exit criteria: **T1** (≥4,150 lines/s sustained on one 4GB node) and **T6** (correct allow/deny at the 10s boundary, p99 decision <1ms locally).
-> Ships as two PRs: **P1a** (parsers + envelope, §2–§7; **implemented**, results in §10) and **P1b** (suppression + streaming aggregation, §8).
+> Ships as two PRs: **P1a** (parsers + envelope, §2–§7; results in §10) and **P1b** (suppression + streaming aggregation, §8; results in §11). Both **implemented**.
 
 ## 1. Goal and scope
 
@@ -177,3 +177,17 @@ v2 output lines change from `LogRecord` to `LogEnvelope`:
   - `LineParser` was deleted in step 4, not step 2, because the pipeline used it until then.
   - Replayed segments are no longer byte-identical: `observedTimestamp` is the time of each run. `eventId`s, paths and every other field are identical, and the crash-replay test compares output with that field removed.
   - A record's `dt` comes from the first record in the segment that *has* an event time.
+
+## 11. Results (P1b)
+- **Tests:** 183 pass (`mvn -P ci test`), up from 155 at the end of P1a, including the Redis store against a real Redis 7.2 (Testcontainers).
+- **T6:** with the fake clock, a copy at 9.999s is denied and one at 10.000s is allowed; exactly one of 32 concurrent identical calls is allowed (16 against Redis). `SuppressionLatencyIT`, 1M decisions on a mix of hot and unique messages with the local store: **p50 1µs, p99 8.8µs, p99.9 16.5µs** (target p99 <1ms).
+- **T1:** the 1GB ingest load test still runs at 377,065 lines/s with a 202MB peak heap (ingest doesn't call the suppressor).
+- **Real app:**
+  - Local store: ALLOW, then DENY with counts 1 and 2 (a copy with surrounding spaces counts as the same message), ALLOW for another tenant, 400 for `X-Argus-Tenant: bad:tenant` and for a missing message. When the window ended, the app logged `Suppressed key=acme:supp:… count=2 window=10s message="disk full on /var"`.
+  - Redis store: the same decisions; Redis held one key, `acme:supp:…`, with value 2 and a 9.5s TTL. With Redis stopped, calls were allowed after the 100ms timeout, with one fail-open warning.
+  - v1 `/aggregateV2` on a 120MB, 1,291,417-line access log (over the 50MB limit) returned in 2.3s; `/cli-summary` and `/export/csv` also returned 200. `/parse` on the same file is still refused.
+- **Deviations:**
+  - SHA-256/128 instead of xxHash64 for the key (D7), to avoid a new dependency.
+  - Testcontainers is pinned to 1.21.4: Spring Boot 3.3.3 manages 1.19.8, which Docker Engine 29 rejects (API 1.32 < minimum 1.40).
+  - Real-app testing found that Redis-mode `windowEndsAt` was dated from before the call, so a slow first round trip made it 330ms early. It is now dated from the reply (`c82ec25`).
+  - The streaming-vs-list test generates its access lines rather than reading `src/main/resources/logs/nginx.log`: that file is git-ignored (`*.log`), so a clean checkout doesn't have it.
