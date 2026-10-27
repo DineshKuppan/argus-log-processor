@@ -67,8 +67,13 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
 ### Core Components
 
 **Models** (`dev.dinesh.argus.model`)
-- `LogRecord`: Core data model representing a parsed log entry with timestamp, level, message, and metadata map
-- `LogParser`: Interface for pluggable log parsing strategies (implementations: `JsonLogParser`, `ServerAccessLogParser`, `KeyValueLogParser`)
+- `LogRecord`: what a parser returns (timestamp, level, message, metadata map); also the v1 API's record type
+- `LogEnvelope`: the canonical v2 record, following the OpenTelemetry log data model (`eventId`, `tenantId`, `timestamp`, `observedTimestamp`, `severityText`/`severityNumber`, `body`, `traceId`/`spanId`, `resource`, `attributes`, `source`). `Severity` maps level spellings to OTel numbers
+
+**Parsers** (`dev.dinesh.argus.parser`)
+- `LogParser` port: `name()`, a cheap `canParse()` probe (no false negatives) and `parse()` returning null, never throwing. Must pass `ParserContractTest`
+- Built-ins, in priority order: `ServerAccessLogParser` (`nginx_access`), `JsonLogParser` (`json`), `CriLogParser` (`cri`, Kubernetes), `KeyValueLogParser` (`kv`); plus `RawTextParser` (`raw`, last fallback) and `LogbackPatternParser` (`logback`, a layout compiled to a regex; only when requested)
+- `ParserRegistry`: resolves a requested format, `detect()`s one from a sample (`FormatDetector`: most parsed lines wins), and builds a `ParserChain` (primary → other parsers → raw)
 
 **Service Layer** (`dev.dinesh.argus.service`)
 - `LogService`: Central service orchestrating parsing, filtering, aggregation, and export operations
@@ -79,7 +84,7 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
 
 **Controller** (`dev.dinesh.argus.controller`)
 - `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous; loads the whole file (50MB cap) and returns results inline
-- `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` slots busy), `GET` and `DELETE /jobs/{id}`
+- `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` with `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` slots busy), `GET` and `DELETE /jobs/{id}`
 
 ### Streaming Ingest (P0)
 
@@ -88,9 +93,10 @@ Read → parse → write stages in separate threads, connected by bounded queues
 - **Commit protocol:** a segment is fsynced and renamed into place (and its directory fsynced) *before* its end offset is checkpointed. A crash or power loss replays at most the open segment, and its output is replaced, not duplicated. Use `utils.DurableFiles` for any rename that must survive power loss.
 - `source.FileSource`: `FileChannel` reader with exact byte offsets; batches end only on line boundaries. A run stops at the last `\n`: a trailing line without one may still be being written, so it waits for the next run (as Filebeat / Fluent Bit do).
 - `checkpoint.FileCheckpointStore`: one JSON file per source (temp file + fsync + atomic rename + directory fsync). The checkpoint stores the inode, a SHA-256 of the first 1KB and a **generation**. `ResumePoint` compares them with the *opened* file and restarts from 0 in a new generation if it was replaced (inode), truncated (size) or truncated-and-regrown (head hash, e.g. `copytruncate`).
-- `sink.LocalVolumeSink`: NDJSON at `tenant=default/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson`. `dt` comes from the segment's first record and the name from offsets, so replays land on the same path; `gen` keeps a rotated file's output from replacing the previous file's.
+- `sink.LocalVolumeSink`: NDJSON at `tenant=default/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson`. `dt` comes from the first event time in the segment (`unknown` if none) and the name from offsets, so replays land on the same path; `gen` keeps a rotated file's output from replacing the previous file's.
 - `ingest.IngestPipeline` runs one job; `ingest.IngestJobService` runs jobs on `max-concurrent-jobs` slots with no queue (rejects instead of buffering), and only one job per source at a time.
-- `parser.LineParser`: the access-log parsing shared by v1 and v2 (replaced by a parser registry in P1).
+- **Formats (P1):** the primary parser is detected from the file's first 100 lines (or requested with `format` / `pattern`). Each line tries the primary, then the other parsers, then `raw`; job status reports `format`, `formatSource`, `fallbackParsed`, `unparsed` and `rejected`. Lines no parser understands are kept as `raw` records with `attributes["argus.unparsed"]` (`keep-unparsed=false` drops them instead).
+- `pipeline.EnvelopeFactory` turns parsed lines into `LogEnvelope`s: `eventId = UUIDv3(tenant, source, generation, line offset)`, so replays reproduce the same ids; trace/span ids and `service.name` are lifted out of the attributes.
 - Source ids become directory names, so `SourceOffset.requireValidSourceId` limits them to `[A-Za-z0-9._-]`. Ingest paths must resolve (after symlinks) under `argus.ingest.allowed-roots`.
 
 ### Filter Architecture
@@ -129,10 +135,9 @@ mvn fmt:format -P local
 Verified against the code; fix these before or alongside scaling work:
 - **v1 still reads whole files:** `LogService.readLines` uses `Files.readAllLines` behind a 50MB guard. Use `/api/v2/ingest` for large files; v1 moves onto the pipeline once aggregation streams (P1).
 - **v1 has no path restriction:** `?file=` / `"file"` accepts any readable path on the host (arbitrary file read). v2 enforces `allowed-roots`.
-- **Parsers not wired in:** `LineParser` (used by v1 and v2) only understands Nginx access lines and ignores the `parser/*` classes, so JSON and key-value logs are rejected (counted as `rejected` in v2).
 - **Access-log dates use `Locale.ROOT`** (English `Sep`, as Nginx writes). Local `nginx.log` files generated before this change on an `en_GB` / `en_IN` JVM contain `Sept` and are now rejected; regenerate them with `DataSeeder`.
-- **Most `LogParserTest` cases are commented out** (WIP commit `1f6beaf`).
-- **ISP violation:** `LogParser.parseLine(line, pattern)` is stubbed by most implementations (`JsonLogParser` returns `null`).
+- **No multiline framing:** a Java stack trace becomes one record per line (each continuation line is `raw` / `unparsed` unless it matches a format). Logback `%ex` is ignored for the same reason.
+- **Records without an event time** (JSON / kv lines with no timestamp field) land in `dt=unknown`, and v1's time filters and time buckets skip them.
 - **Non-streaming aggregation:** `Aggregator.compute(List<LogRecord>)` requires every record in memory.
 - **Durability is local only:** v2 checkpoints and writes NDJSON to a local/PVC volume. No object storage, WAL watermarks or retries yet (P2).
 - **Redis unused:** configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
@@ -178,7 +183,7 @@ Key properties in `application.properties`:
 - `log.max-file-size=52428800`: Max file size in bytes (50MB default)
 - `spring.cache.type=redis` + `spring.data.redis.*`: Redis cache settings (see Known Gaps: caching is not enabled in code yet)
 - `spring.devtools.*`: LiveReload and restart configuration for local development
-- `argus.ingest.*`: streaming ingest. `batch-max-lines` / `batch-max-bytes` (in-memory unit), `segment-bytes` (commit unit), `raw-queue-capacity` / `parsed-queue-capacity`, `max-line-bytes` (longer lines are truncated and counted), `max-concurrent-jobs`, `allowed-roots`, `checkpoint-dir`
+- `argus.ingest.*`: streaming ingest. `batch-max-lines` / `batch-max-bytes` (in-memory unit), `segment-bytes` (commit unit), `raw-queue-capacity` / `parsed-queue-capacity`, `max-line-bytes` (longer lines are truncated and counted), `max-concurrent-jobs`, `allowed-roots`, `checkpoint-dir`, `keep-unparsed` (default `true`)
 - `argus.sink.local.*`: `root` (output volume) and `min-free-bytes` (a new segment fails fast below this)
 - Runtime data (`./data/` by default) is git-ignored
 
@@ -186,7 +191,7 @@ Key properties in `application.properties`:
 
 - Unit tests use JUnit 5 and Mockito
 - Test files are located in `src/test/java/dev/dinesh/argus/`
-- Parser tests verify format-specific parsing logic
+- Parser tests: `ParserContractTest` (every parser: never throws, honours `canParse`, thread-safe), `FormatParsersTest` (format-specific cases), `ParserRegistryTest` (detection and fallback order), `LogParserTest`
 - Aggregator tests verify statistical calculations
 - Filter tests verify filtering conditions
 - `ArgusWebApplicationTest` starts the full context, so bean wiring and property binding errors fail `mvn test`
@@ -195,11 +200,10 @@ Key properties in `application.properties`:
 ## Common Development Tasks
 
 ### Adding a new log format parser
-1. Create a class implementing `LogParser` interface in `dev.dinesh.argus.parser`
-2. Implement `canParse()`, `parseLine()` methods
-3. Add test class in `src/test/java/dev/dinesh/argus/parser/`
-4. Today: v1 and v2 parse only through `LineParser`, so a new parser is not reachable from the API until `ParserRegistry` exists (roadmap P1). Target: register it in `ParserRegistry`; `FormatDetector` selects it via `canParse()`
-5. Optionally extend `DataSeeder` to generate sample data in the new format
+1. Create a class implementing `LogParser` in `dev.dinesh.argus.parser`: a stable `name()`, a cheap `canParse()` with no false negatives, and `parse()` returning null (never throwing) for lines it doesn't own. Put the event time, level and message in `LogRecord`, and everything else in a mutable `meta` map
+2. Add it to `ParserRegistry.builtIns` at the right priority (earlier wins detection ties and is tried first as a fallback). A format that needs configuration (like `logback`) is resolved in `ParserRegistry.resolve` instead
+3. Add it to `ParserContractTest.parsers()` and add format-specific cases to `FormatParsersTest`
+4. Optionally extend `DataSeeder` to generate sample data in the new format
 
 ### Adding a new aggregation function
 1. Create a class implementing `Aggregator<T>` in `dev.dinesh.argus.aggregate.impl`

@@ -2,7 +2,7 @@
 
 > Phase P1 of [`SCALING_DESIGN.md`](SCALING_DESIGN.md) §12. Builds on P0 ([`P0_PLAN.md`](P0_PLAN.md)).
 > Exit criteria: **T1** (≥4,150 lines/s sustained on one 4GB node) and **T6** (correct allow/deny at the 10s boundary, p99 decision <1ms locally).
-> Ships as two PRs: **P1a** (parsers + envelope, §2–§7) and **P1b** (suppression + streaming aggregation, §8).
+> Ships as two PRs: **P1a** (parsers + envelope, §2–§7; **implemented**, results in §10) and **P1b** (suppression + streaming aggregation, §8).
 
 ## 1. Goal and scope
 
@@ -92,9 +92,9 @@ v2 output lines change from `LogRecord` to `LogEnvelope`:
 
 ## 7. Implementation order (P1a, one commit per step)
 1. `LogParser` port, parsers, `ParserRegistry`, `FormatDetector` (+ tests; restore `LogParserTest`).
-2. v1 `LogService` on the registry; null-safe timestamps in v1 filters and aggregators; delete `LineParser`.
+2. v1 `LogService` on the registry; null-safe timestamps in v1 filters and aggregators.
 3. `LogEnvelope`, `Severity`, `EnvelopeFactory`; `RawBatch.lineOffsets`.
-4. Pipeline + sink on envelopes; API `format`/`pattern`; job status fields.
+4. Pipeline + sink on envelopes; API `format`/`pattern`; job status fields; delete `LineParser` (the pipeline used it until this step).
 5. Docs (CLAUDE.md, SCALING_DESIGN.md) and load test results.
 
 ## 8. P1b outline (second PR)
@@ -112,3 +112,12 @@ v2 output lines change from `LogRecord` to `LogEnvelope`:
 | JSON logs without timestamps land in `dt=unknown` | Reported via `unparsed`/format stats; P2's Parquet writer partitions the same way, so no data is misplaced |
 | v2 output schema change | P0 has just merged and nothing consumes the NDJSON yet; the schema is documented here and in CLAUDE.md |
 | Logback layouts that don't round-trip to a regex | Reject unsupported conversion words with a 400 and a clear message instead of guessing |
+
+## 10. Results (P1a)
+- **Tests:** 149 pass (`mvn -P ci test`), up from 74 at the end of P0. They include a parser contract test that every parser must pass, and the `LogParserTest` cases restored from `1f6beaf`.
+- **T1:** the 1GB access-log load test (256MB heap) ran at **364,726 lines/s**, 88× the 4,150 lines/s target. Peak heap was 202MB. P0 ran at about 957k lines/s; the difference is the cost of building an envelope and a UUIDv3 `eventId` per line.
+- **Real app:** `POST /api/v2/ingest/file` on the bundled `app.json` detected `json` and wrote 25,000 envelopes with 0 fallback, unparsed or rejected lines. An unknown `format` returns 400 listing the known formats. v1 `/parse` on the same file now returns all 25,000 records; before P1 it returned none.
+- **Deviations:**
+  - `LineParser` was deleted in step 4, not step 2, because the pipeline used it until then.
+  - Replayed segments are no longer byte-identical: `observedTimestamp` is the time of each run. `eventId`s, paths and every other field are identical, and the crash-replay test compares output with that field removed.
+  - A record's `dt` comes from the first record in the segment that *has* an event time.
