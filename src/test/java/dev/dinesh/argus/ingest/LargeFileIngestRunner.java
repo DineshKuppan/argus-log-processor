@@ -51,7 +51,9 @@ public final class LargeFileIngestRunner {
     long started = System.nanoTime();
     IngestPipeline.Outcome outcome =
         pipeline.run(
-            new IngestPipeline.Request(input, "load", false, null), progress, new AtomicBoolean());
+            new IngestPipeline.Request("default", input, "load", false, null),
+            progress,
+            new AtomicBoolean());
     double seconds = (System.nanoTime() - started) / 1e9;
     heap.stop();
 

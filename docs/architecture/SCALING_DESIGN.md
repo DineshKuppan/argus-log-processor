@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). P2–P5 are design only. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). P2–P5 are design only. Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents

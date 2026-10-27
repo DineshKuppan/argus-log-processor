@@ -13,6 +13,7 @@ import dev.dinesh.argus.ingest.IngestJobService.JobSlotsBusyException;
 import dev.dinesh.argus.ingest.IngestJobService.SourceBusyException;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.tenant.TenantRoots;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -43,7 +44,9 @@ class IngestJobServiceTest {
     file = Files.writeString(root.resolve("app.log"), "line\n");
     IngestProperties props =
         new IngestProperties(0, null, null, 0, 0, null, 1, List.of(root), dir.resolve("cp"), null);
-    service = new IngestJobService(pipeline, new ParserRegistry(), props);
+    service =
+        new IngestJobService(
+            pipeline, new ParserRegistry(), props, TenantRoots.sharedOnly(props.allowedRoots()));
   }
 
   @AfterEach
@@ -66,7 +69,7 @@ class IngestJobServiceTest {
     Instant deadline = Instant.now().plus(Duration.ofSeconds(5));
     while (true) {
       try {
-        return service.submit(path.toString(), sourceId, false, null, null);
+        return service.submit("default", path.toString(), sourceId, false, null, null);
       } catch (JobSlotsBusyException e) {
         if (Instant.now().isAfter(deadline)) {
           throw e;
@@ -88,7 +91,7 @@ class IngestJobServiceTest {
   void runsJobToCompletion() throws Exception {
     when(pipeline.run(any(), any(), any())).thenReturn(Outcome.COMPLETED);
 
-    IngestJob job = service.submit(file.toString(), "app", false, null, null);
+    IngestJob job = service.submit("default", file.toString(), "app", false, null, null);
 
     awaitState(job, State.COMPLETED);
     assertEquals(file.toRealPath(), job.path());
@@ -98,7 +101,7 @@ class IngestJobServiceTest {
   void recordsPipelineFailureOnTheJob() throws Exception {
     when(pipeline.run(any(), any(), any())).thenThrow(new IOException("disk full"));
 
-    IngestJob job = service.submit(file.toString(), "app", false, null, null);
+    IngestJob job = service.submit("default", file.toString(), "app", false, null, null);
 
     awaitState(job, State.FAILED);
     assertEquals("IOException: disk full", job.error());
@@ -109,7 +112,7 @@ class IngestJobServiceTest {
     Path outside = Files.writeString(dir.resolve("secret.txt"), "x");
     assertThrows(
         IllegalArgumentException.class,
-        () -> service.submit(outside.toString(), null, false, null, null));
+        () -> service.submit("default", outside.toString(), null, false, null, null));
   }
 
   @Test
@@ -118,7 +121,7 @@ class IngestJobServiceTest {
     Path link = Files.createSymbolicLink(root.resolve("link.log"), outside);
     assertThrows(
         IllegalArgumentException.class,
-        () -> service.submit(link.toString(), null, false, null, null));
+        () -> service.submit("default", link.toString(), null, false, null, null));
   }
 
   @Test
@@ -126,20 +129,22 @@ class IngestJobServiceTest {
     Path subdir = Files.createDirectories(root.resolve("sub"));
     assertThrows(
         NoSuchFileException.class,
-        () -> service.submit(root.resolve("missing.log").toString(), null, false, null, null));
+        () ->
+            service.submit(
+                "default", root.resolve("missing.log").toString(), null, false, null, null));
     assertThrows(
         IllegalArgumentException.class,
-        () -> service.submit(subdir.toString(), null, false, null, null));
+        () -> service.submit("default", subdir.toString(), null, false, null, null));
     assertThrows(
         IllegalArgumentException.class,
-        () -> service.submit(file.toString(), "../x", false, null, null));
+        () -> service.submit("default", file.toString(), "../x", false, null, null));
   }
 
   @Test
   void defaultSourceIdIsStableForTheSameFile() throws Exception {
     when(pipeline.run(any(), any(), any())).thenReturn(Outcome.COMPLETED);
 
-    IngestJob first = service.submit(file.toString(), null, false, null, null);
+    IngestJob first = service.submit("default", file.toString(), null, false, null, null);
     awaitState(first, State.COMPLETED);
     IngestJob second = submitRetryingWhileSlotsBusy(root.resolve("./app.log"), null);
 
@@ -150,21 +155,22 @@ class IngestJobServiceTest {
   @Test
   void rejectsASecondJobForABusySource() throws Exception {
     pipelineBlocksUntilReleased();
-    service.submit(file.toString(), "app", false, null, null);
+    service.submit("default", file.toString(), "app", false, null, null);
 
     assertThrows(
-        SourceBusyException.class, () -> service.submit(file.toString(), "app", false, null, null));
+        SourceBusyException.class,
+        () -> service.submit("default", file.toString(), "app", false, null, null));
   }
 
   @Test
   void rejectsJobsWhenAllSlotsAreBusy() throws Exception {
     pipelineBlocksUntilReleased();
     Path other = Files.writeString(root.resolve("other.log"), "line\n");
-    IngestJob running = service.submit(file.toString(), "app", false, null, null);
+    IngestJob running = service.submit("default", file.toString(), "app", false, null, null);
 
     assertThrows(
         JobSlotsBusyException.class,
-        () -> service.submit(other.toString(), "other", false, null, null));
+        () -> service.submit("default", other.toString(), "other", false, null, null));
 
     // A rejected submission must not leave its source marked busy.
     release.countDown();
@@ -176,9 +182,9 @@ class IngestJobServiceTest {
   @Test
   void cancelSetsTheFlagSeenByThePipeline() throws Exception {
     pipelineBlocksUntilReleased();
-    IngestJob job = service.submit(file.toString(), "app", false, null, null);
+    IngestJob job = service.submit("default", file.toString(), "app", false, null, null);
 
-    service.cancel(job.id());
+    service.cancel("default", job.id());
 
     assertTrue(job.cancelFlag().get());
   }

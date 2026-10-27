@@ -7,10 +7,11 @@ import dev.dinesh.argus.ingest.IngestPipeline.Request;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.source.SourceOffset;
+import dev.dinesh.argus.tenant.TenantIds;
+import dev.dinesh.argus.tenant.TenantRoots;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.security.MessageDigest;
@@ -32,28 +33,38 @@ import org.springframework.stereotype.Service;
 
 /**
  * Runs ingest jobs on a fixed number of slots. Jobs beyond the slot count are rejected rather than
- * queued, so callers get immediate backpressure (HTTP 429) instead of unbounded memory growth.
+ * queued, so callers get immediate backpressure (HTTP 429) instead of unbounded memory growth. Jobs
+ * belong to a tenant: a tenant sees only its own jobs, and sources are per tenant.
  */
 @Slf4j
 @Service
 public class IngestJobService {
 
-  /** Finished jobs kept for status queries; older ones are evicted. */
-  static final int MAX_RETAINED_JOBS = 200;
+  /**
+   * Finished jobs kept per tenant for status queries; older ones are evicted. Per tenant, so one
+   * tenant's submissions never evict another tenant's job records.
+   */
+  static final int MAX_RETAINED_JOBS_PER_TENANT = 200;
 
   private static final int SOURCE_ID_HASH_BYTES = 6;
 
   private final IngestPipeline pipeline;
   private final ParserRegistry parsers;
-  private final List<Path> allowedRoots;
+  private final TenantRoots tenantRoots;
   private final ThreadPoolExecutor executor;
   private final Map<String, IngestJob> jobs = new ConcurrentHashMap<>();
+
+  /** Active job id per {@code tenant/source}. */
   private final Map<String, String> activeJobBySource = new ConcurrentHashMap<>();
 
-  public IngestJobService(IngestPipeline pipeline, ParserRegistry parsers, IngestProperties props) {
+  public IngestJobService(
+      IngestPipeline pipeline,
+      ParserRegistry parsers,
+      IngestProperties props,
+      TenantRoots tenantRoots) {
     this.pipeline = pipeline;
     this.parsers = parsers;
-    this.allowedRoots = props.allowedRoots();
+    this.tenantRoots = tenantRoots;
     AtomicInteger threadCount = new AtomicInteger();
     this.executor =
         new ThreadPoolExecutor(
@@ -93,27 +104,15 @@ public class IngestJobService {
    *     the source id is invalid, or the format or pattern is not supported
    */
   public IngestJob submit(
+      String tenantId,
       String rawPath,
       String requestedSourceId,
       boolean fromBeginning,
       String format,
       String pattern)
       throws IOException {
-    if (rawPath == null || rawPath.isBlank()) {
-      throw new IllegalArgumentException("path is required");
-    }
-    // Check the roots before existence, so a 404 never reveals whether a path outside them exists.
-    Path path = Path.of(rawPath).toAbsolutePath().normalize();
-    requireAllowed(path);
-    if (!Files.exists(path)) {
-      throw new NoSuchFileException(rawPath);
-    }
-    // Again after resolving symlinks, which may point outside the roots.
-    Path realPath = path.toRealPath();
-    requireAllowed(realPath);
-    if (!Files.isRegularFile(realPath)) {
-      throw new IllegalArgumentException("Not a regular file: " + rawPath);
-    }
+    TenantIds.requireValid(tenantId);
+    Path realPath = tenantRoots.forTenant(tenantId).requireFile(rawPath);
     String sourceId =
         requestedSourceId == null || requestedSourceId.isBlank()
             ? defaultSourceId(realPath)
@@ -121,26 +120,34 @@ public class IngestJobService {
     LogParser parser = parsers.resolve(format, pattern).orElse(null);
 
     IngestJob job =
-        new IngestJob(UUID.randomUUID().toString(), sourceId, realPath, fromBeginning, parser);
-    String existing = activeJobBySource.putIfAbsent(sourceId, job.id());
+        new IngestJob(
+            UUID.randomUUID().toString(), tenantId, sourceId, realPath, fromBeginning, parser);
+    String sourceKey = sourceKey(job);
+    String existing = activeJobBySource.putIfAbsent(sourceKey, job.id());
     if (existing != null) {
       throw new SourceBusyException(sourceId, existing);
     }
     try {
-      evictOldJobs();
+      evictOldJobs(tenantId);
       jobs.put(job.id(), job);
       executor.execute(() -> runJob(job));
     } catch (RejectedExecutionException e) {
       jobs.remove(job.id());
-      activeJobBySource.remove(sourceId, job.id());
+      activeJobBySource.remove(sourceKey, job.id());
       throw new JobSlotsBusyException(executor.getMaximumPoolSize());
     }
-    log.info("Ingest job {} submitted source={} path={}", job.id(), sourceId, realPath);
+    log.info(
+        "Ingest job {} submitted tenant={} source={} path={}",
+        job.id(),
+        tenantId,
+        sourceId,
+        realPath);
     return job;
   }
 
-  public Optional<IngestJob> find(String jobId) {
-    return Optional.ofNullable(jobs.get(jobId));
+  /** The tenant's job; another tenant's job id is reported as absent, not as forbidden. */
+  public Optional<IngestJob> find(String tenantId, String jobId) {
+    return Optional.ofNullable(jobs.get(jobId)).filter(j -> j.tenantId().equals(tenantId));
   }
 
   /** Number of jobs currently occupying a slot. */
@@ -149,8 +156,8 @@ public class IngestJobService {
   }
 
   /** Requests cancellation; the job stops at its next batch boundary. */
-  public Optional<IngestJob> cancel(String jobId) {
-    Optional<IngestJob> job = find(jobId);
+  public Optional<IngestJob> cancel(String tenantId, String jobId) {
+    Optional<IngestJob> job = find(tenantId, jobId);
     job.ifPresent(j -> j.cancelFlag().set(true));
     return job;
   }
@@ -169,28 +176,20 @@ public class IngestJobService {
     try {
       Outcome outcome =
           pipeline.run(
-              new Request(job.path(), job.sourceId(), job.fromBeginning(), job.parser()),
+              new Request(
+                  job.tenantId(), job.path(), job.sourceId(), job.fromBeginning(), job.parser()),
               job.progress(),
               job.cancelFlag());
       job.finished(outcome == Outcome.CANCELLED ? State.CANCELLED : State.COMPLETED, null);
     } catch (Exception e) {
       job.finished(State.FAILED, e.getClass().getSimpleName() + ": " + e.getMessage());
     } finally {
-      activeJobBySource.remove(job.sourceId(), job.id());
+      activeJobBySource.remove(sourceKey(job), job.id());
     }
   }
 
-  /** {@code path} must be absolute and normalized; compared with each root as written and real. */
-  private void requireAllowed(Path path) throws IOException {
-    for (Path root : allowedRoots) {
-      if (Files.isDirectory(root)
-          && (path.startsWith(root.toRealPath())
-              || path.startsWith(root.toAbsolutePath().normalize()))) {
-        return;
-      }
-    }
-    throw new IllegalArgumentException(
-        "Path is outside the allowed ingest roots (argus.ingest.allowed-roots)");
+  private static String sourceKey(IngestJob job) {
+    return job.tenantId() + "/" + job.sourceId();
   }
 
   private static String defaultSourceId(Path realPath) {
@@ -204,12 +203,14 @@ public class IngestJobService {
     }
   }
 
-  private void evictOldJobs() {
-    int excess = jobs.size() - MAX_RETAINED_JOBS + 1;
+  private void evictOldJobs(String tenantId) {
+    List<IngestJob> own =
+        jobs.values().stream().filter(j -> j.tenantId().equals(tenantId)).toList();
+    int excess = own.size() - MAX_RETAINED_JOBS_PER_TENANT + 1;
     if (excess <= 0) {
       return;
     }
-    jobs.values().stream()
+    own.stream()
         .filter(j -> j.state().isFinished())
         .sorted(Comparator.comparing(IngestJob::finishedAt))
         .limit(excess)

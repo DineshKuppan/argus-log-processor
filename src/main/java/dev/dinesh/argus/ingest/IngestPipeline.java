@@ -16,6 +16,7 @@ import dev.dinesh.argus.source.FileSource;
 import dev.dinesh.argus.source.LogBatch;
 import dev.dinesh.argus.source.RawBatch;
 import dev.dinesh.argus.source.SourceOffset;
+import dev.dinesh.argus.tenant.TenantIds;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -51,12 +52,14 @@ public class IngestPipeline {
   /**
    * One run's input.
    *
+   * @param tenantId tenant the source belongs to; prefixes its checkpoints, output and event ids
    * @param path file to ingest
    * @param sourceId stable id under which offsets are checkpointed
    * @param fromBeginning ignore any checkpoint and start at byte 0
    * @param parser the source's primary parser, or null to detect it from the file's first lines
    */
-  public record Request(Path path, String sourceId, boolean fromBeginning, LogParser parser) {}
+  public record Request(
+      String tenantId, Path path, String sourceId, boolean fromBeginning, LogParser parser) {}
 
   static final String THREAD_PREFIX = "ingest-";
   private static final long HANDOFF_POLL_MS = 100;
@@ -88,6 +91,7 @@ public class IngestPipeline {
    */
   public Outcome run(Request request, IngestProgress progress, AtomicBoolean cancel)
       throws Exception {
+    String tenantId = TenantIds.requireValid(request.tenantId());
     String sourceId = SourceOffset.requireValidSourceId(request.sourceId());
     long startNanos = System.nanoTime();
     Outcome outcome = null;
@@ -101,9 +105,10 @@ public class IngestPipeline {
     } finally {
       // Canonical line: one per run, success or not.
       log.info(
-          "Ingest finished source={} outcome={} error={} resumeReason={} format={} formatSource={}"
-              + " startOffset={} committedOffset={} totalBytes={} segments={} lines={}"
-              + " fallbackParsed={} unparsed={} rejected={} truncated={} durationMs={}",
+          "Ingest finished tenant={} source={} outcome={} error={} resumeReason={} format={}"
+              + " formatSource={} startOffset={} committedOffset={} totalBytes={} segments={}"
+              + " lines={} fallbackParsed={} unparsed={} rejected={} truncated={} durationMs={}",
+          tenantId,
           sourceId,
           outcome == null ? "FAILED" : outcome,
           error == null ? null : error.getClass().getSimpleName() + ": " + error.getMessage(),
@@ -127,14 +132,15 @@ public class IngestPipeline {
       Request request, String sourceId, IngestProgress progress, AtomicBoolean cancel)
       throws Exception {
     Path path = request.path();
-    sink.discardUncommitted(sourceId);
+    sink.discardUncommitted(request.tenantId(), sourceId);
     // Open first, then compare the opened file with the checkpoint, so a rotation between the two
     // steps cannot pair this file's offsets with another file's identity.
     FileSource source = FileSource.open(path, sourceId, props);
     Stages stages;
     try {
       ResumePoint resume =
-          ResumePoint.resolve(checkpoints.load(sourceId), source, request.fromBeginning());
+          ResumePoint.resolve(
+              checkpoints.load(request.tenantId(), sourceId), source, request.fromBeginning());
       if (FILE_CHANGED.contains(resume.reason())) {
         log.warn(
             "Source {} ({}): {}; restarting from offset 0 as generation {}",
@@ -179,7 +185,8 @@ public class IngestPipeline {
               source,
               template,
               parsers.chain(primary, props.keepUnparsed()),
-              new EnvelopeFactory(EnvelopeFactory.DEFAULT_TENANT, sourceId, resume.generation()),
+              request.tenantId(),
+              new EnvelopeFactory(request.tenantId(), sourceId, resume.generation()),
               progress,
               cancel);
     } catch (Exception e) {
@@ -208,6 +215,7 @@ public class IngestPipeline {
   private final class Stages {
 
     private final FileSource source;
+    private final String tenantId;
     private final String sourceId;
     private final SourceOffset checkpointTemplate;
     private final ParserChain chain;
@@ -228,10 +236,12 @@ public class IngestPipeline {
         FileSource source,
         SourceOffset checkpointTemplate,
         ParserChain chain,
+        String tenantId,
         EnvelopeFactory envelopes,
         IngestProgress progress,
         AtomicBoolean cancel) {
       this.source = source;
+      this.tenantId = tenantId;
       this.chain = chain;
       this.envelopes = envelopes;
       this.sourceId = checkpointTemplate.sourceId();
@@ -340,13 +350,14 @@ public class IngestPipeline {
             return;
           }
           if (segment == null) {
-            segment = sink.open(sourceId, checkpointTemplate.generation(), batch.startOffset());
+            segment =
+                sink.open(tenantId, sourceId, checkpointTemplate.generation(), batch.startOffset());
           }
           segment.write(batch);
           if (batch.lastInSegment()) {
             String location = segment.commit(batch.endOffset());
             segment = null;
-            checkpoints.save(checkpointAt(batch.endOffset()));
+            checkpoints.save(tenantId, checkpointAt(batch.endOffset()));
             committedOffset = batch.endOffset();
             progress.committed(batch.endOffset(), location);
             log.info(

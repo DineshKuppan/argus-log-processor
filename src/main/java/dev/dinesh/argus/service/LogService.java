@@ -9,6 +9,7 @@ import dev.dinesh.argus.aggregate.impl.DurationAggregator;
 import dev.dinesh.argus.aggregate.impl.ErrorRateAggregator;
 import dev.dinesh.argus.aggregate.impl.TopNEndpointsAggregator;
 import dev.dinesh.argus.config.IngestProperties;
+import dev.dinesh.argus.config.LogProperties;
 import dev.dinesh.argus.filter.FilterSpec;
 import dev.dinesh.argus.filter.LogFilter;
 import dev.dinesh.argus.model.LogRecord;
@@ -16,8 +17,10 @@ import dev.dinesh.argus.parser.FormatDetector;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserChain;
 import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.source.AllowedPaths.OutsideAllowedRootsException;
 import dev.dinesh.argus.source.FileSource;
 import dev.dinesh.argus.source.RawBatch;
+import dev.dinesh.argus.tenant.TenantRoots;
 import java.io.IOException;
 import java.io.StringWriter;
 import java.nio.file.Files;
@@ -32,17 +35,16 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.unit.DataSize;
 
 /**
- * Service for parsing, filtering, analyzing, and exporting log records. Aggregations stream the
- * file in bounded batches, so they work on files of any size; at most {@code
- * log.max-concurrent-aggregations} run at once (more are rejected, never queued). Methods that
- * return every record load the whole file and are limited to {@code log.max-file-size} (50MB by
- * default).
+ * Service for parsing, filtering, analyzing, and exporting log records. Every call acts for a
+ * tenant and may read only that tenant's roots, as v2 ({@link TenantRoots}; see {@link
+ * LogProperties#enforceAllowedRoots()}). Aggregations stream the file in bounded batches, so they
+ * work on files of any size; at most {@code log.max-concurrent-aggregations} run at once (more are
+ * rejected, never queued). Methods that return every record load the whole file and are limited to
+ * {@code log.max-file-size} (50MB by default).
  */
 @Service
 @Slf4j
@@ -50,8 +52,6 @@ public class LogService {
 
   /** Source id for v1's one-off reads; v1 keeps no checkpoints, so it only labels batches. */
   private static final String V1_SOURCE_ID = "v1";
-
-  public static final int DEFAULT_MAX_CONCURRENT_AGGREGATIONS = 2;
 
   /**
    * v1 used {@code readAllLines}, which never cut a line. Streaming needs some bound, so it is far
@@ -69,32 +69,24 @@ public class LogService {
   private final ObjectMapper mapper = new ObjectMapper();
   private final ParserRegistry parsers;
   private final IngestProperties ingest;
+  private final TenantRoots tenantRoots;
+  private final boolean enforceAllowedRoots;
+  private final long maxFileSize;
   private final int aggregationSlots;
   private final Semaphore aggregations;
 
-  @Value("${log.max-file-size}")
-  private long maxFileSize;
-
-  private static final long DEFAULT_MAX_FILE_SIZE = 50L * 1024 * 1024;
-
-  public LogService(ParserRegistry parsers, IngestProperties ingest) {
-    this(parsers, ingest, DEFAULT_MAX_CONCURRENT_AGGREGATIONS);
-  }
-
-  @Autowired
   public LogService(
       ParserRegistry parsers,
       IngestProperties ingest,
-      @Value("${log.max-concurrent-aggregations:" + DEFAULT_MAX_CONCURRENT_AGGREGATIONS + "}")
-          int maxConcurrentAggregations) {
-    if (maxConcurrentAggregations < 1) {
-      throw new IllegalArgumentException(
-          "log.max-concurrent-aggregations must be positive: " + maxConcurrentAggregations);
-    }
+      LogProperties props,
+      TenantRoots tenantRoots) {
     this.parsers = parsers;
     this.ingest = withMaxLineBytes(ingest, V1_MAX_LINE_BYTES);
-    this.aggregationSlots = maxConcurrentAggregations;
-    this.aggregations = new Semaphore(maxConcurrentAggregations);
+    this.tenantRoots = tenantRoots;
+    this.enforceAllowedRoots = props.enforceAllowedRoots();
+    this.maxFileSize = props.maxFileSize().toBytes();
+    this.aggregationSlots = props.maxConcurrentAggregations();
+    this.aggregations = new Semaphore(aggregationSlots);
   }
 
   private static IngestProperties withMaxLineBytes(IngestProperties p, DataSize maxLineBytes) {
@@ -130,15 +122,18 @@ public class LogService {
     }
   }
 
-  public List<LogRecord> parseFile(String filePath) throws Exception {
-    return parseLines(readLines(filePath));
+  public List<LogRecord> parseFile(String tenantId, String filePath) throws Exception {
+    return parseLines(readLines(tenantId, filePath));
   }
 
   /** Parses only the lines that fully match {@code pattern}. */
-  public List<LogRecord> parseFile(String filePath, String pattern) throws Exception {
+  public List<LogRecord> parseFile(String tenantId, String filePath, String pattern)
+      throws Exception {
     Pattern linePattern = Pattern.compile(pattern);
     return parseLines(
-        readLines(filePath).stream().filter(l -> linePattern.matcher(l).matches()).toList());
+        readLines(tenantId, filePath).stream()
+            .filter(l -> linePattern.matcher(l).matches())
+            .toList());
   }
 
   /**
@@ -157,13 +152,13 @@ public class LogService {
         .toList();
   }
 
-  private List<String> readLines(String filePath) throws Exception {
-    Path path = Path.of(filePath);
-    long maxSize = maxFileSize > 0 ? maxFileSize : DEFAULT_MAX_FILE_SIZE;
+  private List<String> readLines(String tenantId, String filePath) throws Exception {
+    Path path = resolve(tenantId, filePath);
     long fileSize = Files.size(path);
     log.info("File size: {}", formatSmartSize(fileSize));
-    if (fileSize > maxSize) {
-      throw new IllegalArgumentException("File size exceeds 50MB limit");
+    if (fileSize > maxFileSize) {
+      throw new IllegalArgumentException(
+          "File size exceeds the " + formatSmartSize(maxFileSize) + " limit (log.max-file-size)");
     }
     List<String> lines = Files.readAllLines(path);
     log.info("Total lines: {}", lines.size());
@@ -171,30 +166,33 @@ public class LogService {
   }
 
   /** {@code byLevel}, {@code topEndpoints} and per-minute {@code errorRate}, in one pass. */
-  public Map<String, Object> summarize(String filePath, int topN) throws IOException {
+  public Map<String, Object> summarize(String tenantId, String filePath, int topN)
+      throws IOException {
     Map<String, StreamingAggregator<?, ?>> aggregators = new LinkedHashMap<>();
     aggregators.put("byLevel", new CountByLevelAggregator());
     aggregators.put("topEndpoints", new TopNEndpointsAggregator(topN));
     aggregators.put("errorRate", perMinuteErrorRate());
-    return aggregate(filePath, r -> true, aggregators);
+    return aggregate(tenantId, filePath, r -> true, aggregators);
   }
 
   /**
    * {@code totalLogs}, {@code byLevel}, {@code topEndpoints} and hourly {@code duration} counts of
    * the records matching every filter, in one pass.
    */
-  public Map<String, Object> aggregate(String filePath, List<LogFilter> filters, int topN)
-      throws IOException {
+  public Map<String, Object> aggregate(
+      String tenantId, String filePath, List<LogFilter> filters, int topN) throws IOException {
     Map<String, StreamingAggregator<?, ?>> aggregators = new LinkedHashMap<>();
     aggregators.put("totalLogs", new CountAggregator());
     aggregators.put("byLevel", new CountByLevelAggregator());
     aggregators.put("topEndpoints", new TopNEndpointsAggregator(topN));
     aggregators.put("duration", new DurationAggregator(ChronoUnit.HOURS));
-    return aggregate(filePath, r -> filters.stream().allMatch(f -> f.matches(r)), aggregators);
+    return aggregate(
+        tenantId, filePath, r -> filters.stream().allMatch(f -> f.matches(r)), aggregators);
   }
 
-  public List<Map<String, Object>> errorRateOverTime(String filePath) throws IOException {
-    return aggregate(filePath, perMinuteErrorRate());
+  public List<Map<String, Object>> errorRateOverTime(String tenantId, String filePath)
+      throws IOException {
+    return aggregate(tenantId, filePath, perMinuteErrorRate());
   }
 
   private static ErrorRateAggregator perMinuteErrorRate() {
@@ -208,7 +206,9 @@ public class LogService {
    *
    * @throws AggregationSlotsBusyException if every slot is taken
    */
-  public void forEachRecord(String filePath, Consumer<LogRecord> consumer) throws IOException {
+  public void forEachRecord(String tenantId, String filePath, Consumer<LogRecord> consumer)
+      throws IOException {
+    Path path = resolve(tenantId, filePath);
     if (!aggregations.tryAcquire()) {
       throw new AggregationSlotsBusyException(aggregationSlots);
     }
@@ -218,7 +218,7 @@ public class LogService {
     long truncated = 0;
     String format = null;
     String outcome = "FAILED";
-    try (FileSource source = FileSource.open(Path.of(filePath), V1_SOURCE_ID, ingest)) {
+    try (FileSource source = FileSource.open(path, V1_SOURCE_ID, ingest)) {
       // v1 reads finished files, so the last line counts even without a trailing newline.
       source.startAt(0, true);
       List<String> sample =
@@ -242,8 +242,9 @@ public class LogService {
       aggregations.release();
       // Canonical line per request (guardrail 9).
       log.info(
-          "v1 scan finished file={} outcome={} format={} lines={} records={} dropped={}"
+          "v1 scan finished tenant={} file={} outcome={} format={} lines={} records={} dropped={}"
               + " truncated={} durationMs={}",
+          tenantId,
           filePath,
           outcome,
           format,
@@ -255,20 +256,44 @@ public class LogService {
     }
   }
 
-  private <A, T> T aggregate(String filePath, StreamingAggregator<A, T> aggregator)
+  /**
+   * The file v1 may read for {@code filePath}: under the allowed roots, or (with enforcement off)
+   * anywhere, with a warning.
+   */
+  private Path resolve(String tenantId, String filePath) throws IOException {
+    try {
+      return tenantRoots.forTenant(tenantId).requireFile(filePath);
+    } catch (OutsideAllowedRootsException e) {
+      if (enforceAllowedRoots) {
+        throw e;
+      }
+      log.warn(
+          "v1 read outside the tenant's allowed roots tenant={} file={}; refused once"
+              + " log.enforce-allowed-roots=true",
+          tenantId,
+          filePath);
+      return Path.of(filePath);
+    }
+  }
+
+  private <A, T> T aggregate(String tenantId, String filePath, StreamingAggregator<A, T> aggregator)
       throws IOException {
     A state = aggregator.newState();
-    forEachRecord(filePath, r -> aggregator.accept(state, r));
+    forEachRecord(tenantId, filePath, r -> aggregator.accept(state, r));
     return aggregator.result(state);
   }
 
   /** Runs every aggregator over the records matching {@code filter}, in one streaming pass. */
   private Map<String, Object> aggregate(
-      String filePath, Predicate<LogRecord> filter, Map<String, StreamingAggregator<?, ?>> byName)
+      String tenantId,
+      String filePath,
+      Predicate<LogRecord> filter,
+      Map<String, StreamingAggregator<?, ?>> byName)
       throws IOException {
     List<Running<?, ?>> running =
         byName.values().stream().<Running<?, ?>>map(Running::new).toList();
     forEachRecord(
+        tenantId,
         filePath,
         r -> {
           if (filter.test(r)) {
@@ -329,8 +354,8 @@ public class LogService {
   }
 
   /** Hourly ERROR counts as a fixed-width table, in time order; hours without errors omitted. */
-  public String errorSummary(String filePath) throws IOException {
-    List<Map<String, Object>> rows = aggregate(filePath, new ErrorRateAggregator());
+  public String errorSummary(String tenantId, String filePath) throws IOException {
+    List<Map<String, Object>> rows = aggregate(tenantId, filePath, new ErrorRateAggregator());
 
     StringBuilder sb = new StringBuilder();
     sb.append(String.format("%-8s %-8s %-40s%n", "Total", "Level", "Time Range"));

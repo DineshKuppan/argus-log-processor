@@ -1,15 +1,12 @@
 package dev.dinesh.argus.suppression;
 
-import java.util.regex.Pattern;
+import dev.dinesh.argus.tenant.TenantIds;
 
 /**
  * Decides whether a message may be printed: only if the same tenant has not had the same message
  * allowed within the window. Uses ingest time, never the message's own timestamp (guardrail 8).
  */
 public class Suppressor {
-
-  /** Tenant ids start every store key (guardrail 4), so they may not contain the ':' separator. */
-  private static final Pattern TENANT_ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
 
   /**
    * Each check hashes the whole message (and template mode scans it three times), so its size is
@@ -29,10 +26,7 @@ public class Suppressor {
    * @throws IllegalArgumentException for an invalid tenant id, or a null or too long message
    */
   public SuppressionDecision check(String tenantId, String message) {
-    if (tenantId == null || !TENANT_ID.matcher(tenantId).matches()) {
-      throw new IllegalArgumentException(
-          "Invalid tenant id (allowed: 1-64 of A-Z a-z 0-9 . _ -): " + tenantId);
-    }
+    TenantIds.requireValid(tenantId);
     if (message == null) {
       throw new IllegalArgumentException("message is required");
     }

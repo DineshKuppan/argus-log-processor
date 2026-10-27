@@ -69,7 +69,7 @@ class LocalVolumeSinkTest {
 
   @Test
   void commitMovesThePartFileToItsOffsetDerivedPath() throws IOException {
-    SegmentWriter writer = sink().open("app", 0, 0);
+    SegmentWriter writer = sink().open("default", "app", 0, 0);
     writer.write(batch(0, 40, "one", "two"));
 
     String location = writer.commit(40);
@@ -85,7 +85,7 @@ class LocalVolumeSinkTest {
 
   @Test
   void abortDeletesThePartFile() throws IOException {
-    SegmentWriter writer = sink().open("app", 0, 0);
+    SegmentWriter writer = sink().open("default", "app", 0, 0);
     writer.write(batch(0, 40, "one"));
 
     writer.abort();
@@ -97,12 +97,12 @@ class LocalVolumeSinkTest {
   @Test
   void recommittingASegmentReplacesTheEarlierCopy() throws IOException {
     LocalVolumeSink sink = sink();
-    SegmentWriter first = sink.open("app", 0, 0);
+    SegmentWriter first = sink.open("default", "app", 0, 0);
     first.write(batch(0, 40, "one"));
     first.commit(40);
 
     // Rerun after a crash: same start offset, file has grown so the segment ends later.
-    SegmentWriter replay = sink.open("app", 0, 0);
+    SegmentWriter replay = sink.open("default", "app", 0, 0);
     replay.write(batch(0, 60, "one", "two"));
     replay.commit(60);
 
@@ -114,12 +114,12 @@ class LocalVolumeSinkTest {
   @Test
   void aNewGenerationNeverReplacesTheEarlierFilesOutput() throws IOException {
     LocalVolumeSink sink = sink();
-    SegmentWriter beforeRotation = sink.open("app", 0, 0);
+    SegmentWriter beforeRotation = sink.open("default", "app", 0, 0);
     beforeRotation.write(batch(0, 40, "old file"));
     beforeRotation.commit(40);
 
     // Same path after rotation: offsets restart at 0, on the same day.
-    SegmentWriter afterRotation = sink.open("app", 1, 0);
+    SegmentWriter afterRotation = sink.open("default", "app", 1, 0);
     afterRotation.write(batch(0, 60, "new file"));
     afterRotation.commit(60);
 
@@ -131,7 +131,7 @@ class LocalVolumeSinkTest {
 
   @Test
   void writesOneJsonRecordPerLineWithATrailingNewline() throws IOException {
-    SegmentWriter writer = sink().open("app", 0, 0);
+    SegmentWriter writer = sink().open("default", "app", 0, 0);
     writer.write(batch(0, 20, "one", "two"));
     writer.write(batch(20, 40, "three"));
 
@@ -149,21 +149,21 @@ class LocalVolumeSinkTest {
   @Test
   void segmentsOfSimilarlyNamedSourcesDoNotCollide() throws IOException {
     LocalVolumeSink sink = sink();
-    SegmentWriter app = sink.open("app", 0, 0);
+    SegmentWriter app = sink.open("default", "app", 0, 0);
     app.write(batch(0, 40, "one"));
     app.commit(40);
-    SegmentWriter app0 = sink.open("app-0", 0, 0);
+    SegmentWriter app0 = sink.open("default", "app-0", 0, 0);
     app0.write(batch(0, 40, "one"));
     app0.commit(40);
 
-    sink.discardUncommitted("app");
+    sink.discardUncommitted("default", "app");
 
     assertEquals(2, committedFiles().size());
   }
 
   @Test
   void emptySegmentIsNotWritten() throws IOException {
-    SegmentWriter writer = sink().open("app", 0, 0);
+    SegmentWriter writer = sink().open("default", "app", 0, 0);
     writer.write(batch(0, 40));
 
     assertNull(writer.commit(40));
@@ -173,10 +173,10 @@ class LocalVolumeSinkTest {
   @Test
   void discardUncommittedRemovesStalePartsForThatSourceOnly() throws IOException {
     LocalVolumeSink sink = sink();
-    sink.open("app", 0, 0).write(batch(0, 40, "crashed"));
-    sink.open("other", 0, 0).write(batch(0, 40, "in progress"));
+    sink.open("default", "app", 0, 0).write(batch(0, 40, "crashed"));
+    sink.open("default", "other", 0, 0).write(batch(0, 40, "in progress"));
 
-    sink.discardUncommitted("app");
+    sink.discardUncommitted("default", "app");
 
     assertFalse(Files.exists(root.resolve("tenant=default/_staging/source=app/0.ndjson.part")));
     assertTrue(Files.exists(root.resolve("tenant=default/_staging/source=other/0.ndjson.part")));
@@ -188,13 +188,13 @@ class LocalVolumeSinkTest {
         new LocalVolumeSink(
             new LocalSinkProperties(root, DataSize.ofBytes(Long.MAX_VALUE)), mapper);
 
-    IOException e = assertThrows(IOException.class, () -> sink.open("app", 0, 0));
+    IOException e = assertThrows(IOException.class, () -> sink.open("default", "app", 0, 0));
     assertTrue(e.getMessage().startsWith("Insufficient disk space"));
   }
 
   @Test
   void rejectsSourceIdsThatCouldEscapeTheRoot() {
-    assertThrows(IllegalArgumentException.class, () -> sink().open("..", 0, 0));
-    assertThrows(IllegalArgumentException.class, () -> sink().open("a/b", 0, 0));
+    assertThrows(IllegalArgumentException.class, () -> sink().open("default", "..", 0, 0));
+    assertThrows(IllegalArgumentException.class, () -> sink().open("default", "a/b", 0, 0));
   }
 }

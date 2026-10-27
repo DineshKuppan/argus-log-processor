@@ -6,17 +6,19 @@ import java.io.IOException;
 /**
  * Destination for parsed records, written one segment at a time. A segment becomes visible only on
  * {@link SegmentWriter#commit}; re-committing the same segment must replace it, never duplicate it.
+ * Output is per tenant: every location starts with the tenant (guardrail 4).
  */
 public interface LogSink {
 
-  /** Removes uncommitted output a crashed run left behind for {@code sourceId}. */
-  void discardUncommitted(String sourceId) throws IOException;
+  /** Removes uncommitted output a crashed run left behind for the tenant's {@code sourceId}. */
+  void discardUncommitted(String tenantId, String sourceId) throws IOException;
 
   /**
    * Starts a segment beginning at {@code startOffset}. Segments of different {@code generation}s
    * (successive files at the same path) never replace each other, even at the same offsets.
    */
-  SegmentWriter open(String sourceId, int generation, long startOffset) throws IOException;
+  SegmentWriter open(String tenantId, String sourceId, int generation, long startOffset)
+      throws IOException;
 
   /** Writes one segment. Not thread-safe: owned by a single writer thread. */
   interface SegmentWriter {

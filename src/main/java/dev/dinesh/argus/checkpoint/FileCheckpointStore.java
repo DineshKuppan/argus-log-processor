@@ -3,6 +3,7 @@ package dev.dinesh.argus.checkpoint;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.source.SourceOffset;
+import dev.dinesh.argus.tenant.TenantIds;
 import dev.dinesh.argus.utils.DurableFiles;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -16,13 +17,16 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
- * One JSON file per source. Writes go to a temp file that is fsynced and then atomically renamed
- * over the previous checkpoint (with the directory fsynced too), so a crash never leaves a
- * half-written checkpoint behind and a saved checkpoint survives power loss.
+ * One JSON file per source, at {@code dir/tenant=T/<source>.json}. Writes go to a temp file that is
+ * fsynced and then atomically renamed over the previous checkpoint (with the directory fsynced
+ * too), so a crash never leaves a half-written checkpoint behind and a saved checkpoint survives
+ * power loss.
  */
 @Slf4j
 @Component
 public class FileCheckpointStore implements CheckpointStore {
+
+  private static final String LEGACY_TENANT = "default";
 
   private final Path dir;
   private final ObjectMapper mapper;
@@ -38,9 +42,12 @@ public class FileCheckpointStore implements CheckpointStore {
   }
 
   @Override
-  public Optional<SourceOffset> load(String sourceId) throws IOException {
-    Path file = fileFor(sourceId);
+  public Optional<SourceOffset> load(String tenantId, String sourceId) throws IOException {
+    Path file = fileFor(tenantId, sourceId);
     if (!Files.exists(file)) {
+      file = legacyFileFor(tenantId, sourceId);
+    }
+    if (file == null || !Files.exists(file)) {
       return Optional.empty();
     }
     try {
@@ -52,10 +59,10 @@ public class FileCheckpointStore implements CheckpointStore {
   }
 
   @Override
-  public void save(SourceOffset offset) throws IOException {
-    Path file = fileFor(offset.sourceId());
+  public void save(String tenantId, SourceOffset offset) throws IOException {
+    Path file = fileFor(tenantId, offset.sourceId());
     Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
-    DurableFiles.createDirectories(dir);
+    DurableFiles.createDirectories(file.getParent());
     try (FileChannel channel =
         FileChannel.open(
             tmp,
@@ -71,7 +78,20 @@ public class FileCheckpointStore implements CheckpointStore {
     DurableFiles.moveAtomically(tmp, file);
   }
 
-  private Path fileFor(String sourceId) {
-    return dir.resolve(SourceOffset.requireValidSourceId(sourceId) + ".json");
+  /**
+   * Before tenancy every checkpoint was {@code dir/<source>.json} and every tenant was {@code
+   * default}. Reading it keeps the source's offset and generation, so an upgrade neither re-ingests
+   * the file nor restarts at generation 0 (which would replace an earlier rotated file's output).
+   * The next save writes the tenant path.
+   */
+  private Path legacyFileFor(String tenantId, String sourceId) {
+    return LEGACY_TENANT.equals(tenantId)
+        ? dir.resolve(SourceOffset.requireValidSourceId(sourceId) + ".json")
+        : null;
+  }
+
+  private Path fileFor(String tenantId, String sourceId) {
+    return dir.resolve(TenantIds.pathSegment(tenantId))
+        .resolve(SourceOffset.requireValidSourceId(sourceId) + ".json");
   }
 }
