@@ -36,6 +36,7 @@ class FileSourceTest {
         DataSize.ofBytes(maxLineBytes),
         2,
         List.of(),
+        null,
         null);
   }
 

@@ -151,6 +151,21 @@ public final class FileSource implements Closeable {
     }
   }
 
+  /**
+   * The first complete, non-blank lines of the file (at most {@code maxLines}, read from at most
+   * {@code maxBytes}), regardless of the start offset. Used to detect the file's format.
+   */
+  public List<String> headLines(int maxBytes, int maxLines) throws IOException {
+    ByteBuffer head = ByteBuffer.allocate((int) Math.min(maxBytes, size));
+    readFully(head, 0);
+    String text = new String(head.array(), 0, head.position(), StandardCharsets.UTF_8);
+    int end = text.lastIndexOf('\n');
+    if (end < 0) {
+      return List.of();
+    }
+    return text.substring(0, end).lines().filter(l -> !l.isBlank()).limit(maxLines).toList();
+  }
+
   private static String fileKey(Path path) throws IOException {
     Object key = Files.readAttributes(path, BasicFileAttributes.class).fileKey();
     return key == null ? null : key.toString();

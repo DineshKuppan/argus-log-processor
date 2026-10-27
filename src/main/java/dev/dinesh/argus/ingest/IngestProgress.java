@@ -12,11 +12,15 @@ public final class IngestProgress {
   private final AtomicLong bytesRead = new AtomicLong();
   private final AtomicLong lines = new AtomicLong();
   private final AtomicLong rejected = new AtomicLong();
+  private final AtomicLong unparsed = new AtomicLong();
+  private final AtomicLong fallbackParsed = new AtomicLong();
   private final AtomicLong truncated = new AtomicLong();
   private final AtomicLong segmentsCommitted = new AtomicLong();
   private final AtomicLong committedOffset = new AtomicLong();
   private final List<String> outputs = new CopyOnWriteArrayList<>();
   private volatile String resumeReason;
+  private volatile String format;
+  private volatile String formatSource;
 
   void started(long offset, long total, String reason) {
     startOffset.set(offset);
@@ -31,9 +35,16 @@ public final class IngestProgress {
     truncated.addAndGet(truncatedLines);
   }
 
-  void parsed(int parsedLines, int rejectedLines) {
-    lines.addAndGet(parsedLines);
+  void format(String name, String source) {
+    format = name;
+    formatSource = source;
+  }
+
+  void parsed(int records, int rejectedLines, int unparsedLines, int fallbackLines) {
+    lines.addAndGet(records);
     rejected.addAndGet(rejectedLines);
+    unparsed.addAndGet(unparsedLines);
+    fallbackParsed.addAndGet(fallbackLines);
   }
 
   void committed(long endOffset, String location) {
@@ -62,6 +73,24 @@ public final class IngestProgress {
 
   public long rejected() {
     return rejected.get();
+  }
+
+  public long unparsed() {
+    return unparsed.get();
+  }
+
+  public long fallbackParsed() {
+    return fallbackParsed.get();
+  }
+
+  /** Primary format of the source, or null before the run has started. */
+  public String format() {
+    return format;
+  }
+
+  /** {@code requested} or {@code detected}. */
+  public String formatSource() {
+    return formatSource;
   }
 
   public long truncated() {

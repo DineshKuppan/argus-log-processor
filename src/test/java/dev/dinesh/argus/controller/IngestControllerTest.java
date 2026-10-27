@@ -16,6 +16,7 @@ import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.ingest.IngestJobService;
 import dev.dinesh.argus.ingest.IngestPipeline;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
+import dev.dinesh.argus.parser.ParserRegistry;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
@@ -40,7 +41,7 @@ import org.springframework.test.web.servlet.ResultActions;
 
 /** Exercises the v2 ingest API against the real job service with a mocked pipeline. */
 @WebMvcTest(IngestController.class)
-@Import({IngestJobService.class, IngestControllerTest.Config.class})
+@Import({IngestJobService.class, ParserRegistry.class, IngestControllerTest.Config.class})
 class IngestControllerTest {
 
   private static final Path ROOT;
@@ -61,7 +62,8 @@ class IngestControllerTest {
     @Primary
     IngestProperties testIngestProperties() {
       // One job slot so the 429 path can be exercised.
-      return new IngestProperties(0, null, null, 0, 0, null, 1, List.of(ROOT), ROOT.resolve("cp"));
+      return new IngestProperties(
+          0, null, null, 0, 0, null, 1, List.of(ROOT), ROOT.resolve("cp"), null);
     }
   }
 
@@ -159,6 +161,30 @@ class IngestControllerTest {
 
     assertEquals(existing, missing);
     assertEquals(existing, traversal);
+  }
+
+  @Test
+  void unknownFormatsAndUnsupportedLayoutsAre400() throws Exception {
+    String app = ROOT.resolve("app.log").toString();
+    submit(Map.of("path", app, "format", "xml"))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("nginx_access")));
+    submit(Map.of("path", app, "pattern", "%replace(%m){'a','b'}"))
+        .andExpect(status().isBadRequest());
+    submit(Map.of("path", app, "format", "logback")).andExpect(status().isBadRequest());
+  }
+
+  @Test
+  void requestedFormatIsAccepted() throws Exception {
+    submit(
+            Map.of(
+                "path",
+                ROOT.resolve("app.log").toString(),
+                "sourceId",
+                "api-format",
+                "pattern",
+                "%d [%t] %-5p %c - %m%n"))
+        .andExpect(status().isAccepted());
   }
 
   @Test

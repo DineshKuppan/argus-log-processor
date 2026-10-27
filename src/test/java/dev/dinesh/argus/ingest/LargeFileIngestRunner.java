@@ -6,7 +6,7 @@ import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import dev.dinesh.argus.checkpoint.FileCheckpointStore;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.LocalSinkProperties;
-import dev.dinesh.argus.parser.LineParser;
+import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.seeder.DataSeeder;
 import dev.dinesh.argus.sink.LocalVolumeSink;
 import java.lang.management.ManagementFactory;
@@ -37,11 +37,11 @@ public final class LargeFileIngestRunner {
             .registerModule(new JavaTimeModule())
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
     IngestProperties props =
-        new IngestProperties(0, null, null, 0, 0, null, 1, List.of(), work.resolve("cp"));
+        new IngestProperties(0, null, null, 0, 0, null, 1, List.of(), work.resolve("cp"), null);
     IngestPipeline pipeline =
         new IngestPipeline(
             props,
-            new LineParser(),
+            new ParserRegistry(),
             new LocalVolumeSink(
                 new LocalSinkProperties(work.resolve("out"), DataSize.ofBytes(0)), mapper),
             new FileCheckpointStore(props, mapper));
@@ -51,7 +51,7 @@ public final class LargeFileIngestRunner {
     long started = System.nanoTime();
     IngestPipeline.Outcome outcome =
         pipeline.run(
-            new IngestPipeline.Request(input, "load", false), progress, new AtomicBoolean());
+            new IngestPipeline.Request(input, "load", false, null), progress, new AtomicBoolean());
     double seconds = (System.nanoTime() - started) / 1e9;
     heap.stop();
 

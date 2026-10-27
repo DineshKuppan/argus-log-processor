@@ -18,7 +18,7 @@ import org.junit.jupiter.api.io.TempDir;
 class ResumePointTest {
 
   private static final IngestProperties PROPS =
-      new IngestProperties(0, null, null, 0, 0, null, 0, List.of(), null);
+      new IngestProperties(0, null, null, 0, 0, null, 0, List.of(), null, null);
 
   @TempDir Path dir;
 

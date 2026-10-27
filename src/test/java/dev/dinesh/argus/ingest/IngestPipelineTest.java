@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -12,7 +13,8 @@ import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.LocalSinkProperties;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.ingest.IngestPipeline.Request;
-import dev.dinesh.argus.parser.LineParser;
+import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.pipeline.EnvelopeFactory;
 import dev.dinesh.argus.sink.LocalVolumeSink;
 import dev.dinesh.argus.sink.LogSink;
 import dev.dinesh.argus.source.LogBatch;
@@ -20,6 +22,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,6 +50,7 @@ class IngestPipelineTest {
           DataSize.ofKilobytes(64),
           2,
           List.of(),
+          null,
           null);
 
   private static final ObjectMapper MAPPER =
@@ -94,12 +99,13 @@ class IngestPipelineTest {
             PROPS.maxLineBytes(),
             PROPS.maxConcurrentJobs(),
             PROPS.allowedRoots(),
-            cpDir);
+            cpDir,
+            PROPS.keepUnparsed());
     return new FileCheckpointStore(withDir, MAPPER);
   }
 
   private IngestPipeline pipeline(LogSink sink, FileCheckpointStore checkpoints) {
-    return new IngestPipeline(PROPS, new LineParser(), sink, checkpoints);
+    return new IngestPipeline(PROPS, new ParserRegistry(), sink, checkpoints);
   }
 
   private static Map<String, String> outputFiles(Path out) throws IOException {
@@ -115,6 +121,24 @@ class IngestPipelineTest {
     return files;
   }
 
+  private static List<JsonNode> records(Path out) throws IOException {
+    List<JsonNode> records = new ArrayList<>();
+    for (String content : outputFiles(out).values()) {
+      for (String line : content.lines().toList()) {
+        records.add(MAPPER.readTree(line));
+      }
+    }
+    return records;
+  }
+
+  /** Output with the per-run ingest time removed, so replays can be compared byte for byte. */
+  private static Map<String, String> withoutObservedTime(Map<String, String> files) {
+    Map<String, String> normalized = new LinkedHashMap<>();
+    files.forEach(
+        (k, v) -> normalized.put(k, v.replaceAll("\"observedTimestamp\":\"[^\"]*\",", "")));
+    return normalized;
+  }
+
   private static long recordCount(Map<String, String> files) {
     return files.values().stream().mapToLong(s -> s.lines().count()).sum();
   }
@@ -128,7 +152,7 @@ class IngestPipelineTest {
 
     Outcome outcome =
         pipeline(localSink(out), cps)
-            .run(new Request(file, "app", false), progress, new AtomicBoolean());
+            .run(new Request(file, "app", false, null), progress, new AtomicBoolean());
 
     assertEquals(Outcome.COMPLETED, outcome);
     Map<String, String> files = outputFiles(out);
@@ -141,16 +165,128 @@ class IngestPipelineTest {
   }
 
   @Test
-  void countsUnparseableLinesWithoutFailing() throws Exception {
+  void parsesStrayFormatsAndKeepsUnknownLinesAsRaw() throws Exception {
     Path file = writeLog(20);
     Files.writeString(file, "garbage line\n{\"json\":true}\n", StandardOpenOption.APPEND);
     IngestProgress progress = new IngestProgress();
+    Path out = dir.resolve("out");
 
-    pipeline(localSink(dir.resolve("out")), checkpoints(dir.resolve("cp")))
-        .run(new Request(file, "app", false), progress, new AtomicBoolean());
+    pipeline(localSink(out), checkpoints(dir.resolve("cp")))
+        .run(new Request(file, "app", false, null), progress, new AtomicBoolean());
+
+    assertEquals("nginx_access", progress.format());
+    assertEquals("detected", progress.formatSource());
+    assertEquals(22, progress.lines());
+    assertEquals(1, progress.fallbackParsed());
+    assertEquals(1, progress.unparsed());
+    assertEquals(0, progress.rejected());
+    List<JsonNode> records = records(out);
+    JsonNode garbage = records.get(20);
+    assertEquals("garbage line", garbage.get("body").asText());
+    assertEquals("raw", garbage.at("/source/format").asText());
+    assertTrue(garbage.at("/attributes/argus.unparsed").asBoolean());
+    assertEquals("json", records.get(21).at("/source/format").asText());
+  }
+
+  @Test
+  void dropsUnknownLinesWhenKeepUnparsedIsOff() throws Exception {
+    Path file = writeLog(20);
+    Files.writeString(file, "garbage line\n", StandardOpenOption.APPEND);
+    IngestProperties dropping =
+        new IngestProperties(
+            PROPS.batchMaxLines(),
+            PROPS.batchMaxBytes(),
+            PROPS.segmentBytes(),
+            PROPS.rawQueueCapacity(),
+            PROPS.parsedQueueCapacity(),
+            PROPS.maxLineBytes(),
+            PROPS.maxConcurrentJobs(),
+            PROPS.allowedRoots(),
+            null,
+            false);
+    IngestProgress progress = new IngestProgress();
+
+    new IngestPipeline(
+            dropping,
+            new ParserRegistry(),
+            localSink(dir.resolve("out")),
+            checkpoints(dir.resolve("cp")))
+        .run(new Request(file, "app", false, null), progress, new AtomicBoolean());
 
     assertEquals(20, progress.lines());
-    assertEquals(2, progress.rejected());
+    assertEquals(1, progress.rejected());
+    assertEquals(0, progress.unparsed());
+  }
+
+  @Test
+  void writesOpenTelemetryEnvelopesWithDeterministicEventIds() throws Exception {
+    Path file = dir.resolve("in/app.json");
+    Files.createDirectories(file.getParent());
+    Files.write(
+        file,
+        List.of(
+            "{\"timestamp\":\"2025-09-19T22:21:35Z\",\"level\":\"warning\",\"message\":\"slow\","
+                + "\"trace_id\":\"t1\",\"service\":\"orders\",\"latency_ms\":714}",
+            "{\"timestamp\":\"2025-09-19T22:21:36Z\",\"level\":\"INFO\",\"message\":\"ok\"}"));
+    Path out = dir.resolve("out");
+    IngestProgress progress = new IngestProgress();
+
+    pipeline(localSink(out), checkpoints(dir.resolve("cp")))
+        .run(new Request(file, "api", false, null), progress, new AtomicBoolean());
+
+    assertEquals("json", progress.format());
+    JsonNode first = records(out).get(0);
+    assertEquals("default", first.get("tenantId").asText());
+    assertEquals("2025-09-19T22:21:35Z", first.get("timestamp").asText());
+    assertTrue(first.has("observedTimestamp"));
+    assertEquals("warning", first.get("severityText").asText());
+    assertEquals(13, first.get("severityNumber").asInt());
+    assertEquals("slow", first.get("body").asText());
+    assertEquals("t1", first.get("traceId").asText());
+    assertEquals("orders", first.at("/resource/service.name").asText());
+    assertEquals(714, first.at("/attributes/latency_ms").asInt());
+    assertEquals("api", first.at("/source/id").asText());
+    assertEquals(0, first.at("/source/offset").asLong());
+    assertEquals(
+        new EnvelopeFactory("default", "api", 0)
+            .create(
+                new ParserRegistry()
+                    .chain(new ParserRegistry().resolve("raw", null).orElseThrow(), true)
+                    .parse("x"),
+                0,
+                Instant.EPOCH)
+            .eventId(),
+        first.get("eventId").asText());
+    assertTrue(records(out).get(1).at("/source/offset").asLong() > 0);
+  }
+
+  @Test
+  void requestedLogbackLayoutSkipsDetection() throws Exception {
+    Path file = dir.resolve("in/app.log");
+    Files.createDirectories(file.getParent());
+    Files.write(
+        file,
+        List.of(
+            "2025-10-26 18:12:00,123 [main] INFO  d.d.a.App - Started",
+            "2025-10-26 18:12:01,000 [main] ERROR d.d.a.App - Failed"));
+    IngestProgress progress = new IngestProgress();
+    Path out = dir.resolve("out");
+
+    pipeline(localSink(out), checkpoints(dir.resolve("cp")))
+        .run(
+            new Request(
+                file,
+                "app",
+                false,
+                new ParserRegistry().resolve(null, "%d [%t] %-5p %c - %m%n").orElseThrow()),
+            progress,
+            new AtomicBoolean());
+
+    assertEquals("logback", progress.format());
+    assertEquals("requested", progress.formatSource());
+    assertEquals(0, progress.unparsed());
+    assertEquals(17, records(out).get(1).get("severityNumber").asInt());
+    assertEquals("main", records(out).get(1).at("/attributes/thread.name").asText());
   }
 
   @Test
@@ -174,7 +310,7 @@ class IngestPipelineTest {
         };
 
     pipeline(slowSink, checkpoints(dir.resolve("cp")))
-        .run(new Request(file, "app", false), progress, new AtomicBoolean());
+        .run(new Request(file, "app", false, null), progress, new AtomicBoolean());
 
     // Read-ahead is limited to what the two queues and the reader/parser hands can hold.
     long maxBatchesAhead = PROPS.rawQueueCapacity() + PROPS.parsedQueueCapacity() + 2;
@@ -190,7 +326,7 @@ class IngestPipelineTest {
 
     Path cleanOut = dir.resolve("clean-out");
     pipeline(localSink(cleanOut), checkpoints(dir.resolve("clean-cp")))
-        .run(new Request(file, "app", false), new IngestProgress(), new AtomicBoolean());
+        .run(new Request(file, "app", false, null), new IngestProgress(), new AtomicBoolean());
 
     Path out = dir.resolve("out");
     FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
@@ -210,17 +346,18 @@ class IngestPipelineTest {
             () ->
                 pipeline(crashingSink, cps)
                     .run(
-                        new Request(file, "app", false),
+                        new Request(file, "app", false, null),
                         new IngestProgress(),
                         new AtomicBoolean()));
     assertTrue(crash.getMessage().contains("simulated crash"));
 
     IngestProgress rerun = new IngestProgress();
-    pipeline(localSink(out), cps).run(new Request(file, "app", false), rerun, new AtomicBoolean());
+    pipeline(localSink(out), cps)
+        .run(new Request(file, "app", false, null), rerun, new AtomicBoolean());
 
     assertEquals("CHECKPOINT", rerun.resumeReason());
     assertTrue(rerun.startOffset() > 0);
-    assertEquals(outputFiles(cleanOut), outputFiles(out));
+    assertEquals(withoutObservedTime(outputFiles(cleanOut)), withoutObservedTime(outputFiles(out)));
   }
 
   @Test
@@ -239,7 +376,7 @@ class IngestPipelineTest {
         };
 
     Outcome outcome =
-        pipeline(cancellingSink, cps).run(new Request(file, "app", false), progress, cancel);
+        pipeline(cancellingSink, cps).run(new Request(file, "app", false, null), progress, cancel);
 
     assertEquals(Outcome.CANCELLED, outcome);
     long checkpoint = cps.load("app").orElseThrow().byteOffset();
@@ -261,7 +398,7 @@ class IngestPipelineTest {
 
     Outcome outcome =
         pipeline(cancellingSink, checkpoints(dir.resolve("cp")))
-            .run(new Request(file, "app", false), new IngestProgress(), cancel);
+            .run(new Request(file, "app", false, null), new IngestProgress(), cancel);
 
     assertEquals(Outcome.COMPLETED, outcome);
   }
@@ -275,10 +412,12 @@ class IngestPipelineTest {
     FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
 
     IngestProgress first = new IngestProgress();
-    pipeline(localSink(out), cps).run(new Request(file, "app", false), first, new AtomicBoolean());
+    pipeline(localSink(out), cps)
+        .run(new Request(file, "app", false, null), first, new AtomicBoolean());
     Files.writeString(file, line.substring(30) + "\n", StandardOpenOption.APPEND);
     IngestProgress second = new IngestProgress();
-    pipeline(localSink(out), cps).run(new Request(file, "app", false), second, new AtomicBoolean());
+    pipeline(localSink(out), cps)
+        .run(new Request(file, "app", false, null), second, new AtomicBoolean());
 
     assertEquals(5, first.lines());
     assertEquals(1, second.lines());
@@ -292,7 +431,7 @@ class IngestPipelineTest {
     Path out = dir.resolve("out");
     FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false), new IngestProgress(), new AtomicBoolean());
+        .run(new Request(file, "app", false, null), new IngestProgress(), new AtomicBoolean());
     Map<String, String> beforeRotation = outputFiles(out);
 
     // Truncated in place (same inode), then regrown past the old checkpoint with new lines.
@@ -300,7 +439,8 @@ class IngestPipelineTest {
     IntStream.range(100, 160).forEach(i -> rotated.append(accessLine(i)).append('\n'));
     Files.writeString(file, rotated);
     IngestProgress rerun = new IngestProgress();
-    pipeline(localSink(out), cps).run(new Request(file, "app", false), rerun, new AtomicBoolean());
+    pipeline(localSink(out), cps)
+        .run(new Request(file, "app", false, null), rerun, new AtomicBoolean());
 
     assertEquals("FILE_REWRITTEN", rerun.resumeReason());
     assertEquals(0, rerun.startOffset());
@@ -317,19 +457,19 @@ class IngestPipelineTest {
     Path out = dir.resolve("out");
     FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false), new IngestProgress(), new AtomicBoolean());
+        .run(new Request(file, "app", false, null), new IngestProgress(), new AtomicBoolean());
     long firstEnd = Files.size(file);
 
     IngestProgress nothingNew = new IngestProgress();
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false), nothingNew, new AtomicBoolean());
+        .run(new Request(file, "app", false, null), nothingNew, new AtomicBoolean());
     assertEquals(0, nothingNew.lines());
 
     Files.writeString(
         file, accessLine(30) + "\n" + accessLine(31) + "\n", StandardOpenOption.APPEND);
     IngestProgress appended = new IngestProgress();
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false), appended, new AtomicBoolean());
+        .run(new Request(file, "app", false, null), appended, new AtomicBoolean());
 
     assertEquals(firstEnd, appended.startOffset());
     assertEquals(2, appended.lines());

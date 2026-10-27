@@ -4,8 +4,12 @@ import dev.dinesh.argus.checkpoint.CheckpointStore;
 import dev.dinesh.argus.checkpoint.ResumePoint;
 import dev.dinesh.argus.checkpoint.ResumePoint.Reason;
 import dev.dinesh.argus.config.IngestProperties;
-import dev.dinesh.argus.model.LogRecord;
-import dev.dinesh.argus.parser.LineParser;
+import dev.dinesh.argus.model.LogEnvelope;
+import dev.dinesh.argus.parser.FormatDetector;
+import dev.dinesh.argus.parser.LogParser;
+import dev.dinesh.argus.parser.ParserChain;
+import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.pipeline.EnvelopeFactory;
 import dev.dinesh.argus.sink.LogSink;
 import dev.dinesh.argus.sink.LogSink.SegmentWriter;
 import dev.dinesh.argus.source.FileSource;
@@ -13,6 +17,7 @@ import dev.dinesh.argus.source.LogBatch;
 import dev.dinesh.argus.source.RawBatch;
 import dev.dinesh.argus.source.SourceOffset;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
@@ -49,29 +54,30 @@ public class IngestPipeline {
    * @param path file to ingest
    * @param sourceId stable id under which offsets are checkpointed
    * @param fromBeginning ignore any checkpoint and start at byte 0
+   * @param parser the source's primary parser, or null to detect it from the file's first lines
    */
-  public record Request(Path path, String sourceId, boolean fromBeginning) {}
+  public record Request(Path path, String sourceId, boolean fromBeginning, LogParser parser) {}
 
   static final String THREAD_PREFIX = "ingest-";
   private static final long HANDOFF_POLL_MS = 100;
-  private static final int REJECTED_SAMPLES_LOGGED = 10;
+  private static final int UNPARSED_SAMPLES_LOGGED = 10;
   private static final int SAMPLE_CHARS = 200;
   private static final Set<Reason> FILE_CHANGED =
       EnumSet.of(Reason.FILE_REPLACED, Reason.FILE_TRUNCATED, Reason.FILE_REWRITTEN);
   private static final RawBatch END_OF_RAW =
       new RawBatch(null, -1, -1, List.of(), new long[0], -1, -1, false, 0);
   private static final LogBatch END_OF_PARSED =
-      new LogBatch(null, -1, -1, List.of(), -1, -1, false, 0);
+      new LogBatch(null, -1, -1, List.of(), -1, -1, false, 0, 0, 0);
 
   private final IngestProperties props;
-  private final LineParser parser;
+  private final ParserRegistry parsers;
   private final LogSink sink;
   private final CheckpointStore checkpoints;
 
   public IngestPipeline(
-      IngestProperties props, LineParser parser, LogSink sink, CheckpointStore checkpoints) {
+      IngestProperties props, ParserRegistry parsers, LogSink sink, CheckpointStore checkpoints) {
     this.props = props;
-    this.parser = parser;
+    this.parsers = parsers;
     this.sink = sink;
     this.checkpoints = checkpoints;
   }
@@ -87,7 +93,7 @@ public class IngestPipeline {
     Outcome outcome = null;
     Throwable error = null;
     try {
-      outcome = ingest(request.path(), sourceId, request.fromBeginning(), progress, cancel);
+      outcome = ingest(request, sourceId, progress, cancel);
       return outcome;
     } catch (Throwable t) {
       error = t;
@@ -95,18 +101,22 @@ public class IngestPipeline {
     } finally {
       // Canonical line: one per run, success or not.
       log.info(
-          "Ingest finished source={} outcome={} error={} resumeReason={} startOffset={}"
-              + " committedOffset={} totalBytes={} segments={} lines={} rejected={} truncated={}"
-              + " durationMs={}",
+          "Ingest finished source={} outcome={} error={} resumeReason={} format={} formatSource={}"
+              + " startOffset={} committedOffset={} totalBytes={} segments={} lines={}"
+              + " fallbackParsed={} unparsed={} rejected={} truncated={} durationMs={}",
           sourceId,
           outcome == null ? "FAILED" : outcome,
           error == null ? null : error.getClass().getSimpleName() + ": " + error.getMessage(),
           progress.resumeReason(),
+          progress.format(),
+          progress.formatSource(),
           progress.startOffset(),
           progress.committedOffset(),
           progress.totalBytes(),
           progress.segmentsCommitted(),
           progress.lines(),
+          progress.fallbackParsed(),
+          progress.unparsed(),
           progress.rejected(),
           progress.truncated(),
           TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
@@ -114,19 +124,17 @@ public class IngestPipeline {
   }
 
   private Outcome ingest(
-      Path path,
-      String sourceId,
-      boolean fromBeginning,
-      IngestProgress progress,
-      AtomicBoolean cancel)
+      Request request, String sourceId, IngestProgress progress, AtomicBoolean cancel)
       throws Exception {
+    Path path = request.path();
     sink.discardUncommitted(sourceId);
     // Open first, then compare the opened file with the checkpoint, so a rotation between the two
     // steps cannot pair this file's offsets with another file's identity.
     FileSource source = FileSource.open(path, sourceId, props);
     Stages stages;
     try {
-      ResumePoint resume = ResumePoint.resolve(checkpoints.load(sourceId), source, fromBeginning);
+      ResumePoint resume =
+          ResumePoint.resolve(checkpoints.load(sourceId), source, request.fromBeginning());
       if (FILE_CHANGED.contains(resume.reason())) {
         log.warn(
             "Source {} ({}): {}; restarting from offset 0 as generation {}",
@@ -146,17 +154,34 @@ public class IngestPipeline {
               resume.offset(),
               headBytes,
               source.sha256OfFirst(headBytes));
+      LogParser primary = request.parser();
+      if (primary == null) {
+        primary =
+            parsers
+                .detect(source.headLines(FormatDetector.SAMPLE_BYTES, FormatDetector.SAMPLE_LINES))
+                .parser();
+      }
       progress.started(resume.offset(), source.limit(), resume.reason().name());
+      progress.format(primary.name(), request.parser() == null ? "detected" : "requested");
       log.info(
-          "Ingest start source={} path={} offset={} limit={} size={} generation={} reason={}",
+          "Ingest start source={} path={} offset={} limit={} size={} generation={} reason={}"
+              + " format={}",
           sourceId,
           path,
           resume.offset(),
           source.limit(),
           source.size(),
           resume.generation(),
-          resume.reason());
-      stages = new Stages(source, template, progress, cancel);
+          resume.reason(),
+          primary.name());
+      stages =
+          new Stages(
+              source,
+              template,
+              parsers.chain(primary, props.keepUnparsed()),
+              new EnvelopeFactory(EnvelopeFactory.DEFAULT_TENANT, sourceId, resume.generation()),
+              progress,
+              cancel);
     } catch (Exception e) {
       source.close();
       throw e;
@@ -185,13 +210,15 @@ public class IngestPipeline {
     private final FileSource source;
     private final String sourceId;
     private final SourceOffset checkpointTemplate;
+    private final ParserChain chain;
+    private final EnvelopeFactory envelopes;
     private final IngestProgress progress;
     private final AtomicBoolean cancel;
     private final BlockingQueue<RawBatch> raw;
     private final BlockingQueue<LogBatch> parsed;
     private final AtomicBoolean stop = new AtomicBoolean();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
-    private final AtomicInteger rejectedSamples = new AtomicInteger();
+    private final AtomicInteger unparsedSamples = new AtomicInteger();
     private final List<Thread> threads = new ArrayList<>();
 
     /** Written and read only by the writer (caller) thread. */
@@ -200,9 +227,13 @@ public class IngestPipeline {
     Stages(
         FileSource source,
         SourceOffset checkpointTemplate,
+        ParserChain chain,
+        EnvelopeFactory envelopes,
         IngestProgress progress,
         AtomicBoolean cancel) {
       this.source = source;
+      this.chain = chain;
+      this.envelopes = envelopes;
       this.sourceId = checkpointTemplate.sourceId();
       this.checkpointTemplate = checkpointTemplate;
       this.committedOffset = checkpointTemplate.byteOffset();
@@ -257,18 +288,30 @@ public class IngestPipeline {
           handOff(parsed, END_OF_PARSED);
           return;
         }
-        List<LogRecord> records = new ArrayList<>(batch.lines().size());
+        List<LogEnvelope> records = new ArrayList<>(batch.lines().size());
         int rejected = 0;
-        for (String line : batch.lines()) {
-          LogRecord record = parser.parse(line);
-          if (record != null) {
-            records.add(record);
-          } else {
+        int unparsed = 0;
+        int fallback = 0;
+        Instant observedAt = Instant.now();
+        for (int i = 0; i < batch.lines().size(); i++) {
+          String line = batch.lines().get(i);
+          ParserChain.Parsed result = chain.parse(line);
+          if (result == null) {
             rejected++;
-            sampleRejected(line, batch);
+            sampleUnparsed(line, batch);
+            continue;
           }
+          switch (result.outcome()) {
+            case UNPARSED -> {
+              unparsed++;
+              sampleUnparsed(line, batch);
+            }
+            case FALLBACK -> fallback++;
+            case PRIMARY -> {}
+          }
+          records.add(envelopes.create(result, batch.lineOffsets()[i], observedAt));
         }
-        progress.parsed(records.size(), rejected);
+        progress.parsed(records.size(), rejected, unparsed, fallback);
         LogBatch out =
             new LogBatch(
                 batch.sourceId(),
@@ -278,7 +321,9 @@ public class IngestPipeline {
                 batch.startOffset(),
                 batch.endOffset(),
                 batch.lastInSegment(),
-                rejected);
+                rejected,
+                unparsed,
+                fallback);
         if (!handOff(parsed, out)) {
           return;
         }
@@ -384,10 +429,10 @@ public class IngestPipeline {
       return null;
     }
 
-    private void sampleRejected(String line, RawBatch batch) {
-      if (rejectedSamples.incrementAndGet() <= REJECTED_SAMPLES_LOGGED) {
+    private void sampleUnparsed(String line, RawBatch batch) {
+      if (unparsedSamples.incrementAndGet() <= UNPARSED_SAMPLES_LOGGED) {
         log.warn(
-            "Unparseable line source={} batchStartOffset={}: {}",
+            "No parser understood line source={} batchStartOffset={}: {}",
             sourceId,
             batch.startOffset(),
             line.length() > SAMPLE_CHARS ? line.substring(0, SAMPLE_CHARS) + "…" : line);
