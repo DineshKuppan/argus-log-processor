@@ -3,14 +3,16 @@ package dev.dinesh.argus.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.opencsv.CSVWriter;
 import dev.dinesh.argus.aggregate.impl.CountByLevelAggregator;
-import dev.dinesh.argus.aggregate.impl.ErrorRateAggregator;
+import dev.dinesh.argus.aggregate.impl.DurationAggregator;
 import dev.dinesh.argus.aggregate.impl.TopNEndpointsAggregator;
 import dev.dinesh.argus.filter.FilterSpec;
 import dev.dinesh.argus.filter.LogFilter;
 import dev.dinesh.argus.model.LogRecord;
+import dev.dinesh.argus.parser.LineParser;
 import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -33,11 +35,16 @@ import org.springframework.stereotype.Service;
 public class LogService {
 
   private final ObjectMapper mapper = new ObjectMapper();
+  private final LineParser lineParser;
 
   @Value("${log.max-file-size}")
   private long maxFileSize;
 
   private static final long DEFAULT_MAX_FILE_SIZE = 50L * 1024 * 1024;
+
+  public LogService(LineParser lineParser) {
+    this.lineParser = lineParser;
+  }
 
   public static String getFileSizeInfo(Path path) throws Exception {
     long bytes = Files.size(path);
@@ -61,7 +68,7 @@ public class LogService {
   public List<LogRecord> parseFile(String filePath) throws Exception {
     return readLines(filePath).stream()
         .filter(l -> !l.isBlank())
-        .map(this::parseLineSafely)
+        .map(lineParser::parse)
         .filter(Objects::nonNull)
         .toList();
   }
@@ -72,15 +79,13 @@ public class LogService {
     return readLines(filePath).stream()
         .filter(l -> !l.isBlank())
         .filter(l -> linePattern.matcher(l).matches())
-        .map(this::parseLineSafely)
+        .map(lineParser::parse)
         .filter(Objects::nonNull)
         .toList();
   }
 
   private List<String> readLines(String filePath) throws Exception {
-    log.info("parsing file: {}", filePath);
     Path path = Path.of(filePath);
-    log.info("Path exists: {}", Files.exists(path));
     long maxSize = maxFileSize > 0 ? maxFileSize : DEFAULT_MAX_FILE_SIZE;
     long fileSize = Files.size(path);
     log.info("File size: {}", formatSmartSize(fileSize));
@@ -90,25 +95,6 @@ public class LogService {
     List<String> lines = Files.readAllLines(path);
     log.info("Total lines: {}", lines.size());
     return lines;
-  }
-
-  private LogRecord parseLineSafely(String line) {
-    try {
-      if (line.trim().startsWith("{")) {
-        Map<String, Object> map = mapper.readValue(line, Map.class);
-        return LogRecord.builder()
-            .timestamp(
-                map.containsKey("timestamp")
-                    ? java.time.Instant.parse((String) map.get("timestamp"))
-                    : java.time.Instant.now())
-            .level((String) map.get("level"))
-            .message((String) map.get("message"))
-            .meta(map)
-            .build();
-      }
-    } catch (Exception ignored) {
-    }
-    return null;
   }
 
   public List<LogRecord> applyFilters(List<LogRecord> logs, List<LogFilter> filters) {
@@ -121,7 +107,8 @@ public class LogService {
     results.put("totalLogs", logs.size());
     results.put("byLevel", new CountByLevelAggregator().compute(logs));
     results.put("topEndpoints", new TopNEndpointsAggregator(topN).compute(logs));
-    results.put("errorRate", new ErrorRateAggregator().compute(logs));
+    // results.put("errorRate", new ErrorRateAggregator().compute(logs));
+    results.put("duration", new DurationAggregator(ChronoUnit.HOURS).compute(logs));
 
     return results;
   }
