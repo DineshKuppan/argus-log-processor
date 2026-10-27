@@ -95,7 +95,7 @@ public class LogController {
   }
 
   /**
-   * Aggregates logs and returns summary statistics.
+   * Aggregates logs and returns summary statistics. Streams the file, so it has no size limit.
    *
    * @param body aggregation parameters (file, topN)
    * @return aggregation results
@@ -103,23 +103,14 @@ public class LogController {
    */
   @PostMapping("/aggregate")
   public Map<String, Object> aggregateLogs(@RequestBody Map<String, Object> body) throws Exception {
-    String file = (String) body.get("file");
-    List<LogRecord> logs = logService.parseFile(file);
-
-    Map<String, Long> byLevel = logService.countByLevel(logs);
-    List<Map.Entry<String, Long>> topEndpoints =
-        logService.topNEndpoints(logs, (int) body.getOrDefault("topN", 3));
-    List<Map<String, Object>> errorRate = logService.errorRateOverTime(logs);
-
-    return Map.of("byLevel", byLevel, "topEndpoints", topEndpoints, "errorRate", errorRate);
+    return logService.summarize((String) body.get("file"), (int) body.getOrDefault("topN", 3));
   }
 
+  /** Filters, then aggregates, in one streaming pass over the file (no size limit). */
   @PostMapping("/aggregateV2")
   public Map<String, Object> aggregateLogsV2(@RequestBody Map<String, Object> body)
       throws Exception {
     String file = (String) body.get("file");
-    List<LogRecord> logs = logService.parseFile(file);
-    log.debug("Total Logs Present - [{}]", logs.size());
     // Apply filters before aggregating
     List<LogFilter> filters = new ArrayList<>();
     if (body.containsKey("from") || body.containsKey("to")) {
@@ -135,10 +126,8 @@ public class LogController {
       filters.add(new RegexFilter((String) body.get("regex")));
     }
 
-    List<LogRecord> filtered = logService.applyFilters(logs, filters);
-
     int topN = (int) body.getOrDefault("topN", 3);
-    return logService.runAggregations(filtered, topN);
+    return logService.aggregate(file, filters, topN);
   }
 
   /**
@@ -166,9 +155,7 @@ public class LogController {
    */
   @PostMapping(value = "/export/csv", produces = "text/csv")
   public ResponseEntity<String> exportCsv(@RequestBody Map<String, Object> body) throws Exception {
-    String file = (String) body.get("file");
-    List<LogRecord> logs = logService.parseFile(file);
-    List<Map<String, Object>> errorRate = logService.errorRateOverTime(logs);
+    List<Map<String, Object>> errorRate = logService.errorRateOverTime((String) body.get("file"));
 
     String csv = logService.exportErrorRateToCsv(errorRate);
     return ResponseEntity.ok()
@@ -185,10 +172,7 @@ public class LogController {
    */
   @PostMapping("/cli-summary")
   public ResponseEntity<String> cliSummary(@RequestBody Map<String, Object> body) throws Exception {
-    String file = (String) body.get("file");
-    List<LogRecord> logs = logService.parseFile(file);
-
-    String summary = logService.printErrorSummary(logs);
+    String summary = logService.errorSummary((String) body.get("file"));
     log.info("*********** CLI Summary - Processing ***********");
     log.info(summary);
     log.info("*********** CLI Summary - Processed ***********");

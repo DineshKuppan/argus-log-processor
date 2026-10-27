@@ -2,9 +2,14 @@ package dev.dinesh.argus.service;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import dev.dinesh.argus.aggregate.impl.CountByLevelAggregator;
+import dev.dinesh.argus.aggregate.impl.TopNEndpointsAggregator;
+import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.filter.FilterSpec;
+import dev.dinesh.argus.filter.impl.LevelFilter;
 import dev.dinesh.argus.model.LogRecord;
 import dev.dinesh.argus.parser.ParserRegistry;
 import java.io.IOException;
@@ -14,12 +19,17 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.springframework.test.util.ReflectionTestUtils;
 
 class LogServiceTest {
 
-  private final LogService service = new LogService(new ParserRegistry());
+  private static final IngestProperties DEFAULTS =
+      new IngestProperties(0, null, null, 0, 0, null, 0, List.of(), null, null);
+
+  private final LogService service = new LogService(new ParserRegistry(), DEFAULTS);
 
   @TempDir Path dir;
 
@@ -66,12 +76,54 @@ class LogServiceTest {
             "{\"timestamp\":\"2025-09-19T22:21:35Z\",\"level\":\"ERROR\",\"message\":\"timed\"}");
     List<LogRecord> logs = service.parseFile(file);
 
-    Map<String, Object> aggregates = assertDoesNotThrow(() -> service.runAggregations(logs, 3));
-    assertEquals(2, aggregates.get("totalLogs"));
-    assertEquals(1, service.errorRateOverTime(logs).size());
-    assertTrue(service.printErrorSummary(logs).contains("2025-09-19T22:00:00Z"));
+    Map<String, Object> aggregates =
+        assertDoesNotThrow(() -> service.aggregate(file, List.of(), 3));
+    assertEquals(2L, aggregates.get("totalLogs"));
+    assertEquals(1, service.errorRateOverTime(file).size());
+    assertTrue(service.errorSummary(file).contains("2025-09-19T22:00:00Z"));
     FilterSpec range = new FilterSpec(Instant.parse("2025-01-01T00:00:00Z"), null, Set.of(), null);
     assertEquals(1, service.filterLogs(logs, range).size());
     assertEquals(2, service.filterLogs(logs, new FilterSpec(null, null, Set.of(), null)).size());
+  }
+
+  @Test
+  void streamingAggregationMatchesTheListBasedResult() throws Exception {
+    String file =
+        write(
+            IntStream.range(0, 500)
+                .mapToObj(
+                    i ->
+                        String.format(
+                            "10.0.0.%d - - [09/Oct/2025:%02d:%02d:00 +0000] \"GET /api/%d HTTP/1.1\""
+                                + " %d 512 \"-\" \"curl/8.0\"",
+                            i % 7, i / 60, i % 60, i % 9, i % 5 == 0 ? 500 : 200))
+                .toArray(String[]::new));
+    List<LogRecord> all = service.parseFile(file);
+    assertEquals(500, all.size());
+
+    Map<String, Object> summary = service.summarize(file, 5);
+
+    assertEquals(new CountByLevelAggregator().compute(all), summary.get("byLevel"));
+    assertEquals(new TopNEndpointsAggregator(5).compute(all), summary.get("topEndpoints"));
+    Map<String, Object> errorsOnly =
+        service.aggregate(file, List.of(new LevelFilter(Set.of("ERROR"))), 5);
+    assertEquals(
+        all.stream().filter(r -> "ERROR".equals(r.getLevel())).count(),
+        errorsOnly.get("totalLogs"));
+  }
+
+  @Test
+  void aggregationStreamsFilesOverTheSizeLimitAndCountsAnUnterminatedLastLine() throws Exception {
+    Path file = dir.resolve("big.log");
+    Files.writeString(
+        file,
+        "{\"timestamp\":\"2025-09-19T22:21:35Z\",\"level\":\"ERROR\",\"message\":\"a\"}\n"
+            + "{\"timestamp\":\"2025-09-19T22:21:36Z\",\"level\":\"INFO\",\"message\":\"b\"}");
+    ReflectionTestUtils.setField(service, "maxFileSize", 10L);
+
+    assertThrows(IllegalArgumentException.class, () -> service.parseFile(file.toString()));
+    Map<String, Object> aggregates = service.aggregate(file.toString(), List.of(), 3);
+    assertEquals(2L, aggregates.get("totalLogs"));
+    assertEquals(Map.of("ERROR", 1L, "INFO", 1L), aggregates.get("byLevel"));
   }
 }
