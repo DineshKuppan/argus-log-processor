@@ -90,7 +90,7 @@ public class LocalVolumeSink implements LogSink {
   }
 
   private Path tenantRoot(String tenantId) {
-    return root.resolve("tenant=" + TenantIds.requireValid(tenantId));
+    return root.resolve(TenantIds.pathSegment(tenantId));
   }
 
   private Path stagingDir(String tenantId, String sourceId) {

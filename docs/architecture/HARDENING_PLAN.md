@@ -57,3 +57,19 @@
   - Ingest: no key → 401. With the key, `app.json` was ingested as tenant `acme`: 25,000 lines, checkpoint at `data/checkpoints/tenant=acme/app.json`, output under `data/out/tenant=acme/…`, and every envelope carries `"tenantId":"acme"`.
   - v1: `/parse?file=/etc/hosts` and `/aggregate` on `/etc/hosts` → 400 (outside the roots); a file under the roots → 200; a missing file under the roots → 404.
 - **Deviations:** none from §1. The tenant-id rule also forbids a leading `.` (a tenant becomes a directory name), which `X-Argus-Tenant` used to allow.
+
+### Review fixes (`/code-review high`)
+| # | Finding | Fix |
+|---|---|---|
+| 1 | v1 needed no credential, so anyone could read files v2 protects | Every `/api/**` request (v1 included) needs an API key; v1 acts for that tenant |
+| 2 | Every tenant shared `allowed-roots`, so one tenant could ingest another's files | `argus.tenancy.api-keys[i].allowed-roots` give a tenant its own input directories (`TenantRoots`); keys without them share the global roots, and startup warns when several do |
+| 3 | Auth ran only for handlers with `@CurrentTenant` (fails open) | `TenantInterceptor` on `/api/**` resolves the tenant before dispatch; `@CurrentTenant` reads it and throws if it's missing (fails closed) |
+| 4 | Pre-tenancy checkpoints were ignored: re-ingest at generation 0 could replace a rotated file's output | Tenant `default` falls back to `checkpoint-dir/<source>.json`; the next save writes the tenant path |
+| 5 | One 200-job limit across tenants: noisy-neighbour eviction | 200 retained jobs per tenant; a tenant evicts only its own |
+| 6 | Swagger showed `tenantId` as a query parameter, no auth scheme | SpringDoc ignores `@CurrentTenant`; an `X-Argus-Api-Key` security scheme is declared |
+| 7 | `LogProperties` dropped validation and changed what 0 means | Negative values fail at startup; 0 means the default again (50MB, 2 slots) |
+| 8 | A blank `X-Argus-Api-Key` hid a valid Bearer token | Blank counts as absent |
+| 9 | Roots re-resolved on every check, and two instances | Each root's real path is resolved once (when it first exists); one `TenantRoots` bean serves v1 and v2 |
+| 10 | `"tenant=" + id` copied in the sink and checkpoint store | `TenantIds.pathSegment` |
+
+After the fixes: 216 tests pass. §2's note on unmigrated checkpoints is superseded by fix 4.

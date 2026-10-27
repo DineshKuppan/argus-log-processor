@@ -19,6 +19,7 @@ import dev.dinesh.argus.ingest.IngestPipeline;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.tenant.ApiKeyTenantResolver;
+import dev.dinesh.argus.tenant.TenantRoots;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
@@ -38,38 +39,56 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.context.annotation.Primary;
 import org.springframework.http.MediaType;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
 /** Exercises the v2 ingest API against the real job service with a mocked pipeline. */
-@WebMvcTest(
-    controllers = IngestController.class,
-    properties = {
-      "argus.tenancy.api-keys[0].tenant=acme",
-      // printf %s acme-key | shasum -a 256
-      "argus.tenancy.api-keys[0].key-sha256=afacab3575137afa4e00d9cbcafcb14c9ae25f779d964eb0ea5b2c4eb5dfd163",
-      "argus.tenancy.api-keys[1].tenant=globex",
-      "argus.tenancy.api-keys[1].key-sha256=f2a455b59b858a04c51108416af2042203cb6ac35fa4141fba4148bc856e78d4"
-    })
+@WebMvcTest(IngestController.class)
 @Import({
   IngestJobService.class,
   ParserRegistry.class,
   TenancyConfig.class,
+  TenantRoots.class,
   IngestControllerTest.Config.class
 })
 class IngestControllerTest {
 
   private static final Path ROOT;
 
+  /** globex's own input root: it may read only here, while acme reads the shared ROOT. */
+  private static final Path GLOBEX_ROOT;
+
   static {
     try {
       ROOT = Files.createTempDirectory("argus-ingest-api").toRealPath();
       Files.writeString(ROOT.resolve("app.log"), "line\n");
       Files.writeString(ROOT.resolve("other.log"), "line\n");
+      GLOBEX_ROOT = Files.createTempDirectory("argus-ingest-globex").toRealPath();
+      Files.writeString(GLOBEX_ROOT.resolve("app.log"), "line\n");
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+  }
+
+  /**
+   * All keys in one property source: Spring Boot binds an indexed list from a single source, so
+   * splitting it between the annotation and here would drop entries.
+   */
+  @DynamicPropertySource
+  static void apiKeys(DynamicPropertyRegistry registry) {
+    registry.add("argus.tenancy.api-keys[0].tenant", () -> "acme");
+    // printf %s acme-key | shasum -a 256
+    registry.add(
+        "argus.tenancy.api-keys[0].key-sha256",
+        () -> "afacab3575137afa4e00d9cbcafcb14c9ae25f779d964eb0ea5b2c4eb5dfd163");
+    registry.add("argus.tenancy.api-keys[1].tenant", () -> "globex");
+    registry.add(
+        "argus.tenancy.api-keys[1].key-sha256",
+        () -> "f2a455b59b858a04c51108416af2042203cb6ac35fa4141fba4148bc856e78d4");
+    registry.add("argus.tenancy.api-keys[1].allowed-roots", GLOBEX_ROOT::toString);
   }
 
   @TestConfiguration
@@ -189,12 +208,23 @@ class IngestControllerTest {
     releaseAndWaitForTheSlot();
 
     // Same source id, other tenant: its own source, not a 409.
-    submitAs(GLOBEX_KEY, Map.of("path", ROOT.resolve("app.log").toString(), "sourceId", "shared"))
+    submitAs(
+            GLOBEX_KEY,
+            Map.of("path", GLOBEX_ROOT.resolve("app.log").toString(), "sourceId", "shared"))
         .andExpect(status().isAccepted())
         .andExpect(jsonPath("$.tenantId").value("globex"));
     as(GLOBEX_KEY, get("/api/v2/ingest/jobs/" + acmeJob)).andExpect(status().isNotFound());
     as(GLOBEX_KEY, delete("/api/v2/ingest/jobs/" + acmeJob)).andExpect(status().isNotFound());
     perform(get("/api/v2/ingest/jobs/" + acmeJob)).andExpect(status().isOk());
+  }
+
+  @Test
+  void aTenantWithItsOwnRootsCannotIngestAnotherTenantsFiles() throws Exception {
+    submitAs(GLOBEX_KEY, Map.of("path", ROOT.resolve("app.log").toString()))
+        .andExpect(status().isBadRequest());
+    // acme reads the shared roots only, not globex's.
+    submit(Map.of("path", GLOBEX_ROOT.resolve("app.log").toString()))
+        .andExpect(status().isBadRequest());
   }
 
   @Test

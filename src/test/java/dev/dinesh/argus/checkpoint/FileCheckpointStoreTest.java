@@ -90,4 +90,20 @@ class FileCheckpointStoreTest {
     assertTrue(store.load("default", "app").isEmpty());
     assertTrue(Files.exists(dir.resolve("checkpoints/tenant=acme/app.json")));
   }
+
+  @Test
+  void aPreTenancyCheckpointStillLoadsForTheDefaultTenant() throws IOException {
+    Files.createDirectories(dir.resolve("checkpoints"));
+    Files.writeString(
+        dir.resolve("checkpoints/app.json"),
+        "{\"sourceId\":\"app\",\"path\":\"/x\",\"fileKey\":\"k\",\"generation\":2,"
+            + "\"byteOffset\":7}");
+    FileCheckpointStore store = store();
+
+    assertEquals(2, store.load("default", "app").orElseThrow().generation());
+    assertTrue(store.load("acme", "app").isEmpty());
+    store.save("default", offset(100));
+    assertEquals(100, store.load("default", "app").orElseThrow().byteOffset());
+    assertTrue(Files.exists(dir.resolve("checkpoints/tenant=default/app.json")));
+  }
 }

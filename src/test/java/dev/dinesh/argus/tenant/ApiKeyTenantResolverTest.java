@@ -13,8 +13,9 @@ class ApiKeyTenantResolverTest {
   private final ApiKeyTenantResolver resolver =
       new ApiKeyTenantResolver(
           List.of(
-              new ApiKey("acme", ApiKeyTenantResolver.sha256Hex("acme-key")),
-              new ApiKey("globex", ApiKeyTenantResolver.sha256Hex("globex-key").toUpperCase())));
+              new ApiKey("acme", ApiKeyTenantResolver.sha256Hex("acme-key"), null),
+              new ApiKey(
+                  "globex", ApiKeyTenantResolver.sha256Hex("globex-key").toUpperCase(), null)));
 
   private static MockHttpServletRequest request(String header, String value) {
     MockHttpServletRequest request = new MockHttpServletRequest();
@@ -30,6 +31,14 @@ class ApiKeyTenantResolverTest {
         "acme", resolver.resolve(request(ApiKeyTenantResolver.API_KEY_HEADER, "acme-key")));
     assertEquals("globex", resolver.resolve(request("Authorization", "Bearer globex-key")));
     assertEquals("globex", resolver.resolve(request("Authorization", "bearer  globex-key ")));
+  }
+
+  @Test
+  void aBlankKeyHeaderDoesNotHideABearerToken() {
+    MockHttpServletRequest request = request(ApiKeyTenantResolver.API_KEY_HEADER, " ");
+    request.addHeader("Authorization", "Bearer acme-key");
+
+    assertEquals("acme", resolver.resolve(request));
   }
 
   @Test
@@ -52,13 +61,15 @@ class ApiKeyTenantResolverTest {
     String hash = ApiKeyTenantResolver.sha256Hex("k");
     assertThrows(
         IllegalArgumentException.class,
-        () -> new ApiKeyTenantResolver(List.of(new ApiKey("a:b", hash))));
+        () -> new ApiKeyTenantResolver(List.of(new ApiKey("a:b", hash, null))));
     assertThrows(
         IllegalArgumentException.class,
-        () -> new ApiKeyTenantResolver(List.of(new ApiKey("acme", "plaintext-key"))));
+        () -> new ApiKeyTenantResolver(List.of(new ApiKey("acme", "plaintext-key", null))));
     assertThrows(
         IllegalArgumentException.class,
-        () -> new ApiKeyTenantResolver(List.of(new ApiKey("a", hash), new ApiKey("b", hash))));
+        () ->
+            new ApiKeyTenantResolver(
+                List.of(new ApiKey("a", hash, null), new ApiKey("b", hash, null))));
   }
 
   @Test

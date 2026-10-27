@@ -23,4 +23,12 @@ public final class TenantIds {
     }
     return tenantId;
   }
+
+  /**
+   * The directory (or object-key) segment that starts every tenant's checkpoints and output: one
+   * definition, so sinks and checkpoint stores always agree on it.
+   */
+  public static String pathSegment(String tenantId) {
+    return "tenant=" + requireValid(tenantId);
+  }
 }

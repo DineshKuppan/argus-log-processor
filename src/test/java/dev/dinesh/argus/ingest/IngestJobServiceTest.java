@@ -13,6 +13,7 @@ import dev.dinesh.argus.ingest.IngestJobService.JobSlotsBusyException;
 import dev.dinesh.argus.ingest.IngestJobService.SourceBusyException;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.tenant.TenantRoots;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -43,7 +44,9 @@ class IngestJobServiceTest {
     file = Files.writeString(root.resolve("app.log"), "line\n");
     IngestProperties props =
         new IngestProperties(0, null, null, 0, 0, null, 1, List.of(root), dir.resolve("cp"), null);
-    service = new IngestJobService(pipeline, new ParserRegistry(), props);
+    service =
+        new IngestJobService(
+            pipeline, new ParserRegistry(), props, TenantRoots.sharedOnly(props.allowedRoots()));
   }
 
   @AfterEach

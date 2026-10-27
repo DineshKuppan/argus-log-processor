@@ -6,9 +6,9 @@ import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.ingest.IngestPipeline.Request;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserRegistry;
-import dev.dinesh.argus.source.AllowedPaths;
 import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.tenant.TenantIds;
+import dev.dinesh.argus.tenant.TenantRoots;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -18,6 +18,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -39,24 +40,31 @@ import org.springframework.stereotype.Service;
 @Service
 public class IngestJobService {
 
-  /** Finished jobs kept for status queries; older ones are evicted. */
-  static final int MAX_RETAINED_JOBS = 200;
+  /**
+   * Finished jobs kept per tenant for status queries; older ones are evicted. Per tenant, so one
+   * tenant's submissions never evict another tenant's job records.
+   */
+  static final int MAX_RETAINED_JOBS_PER_TENANT = 200;
 
   private static final int SOURCE_ID_HASH_BYTES = 6;
 
   private final IngestPipeline pipeline;
   private final ParserRegistry parsers;
-  private final AllowedPaths allowedPaths;
+  private final TenantRoots tenantRoots;
   private final ThreadPoolExecutor executor;
   private final Map<String, IngestJob> jobs = new ConcurrentHashMap<>();
 
   /** Active job id per {@code tenant/source}. */
   private final Map<String, String> activeJobBySource = new ConcurrentHashMap<>();
 
-  public IngestJobService(IngestPipeline pipeline, ParserRegistry parsers, IngestProperties props) {
+  public IngestJobService(
+      IngestPipeline pipeline,
+      ParserRegistry parsers,
+      IngestProperties props,
+      TenantRoots tenantRoots) {
     this.pipeline = pipeline;
     this.parsers = parsers;
-    this.allowedPaths = new AllowedPaths(props.allowedRoots());
+    this.tenantRoots = tenantRoots;
     AtomicInteger threadCount = new AtomicInteger();
     this.executor =
         new ThreadPoolExecutor(
@@ -104,7 +112,7 @@ public class IngestJobService {
       String pattern)
       throws IOException {
     TenantIds.requireValid(tenantId);
-    Path realPath = allowedPaths.requireFile(rawPath);
+    Path realPath = tenantRoots.forTenant(tenantId).requireFile(rawPath);
     String sourceId =
         requestedSourceId == null || requestedSourceId.isBlank()
             ? defaultSourceId(realPath)
@@ -120,7 +128,7 @@ public class IngestJobService {
       throw new SourceBusyException(sourceId, existing);
     }
     try {
-      evictOldJobs();
+      evictOldJobs(tenantId);
       jobs.put(job.id(), job);
       executor.execute(() -> runJob(job));
     } catch (RejectedExecutionException e) {
@@ -195,12 +203,14 @@ public class IngestJobService {
     }
   }
 
-  private void evictOldJobs() {
-    int excess = jobs.size() - MAX_RETAINED_JOBS + 1;
+  private void evictOldJobs(String tenantId) {
+    List<IngestJob> own =
+        jobs.values().stream().filter(j -> j.tenantId().equals(tenantId)).toList();
+    int excess = own.size() - MAX_RETAINED_JOBS_PER_TENANT + 1;
     if (excess <= 0) {
       return;
     }
-    jobs.values().stream()
+    own.stream()
         .filter(j -> j.state().isFinished())
         .sorted(Comparator.comparing(IngestJob::finishedAt))
         .limit(excess)

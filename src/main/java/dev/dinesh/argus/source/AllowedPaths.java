@@ -1,28 +1,58 @@
 package dev.dinesh.argus.source;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.List;
 
 /**
- * The directories file sources may be read from ({@code argus.ingest.allowed-roots}), shared by v1
- * and v2 so both APIs follow one rule. Thread-safe.
+ * The directories file sources may be read from, shared by v1 and v2 so both APIs follow one rule.
+ * Each root's real path is resolved once, when it first exists (roots may be created after
+ * startup). Thread-safe.
  */
 public final class AllowedPaths {
 
   /** A path outside every allowed root; the APIs answer 400. */
   public static class OutsideAllowedRootsException extends IllegalArgumentException {
     OutsideAllowedRootsException() {
-      super("Path is outside the allowed roots (argus.ingest.allowed-roots)");
+      super("Path is outside the allowed roots");
     }
   }
 
-  private final List<Path> roots;
+  private static final class Root {
+    final Path asWritten;
+    volatile Path real;
+
+    Root(Path root) {
+      this.asWritten = root.toAbsolutePath().normalize();
+    }
+
+    /** True if {@code path} is under this root, as written or after resolving its symlinks. */
+    boolean contains(Path path) {
+      if (path.startsWith(asWritten)) {
+        return Files.isDirectory(asWritten);
+      }
+      Path resolved = real;
+      if (resolved == null) {
+        if (!Files.isDirectory(asWritten)) {
+          return false;
+        }
+        try {
+          resolved = real = asWritten.toRealPath();
+        } catch (IOException e) {
+          throw new UncheckedIOException(e);
+        }
+      }
+      return path.startsWith(resolved);
+    }
+  }
+
+  private final List<Root> roots;
 
   public AllowedPaths(List<Path> roots) {
-    this.roots = List.copyOf(roots);
+    this.roots = roots.stream().map(Root::new).toList();
   }
 
   /**
@@ -52,12 +82,10 @@ public final class AllowedPaths {
     return realPath;
   }
 
-  /** {@code path} must be absolute and normalized; compared with each root as written and real. */
-  private void requireAllowed(Path path) throws IOException {
-    for (Path root : roots) {
-      if (Files.isDirectory(root)
-          && (path.startsWith(root.toRealPath())
-              || path.startsWith(root.toAbsolutePath().normalize()))) {
+  /** {@code path} must be absolute and normalized. */
+  private void requireAllowed(Path path) {
+    for (Root root : roots) {
+      if (root.contains(path)) {
         return;
       }
     }

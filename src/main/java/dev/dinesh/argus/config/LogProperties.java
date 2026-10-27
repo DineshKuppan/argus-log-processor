@@ -15,8 +15,17 @@ import org.springframework.util.unit.DataSize;
 public record LogProperties(
     DataSize maxFileSize, int maxConcurrentAggregations, Boolean enforceAllowedRoots) {
 
+  /** 0 (or null) means "use the default"; negative values are configuration errors. */
   public LogProperties {
-    maxFileSize = maxFileSize != null ? maxFileSize : DataSize.ofMegabytes(50);
+    if (maxFileSize != null && maxFileSize.isNegative()) {
+      throw new IllegalArgumentException("log.max-file-size must not be negative: " + maxFileSize);
+    }
+    if (maxConcurrentAggregations < 0) {
+      throw new IllegalArgumentException(
+          "log.max-concurrent-aggregations must not be negative: " + maxConcurrentAggregations);
+    }
+    maxFileSize =
+        maxFileSize != null && maxFileSize.toBytes() > 0 ? maxFileSize : DataSize.ofMegabytes(50);
     maxConcurrentAggregations = maxConcurrentAggregations > 0 ? maxConcurrentAggregations : 2;
     enforceAllowedRoots = enforceAllowedRoots == null || enforceAllowedRoots;
   }

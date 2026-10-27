@@ -26,6 +26,8 @@ import org.springframework.stereotype.Component;
 @Component
 public class FileCheckpointStore implements CheckpointStore {
 
+  private static final String LEGACY_TENANT = "default";
+
   private final Path dir;
   private final ObjectMapper mapper;
 
@@ -43,6 +45,9 @@ public class FileCheckpointStore implements CheckpointStore {
   public Optional<SourceOffset> load(String tenantId, String sourceId) throws IOException {
     Path file = fileFor(tenantId, sourceId);
     if (!Files.exists(file)) {
+      file = legacyFileFor(tenantId, sourceId);
+    }
+    if (file == null || !Files.exists(file)) {
       return Optional.empty();
     }
     try {
@@ -73,8 +78,20 @@ public class FileCheckpointStore implements CheckpointStore {
     DurableFiles.moveAtomically(tmp, file);
   }
 
+  /**
+   * Before tenancy every checkpoint was {@code dir/<source>.json} and every tenant was {@code
+   * default}. Reading it keeps the source's offset and generation, so an upgrade neither re-ingests
+   * the file nor restarts at generation 0 (which would replace an earlier rotated file's output).
+   * The next save writes the tenant path.
+   */
+  private Path legacyFileFor(String tenantId, String sourceId) {
+    return LEGACY_TENANT.equals(tenantId)
+        ? dir.resolve(SourceOffset.requireValidSourceId(sourceId) + ".json")
+        : null;
+  }
+
   private Path fileFor(String tenantId, String sourceId) {
-    return dir.resolve("tenant=" + TenantIds.requireValid(tenantId))
+    return dir.resolve(TenantIds.pathSegment(tenantId))
         .resolve(SourceOffset.requireValidSourceId(sourceId) + ".json");
   }
 }

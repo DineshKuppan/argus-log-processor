@@ -1,20 +1,14 @@
 package dev.dinesh.argus.tenant;
 
-import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.core.MethodParameter;
 import org.springframework.web.bind.support.WebDataBinderFactory;
 import org.springframework.web.context.request.NativeWebRequest;
+import org.springframework.web.context.request.RequestAttributes;
 import org.springframework.web.method.support.HandlerMethodArgumentResolver;
 import org.springframework.web.method.support.ModelAndViewContainer;
 
-/** Fills {@link CurrentTenant} parameters from the configured {@link TenantResolver}. */
+/** Fills {@link CurrentTenant} parameters with the tenant {@link TenantInterceptor} resolved. */
 public final class CurrentTenantArgumentResolver implements HandlerMethodArgumentResolver {
-
-  private final TenantResolver tenants;
-
-  public CurrentTenantArgumentResolver(TenantResolver tenants) {
-    this.tenants = tenants;
-  }
 
   @Override
   public boolean supportsParameter(MethodParameter parameter) {
@@ -28,6 +22,15 @@ public final class CurrentTenantArgumentResolver implements HandlerMethodArgumen
       ModelAndViewContainer mavContainer,
       NativeWebRequest webRequest,
       WebDataBinderFactory binderFactory) {
-    return tenants.resolve(webRequest.getNativeRequest(HttpServletRequest.class));
+    Object tenant =
+        webRequest.getAttribute(
+            TenantInterceptor.TENANT_ATTRIBUTE, RequestAttributes.SCOPE_REQUEST);
+    if (tenant == null) {
+      // Fail closed: the handler is outside the interceptor's paths.
+      throw new IllegalStateException(
+          "@CurrentTenant used on a path TenantInterceptor does not cover: "
+              + parameter.getExecutable());
+    }
+    return (String) tenant;
   }
 }

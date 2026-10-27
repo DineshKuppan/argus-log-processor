@@ -2,6 +2,7 @@ package dev.dinesh.argus.tenant;
 
 import jakarta.servlet.http.HttpServletRequest;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
@@ -22,8 +23,14 @@ public final class ApiKeyTenantResolver implements TenantResolver {
   private static final String BEARER = "Bearer ";
   private static final Pattern SHA256_HEX = Pattern.compile("[0-9a-f]{64}");
 
-  /** One configured key: its tenant and the lowercase hex SHA-256 of the key. */
-  public record ApiKey(String tenant, String keySha256) {}
+  /**
+   * One configured key.
+   *
+   * @param keySha256 hex SHA-256 of the key
+   * @param allowedRoots directories this tenant may read files from; null or empty means the shared
+   *     {@code argus.ingest.allowed-roots}
+   */
+  public record ApiKey(String tenant, String keySha256, List<Path> allowedRoots) {}
 
   private final Map<String, String> tenantByKeyHash = new HashMap<>();
 
@@ -64,7 +71,9 @@ public final class ApiKeyTenantResolver implements TenantResolver {
 
   private static String presentedKey(HttpServletRequest request) {
     String key = request.getHeader(API_KEY_HEADER);
-    if (key == null) {
+    // A blank header (some proxies and SDKs always send it) must not hide a Bearer token.
+    if (key == null || key.isBlank()) {
+      key = null;
       String authorization = request.getHeader("Authorization");
       if (authorization != null
           && authorization.regionMatches(true, 0, BEARER, 0, BEARER.length())) {

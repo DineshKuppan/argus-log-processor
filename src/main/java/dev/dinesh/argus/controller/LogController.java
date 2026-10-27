@@ -8,6 +8,7 @@ import dev.dinesh.argus.filter.impl.TimeRangeFilter;
 import dev.dinesh.argus.model.LogRecord;
 import dev.dinesh.argus.service.LogService;
 import dev.dinesh.argus.service.LogService.AggregationSlotsBusyException;
+import dev.dinesh.argus.tenant.CurrentTenant;
 import java.nio.file.NoSuchFileException;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -60,8 +61,9 @@ public class LogController {
    * @throws Exception if parsing fails
    */
   @GetMapping("/parse")
-  public List<LogRecord> parseLogs(@RequestParam String file) throws Exception {
-    return logService.parseFile(file);
+  public List<LogRecord> parseLogs(@CurrentTenant String tenantId, @RequestParam String file)
+      throws Exception {
+    return logService.parseFile(tenantId, file);
   }
 
   /**
@@ -74,9 +76,10 @@ public class LogController {
    */
   @GetMapping("/parse/regexp")
   public List<LogRecord> parseLogsWithPattern(
-      @RequestParam String file, @RequestParam String pattern) throws Exception {
+      @CurrentTenant String tenantId, @RequestParam String file, @RequestParam String pattern)
+      throws Exception {
 
-    return logService.parseFile(file, pattern);
+    return logService.parseFile(tenantId, file, pattern);
   }
 
   /**
@@ -87,9 +90,10 @@ public class LogController {
    * @throws Exception if filtering fails
    */
   @PostMapping("/filter")
-  public List<LogRecord> filterLogs(@RequestBody Map<String, Object> body) throws Exception {
+  public List<LogRecord> filterLogs(
+      @CurrentTenant String tenantId, @RequestBody Map<String, Object> body) throws Exception {
     String file = (String) body.get("file");
-    List<LogRecord> logs = logService.parseFile(file);
+    List<LogRecord> logs = logService.parseFile(tenantId, file);
 
     Instant from = body.containsKey("from") ? Instant.parse((String) body.get("from")) : null;
     Instant to = body.containsKey("to") ? Instant.parse((String) body.get("to")) : null;
@@ -109,14 +113,16 @@ public class LogController {
    * @throws Exception if aggregation fails
    */
   @PostMapping("/aggregate")
-  public Map<String, Object> aggregateLogs(@RequestBody Map<String, Object> body) throws Exception {
-    return logService.summarize((String) body.get("file"), (int) body.getOrDefault("topN", 3));
+  public Map<String, Object> aggregateLogs(
+      @CurrentTenant String tenantId, @RequestBody Map<String, Object> body) throws Exception {
+    return logService.summarize(
+        tenantId, (String) body.get("file"), (int) body.getOrDefault("topN", 3));
   }
 
   /** Filters, then aggregates, in one streaming pass over the file (no size limit). */
   @PostMapping("/aggregateV2")
-  public Map<String, Object> aggregateLogsV2(@RequestBody Map<String, Object> body)
-      throws Exception {
+  public Map<String, Object> aggregateLogsV2(
+      @CurrentTenant String tenantId, @RequestBody Map<String, Object> body) throws Exception {
     String file = (String) body.get("file");
     // Apply filters before aggregating
     List<LogFilter> filters = new ArrayList<>();
@@ -134,7 +140,7 @@ public class LogController {
     }
 
     int topN = (int) body.getOrDefault("topN", 3);
-    return logService.aggregate(file, filters, topN);
+    return logService.aggregate(tenantId, file, filters, topN);
   }
 
   /**
@@ -145,8 +151,9 @@ public class LogController {
    * @throws Exception if export fails
    */
   @PostMapping(value = "/export/json", produces = MediaType.APPLICATION_JSON_VALUE)
-  public ResponseEntity<String> exportJson(@RequestBody Map<String, Object> body) throws Exception {
-    Map<String, Object> results = aggregateLogs(body);
+  public ResponseEntity<String> exportJson(
+      @CurrentTenant String tenantId, @RequestBody Map<String, Object> body) throws Exception {
+    Map<String, Object> results = aggregateLogs(tenantId, body);
     String json = logService.exportToJson(results);
     return ResponseEntity.ok()
         .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=logs.json")
@@ -161,8 +168,10 @@ public class LogController {
    * @throws Exception if export fails
    */
   @PostMapping(value = "/export/csv", produces = "text/csv")
-  public ResponseEntity<String> exportCsv(@RequestBody Map<String, Object> body) throws Exception {
-    List<Map<String, Object>> errorRate = logService.errorRateOverTime((String) body.get("file"));
+  public ResponseEntity<String> exportCsv(
+      @CurrentTenant String tenantId, @RequestBody Map<String, Object> body) throws Exception {
+    List<Map<String, Object>> errorRate =
+        logService.errorRateOverTime(tenantId, (String) body.get("file"));
 
     String csv = logService.exportErrorRateToCsv(errorRate);
     return ResponseEntity.ok()
@@ -178,8 +187,9 @@ public class LogController {
    * @throws Exception if summary generation fails
    */
   @PostMapping("/cli-summary")
-  public ResponseEntity<String> cliSummary(@RequestBody Map<String, Object> body) throws Exception {
-    String summary = logService.errorSummary((String) body.get("file"));
+  public ResponseEntity<String> cliSummary(
+      @CurrentTenant String tenantId, @RequestBody Map<String, Object> body) throws Exception {
+    String summary = logService.errorSummary(tenantId, (String) body.get("file"));
     log.info("*********** CLI Summary - Processing ***********");
     log.info(summary);
     log.info("*********** CLI Summary - Processed ***********");
