@@ -112,6 +112,20 @@ class FormatParsersTest {
   }
 
   @Test
+  void epochAndOffsetVariantsAreParsed() {
+    assertEquals(
+        Instant.ofEpochSecond(1_700_000_000L, 123_456_789),
+        new KeyValueLogParser().parse("ts=\"1700000000123456789\" msg=x").getTimestamp());
+    assertNull(new KeyValueLogParser().parse("ts=99999999999999999999 msg=x").getTimestamp());
+    assertEquals(
+        Instant.parse("2025-10-09T01:11:40Z"),
+        new RawTextParser().parse("2025-10-09 01:11:40Z boom").getTimestamp());
+    assertEquals(
+        Instant.parse("2025-10-08T19:41:40Z"),
+        new RawTextParser().parse("2025-10-09T01:11:40+0530 boom").getTimestamp());
+  }
+
+  @Test
   void rawTextPicksUpALeadingTimestampAndLevelWord() {
     LogRecord r = new RawTextParser().parse("2025-10-26 18:12:00,123 WARN pool exhausted");
 
@@ -164,6 +178,45 @@ class FormatParsersTest {
   }
 
   @Test
+  void logbackDefaultDateIsFollowedDirectlyByAnotherField() {
+    LogbackPatternParser parser = new LogbackPatternParser("%d %-5level %logger %msg");
+
+    LogRecord r = parser.parse("2024-01-01 12:00:00,000 INFO  c.Foo hi there");
+
+    assertEquals(Instant.parse("2024-01-01T12:00:00Z"), r.getTimestamp());
+    assertEquals("INFO", r.getLevel());
+    assertEquals("c.Foo", r.getMeta().get("logger"));
+    assertEquals("hi there", r.getMessage());
+    assertEquals(
+        "hi", new LogbackPatternParser("%d %m").parse("2024-01-01 12:00:00,000 hi").getMessage());
+  }
+
+  @Test
+  void logbackTimeOnlyDateKeepsTheTimeAsAnAttribute() {
+    LogbackPatternParser parser =
+        new LogbackPatternParser("%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n");
+
+    LogRecord r = parser.parse("12:00:00.123 [main] DEBUG c.e.App - started");
+
+    assertNull(r.getTimestamp());
+    assertEquals("12:00:00.123", r.getMeta().get("timestamp"));
+    assertEquals("DEBUG", r.getLevel());
+    assertEquals("started", r.getMessage());
+    assertNull(parser.parse("not-a-time [main] DEBUG c.e.App - started"));
+  }
+
+  @Test
+  void logbackDateWordsEachUseTheirOwnFormat() {
+    LogbackPatternParser parser =
+        new LogbackPatternParser("%d{\"HH:mm:ss\", UTC} %d{yyyy-MM-dd} %m");
+
+    LogRecord r = parser.parse("12:00:00 2024-01-01 hi");
+
+    assertEquals(Instant.parse("2024-01-01T00:00:00Z"), r.getTimestamp());
+    assertEquals("12:00:00", r.getMeta().get("timestamp"));
+  }
+
+  @Test
   void logbackRejectsUnsupportedLayouts() {
     assertThrows(IllegalArgumentException.class, () -> new LogbackPatternParser(""));
     assertThrows(IllegalArgumentException.class, () -> new LogbackPatternParser("just text"));
@@ -171,6 +224,11 @@ class FormatParsersTest {
         IllegalArgumentException.class, () -> new LogbackPatternParser("%replace(%m){'a','b'}"));
     assertThrows(IllegalArgumentException.class, () -> new LogbackPatternParser("%X %m"));
     assertThrows(IllegalArgumentException.class, () -> new LogbackPatternParser("%d{qqqq-bad} %m"));
+    assertThrows(
+        IllegalArgumentException.class, () -> new LogbackPatternParser("%d{\"yyyy-MM-dd} %m"));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> new LogbackPatternParser("%d{\"yyyy-MM-dd\", Not/AZone} %m"));
     assertTrue(new LogbackPatternParser("%m").parse("anything").getMessage().equals("anything"));
   }
 }

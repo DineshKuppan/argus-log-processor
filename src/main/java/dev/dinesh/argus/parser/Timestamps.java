@@ -8,6 +8,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
+import java.time.temporal.TemporalAccessor;
 
 /** Lenient timestamp parsing for the field values structured logs use. */
 final class Timestamps {
@@ -17,12 +18,24 @@ final class Timestamps {
   private static final long MAX_EPOCH_MILLIS = 100_000_000_000_000L;
   private static final long MAX_EPOCH_MICROS = 100_000_000_000_000_000L;
 
-  /** {@code 2025-10-09 01:11:40}, optionally with a fraction after '.' or ','; read as UTC. */
-  private static final DateTimeFormatter LOCAL_DATE_TIME =
+  // Long.MAX_VALUE has 19 digits: nanosecond epochs fit, longer digit strings are not epochs.
+  private static final int MAX_EPOCH_DIGITS = 19;
+
+  /**
+   * {@code 2025-10-09 01:11:40} or {@code 2025-10-09T01:11:40}, optionally with a fraction (after
+   * '.' or ',') and an offset ({@code Z}, {@code +05:30} or {@code +0530}); without one it is UTC.
+   */
+  private static final DateTimeFormatter DATE_TIME =
       new DateTimeFormatterBuilder()
           .appendPattern("yyyy-MM-dd[ ]['T']HH:mm:ss")
           .optionalStart()
           .appendFraction(ChronoField.NANO_OF_SECOND, 1, 9, true)
+          .optionalEnd()
+          .optionalStart()
+          .appendOffset("+HH:MM", "Z")
+          .optionalEnd()
+          .optionalStart()
+          .appendOffset("+HHMM", "Z")
           .optionalEnd()
           .toFormatter();
 
@@ -38,15 +51,23 @@ final class Timestamps {
     }
     String text = s.trim().replace(',', '.');
     if (isDigits(text)) {
-      return fromEpoch(Long.parseLong(text));
+      try {
+        return fromEpoch(Long.parseLong(text));
+      } catch (NumberFormatException e) {
+        return null; // 19 digits above Long.MAX_VALUE
+      }
     }
     try {
       return OffsetDateTime.parse(text).toInstant();
     } catch (DateTimeException e) {
-      // not ISO-8601 with an offset; try without one
+      // not strict ISO-8601 with an offset; try the lenient forms
     }
     try {
-      return LocalDateTime.parse(text, LOCAL_DATE_TIME).toInstant(ZoneOffset.UTC);
+      TemporalAccessor parsed =
+          DATE_TIME.parseBest(text, OffsetDateTime::from, LocalDateTime::from);
+      return parsed instanceof OffsetDateTime odt
+          ? odt.toInstant()
+          : ((LocalDateTime) parsed).toInstant(ZoneOffset.UTC);
     } catch (DateTimeException e) {
       return null;
     }
@@ -66,7 +87,7 @@ final class Timestamps {
   }
 
   private static boolean isDigits(String s) {
-    if (s.length() > 18) {
+    if (s.isEmpty() || s.length() > MAX_EPOCH_DIGITS) {
       return false;
     }
     for (int i = 0; i < s.length(); i++) {

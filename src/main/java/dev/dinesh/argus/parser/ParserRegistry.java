@@ -69,11 +69,18 @@ public class ParserRegistry {
   }
 
   /**
+   * @param primary the source's format; {@code raw} (what detection returns when no format fits the
+   *     sample) means none, so a file that starts with a plain-text banner still parses the
+   *     structured lines after it
    * @param keepUnparsed keep lines no parser understands as raw text instead of dropping them
    */
   public ParserChain chain(LogParser primary, boolean keepUnparsed) {
+    RawTextParser unparsed = keepUnparsed ? raw : null;
+    if (primary instanceof RawTextParser) {
+      return new ParserChain(null, builtIns, unparsed);
+    }
     List<LogParser> fallbacks =
         builtIns.stream().filter(p -> !p.name().equals(primary.name())).toList();
-    return new ParserChain(primary, fallbacks, keepUnparsed ? raw : null);
+    return new ParserChain(primary, fallbacks, unparsed);
   }
 }

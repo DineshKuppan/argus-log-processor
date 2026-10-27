@@ -57,6 +57,19 @@ class EnvelopeFactoryTest {
   }
 
   @Test
+  void ecsServiceObjectLendsItsNameAndStaysInTheAttributes() {
+    Map<String, Object> ecs = Map.of("name", "checkout", "version", "1.2");
+    LogEnvelope e =
+        new EnvelopeFactory("default", "app", 0)
+            .create(parsed("INFO", Map.of("service", ecs, "trace_id", Map.of("x", 1))), 0, NOW);
+
+    assertEquals(Map.of("service.name", "checkout"), e.resource());
+    assertEquals(ecs, e.attributes().get("service"));
+    assertNull(e.traceId());
+    assertEquals(Map.of("x", 1), e.attributes().get("trace_id"));
+  }
+
+  @Test
   void eventIdIsDeterministicAndDiffersByOffsetSourceAndGeneration() {
     EnvelopeFactory app = new EnvelopeFactory("default", "app", 0);
 

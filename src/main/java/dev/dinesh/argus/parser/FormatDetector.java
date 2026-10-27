@@ -5,7 +5,7 @@ import java.util.List;
 /**
  * Picks a source's primary format from a sample of its lines: the candidate that parses the most
  * sample lines wins, ties going to the earlier (higher-priority) candidate. If none parses any
- * line, the source is raw text.
+ * line, the source is raw text; its lines still try every format (see {@link ParserChain}).
  */
 public final class FormatDetector {
 
@@ -44,7 +44,7 @@ public final class FormatDetector {
       }
     }
     return best == null
-        ? new Detection(fallback, sample.size(), sample.size())
+        ? new Detection(fallback, sample.size(), 0)
         : new Detection(best, sample.size(), bestCount);
   }
 

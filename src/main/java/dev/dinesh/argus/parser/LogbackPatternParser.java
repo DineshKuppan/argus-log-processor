@@ -3,12 +3,12 @@ package dev.dinesh.argus.parser;
 import dev.dinesh.argus.model.LogRecord;
 import java.time.DateTimeException;
 import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.OffsetDateTime;
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoField;
 import java.time.temporal.TemporalAccessor;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -26,7 +26,8 @@ import java.util.regex.Pattern;
  * <p>Supported: {@code %d{pattern[, zone]}} (default ISO8601, UTC), {@code %p/%le/%level}, {@code
  * %t/%thread}, {@code %c/%lo/%logger}, {@code %m/%msg/%message}, {@code %X{key}}, {@code ${NAME}},
  * {@code %n}, format modifiers such as {@code %-5p}, and any other word (kept as an attribute).
- * Composite words such as {@code %replace(...)} are rejected.
+ * Composite words such as {@code %replace(...)} are rejected. A time-only {@code %d} (no date in
+ * the line) leaves the event time empty and keeps the text as the {@code timestamp} attribute.
  */
 public class LogbackPatternParser implements LogParser {
 
@@ -43,13 +44,21 @@ public class LogbackPatternParser implements LogParser {
     ATTRIBUTE
   }
 
-  private record Field(Kind kind, String attribute) {}
+  /** One {@code %d} word: its formatter, and the zone for date-times written without one. */
+  private record DateFormat(String pattern, DateTimeFormatter formatter, ZoneId zone) {}
+
+  /**
+   * @param date set for {@link Kind#TIMESTAMP} only; each {@code %d} word has its own
+   */
+  private record Field(Kind kind, String attribute, DateFormat date) {
+    Field(Kind kind, String attribute) {
+      this(kind, attribute, null);
+    }
+  }
 
   private final String layout;
   private final Pattern regex;
   private final List<Field> fields = new ArrayList<>();
-  private DateTimeFormatter dateFormat;
-  private ZoneId zone = ZoneOffset.UTC;
 
   /**
    * @throws IllegalArgumentException if the layout uses an unsupported construct
@@ -89,11 +98,17 @@ public class LogbackPatternParser implements LogParser {
       Field field = fields.get(i);
       switch (field.kind()) {
         case TIMESTAMP -> {
-          Instant ts = parseTimestamp(value);
-          if (ts == null) {
+          Instant ts;
+          try {
+            ts = toInstant(field.date(), value);
+          } catch (DateTimeException e) {
             return null;
           }
-          record.setTimestamp(ts);
+          if (ts == null) {
+            meta.put("timestamp", value);
+          } else {
+            record.setTimestamp(ts);
+          }
         }
         case LEVEL -> record.setLevel(value);
         case MESSAGE -> record.setMessage(value);
@@ -105,21 +120,22 @@ public class LogbackPatternParser implements LogParser {
     return record;
   }
 
-  private Instant parseTimestamp(String text) {
-    try {
-      TemporalAccessor parsed =
-          dateFormat.parseBest(
-              text, OffsetDateTime::from, ZonedDateTime::from, LocalDateTime::from);
-      if (parsed instanceof OffsetDateTime odt) {
-        return odt.toInstant();
-      }
-      if (parsed instanceof ZonedDateTime zdt) {
-        return zdt.toInstant();
-      }
-      return ((LocalDateTime) parsed).atZone(zone).toInstant();
-    } catch (DateTimeException e) {
+  /**
+   * Returns the instant {@code text} denotes, or null if the format has no date (time only).
+   *
+   * @throws DateTimeException if {@code text} does not match the format
+   */
+  private static Instant toInstant(DateFormat date, String text) {
+    TemporalAccessor parsed = date.formatter().parse(text);
+    if (parsed.isSupported(ChronoField.INSTANT_SECONDS)) {
+      return Instant.from(parsed);
+    }
+    if (!parsed.isSupported(ChronoField.EPOCH_DAY)) {
       return null;
     }
+    LocalTime time =
+        parsed.isSupported(ChronoField.NANO_OF_DAY) ? LocalTime.from(parsed) : LocalTime.MIDNIGHT;
+    return LocalDate.from(parsed).atTime(time).atZone(date.zone()).toInstant();
   }
 
   private String compile(String layout) {
@@ -184,8 +200,8 @@ public class LogbackPatternParser implements LogParser {
     }
     switch (word) {
       case "d", "date" -> {
-        configureDate(options);
-        addField(out, new Field(Kind.TIMESTAMP, null), "(.+?)", padded);
+        DateFormat date = dateFormat(options);
+        addField(out, new Field(Kind.TIMESTAMP, null, date), dateGroup(date), padded);
       }
       case "p", "le", "level" -> addField(out, new Field(Kind.LEVEL, null), "(\\S+)", padded);
       case "t", "thread" -> addField(out, new Field(Kind.THREAD, null), "(.+?)", padded);
@@ -222,30 +238,54 @@ public class LogbackPatternParser implements LogParser {
     return !min.isEmpty() && Integer.parseInt(min) > 0;
   }
 
-  private void configureDate(String options) {
+  /** Reads {@code %d{options}}: {@code pattern[, zone]} or {@code "pattern"[, zone]}. */
+  private static DateFormat dateFormat(String options) {
     String pattern = ISO8601;
+    String zoneId = null;
     if (options != null && !options.isBlank()) {
       String opts = options.strip();
       if (opts.startsWith("\"")) {
         int close = opts.indexOf('"', 1);
+        if (close < 0) {
+          throw new IllegalArgumentException("Unclosed quote in %d{" + options + "}");
+        }
         pattern = opts.substring(1, close);
         String rest = opts.substring(close + 1).strip();
         if (rest.startsWith(",")) {
-          zone = ZoneId.of(rest.substring(1).strip());
+          zoneId = rest.substring(1).strip();
         }
       } else {
         int comma = opts.lastIndexOf(',');
         if (comma > 0 && isZone(opts.substring(comma + 1).strip())) {
-          zone = ZoneId.of(opts.substring(comma + 1).strip());
+          zoneId = opts.substring(comma + 1).strip();
           opts = opts.substring(0, comma).strip();
         }
         pattern = opts.equals("ISO8601") ? ISO8601 : opts;
       }
     }
+    ZoneId zone = zoneId == null ? ZoneOffset.UTC : zone(zoneId);
     try {
-      dateFormat = DateTimeFormatter.ofPattern(pattern, Locale.ROOT);
+      return new DateFormat(pattern, DateTimeFormatter.ofPattern(pattern, Locale.ROOT), zone);
     } catch (IllegalArgumentException e) {
       throw new IllegalArgumentException("Invalid %d date pattern '" + pattern + "'", e);
+    }
+  }
+
+  /**
+   * A formatted date has one more space-separated token than its pattern has spaces (two for
+   * ISO8601), so the group takes exactly that many; a lazy group would stop at the first space and
+   * split the date.
+   */
+  private static String dateGroup(DateFormat date) {
+    long spaces = date.pattern().chars().filter(c -> c == ' ').count();
+    return "(\\S+" + "\\s+\\S+".repeat((int) spaces) + ")";
+  }
+
+  private static ZoneId zone(String id) {
+    try {
+      return ZoneId.of(id);
+    } catch (DateTimeException e) {
+      throw new IllegalArgumentException("Unknown time zone '" + id + "' in %d", e);
     }
   }
 

@@ -28,7 +28,7 @@ public class DurationAggregator implements Aggregator<List<Map<String, Object>>>
         .forEach(
             r -> {
               Instant hour = r.getTimestamp().truncatedTo(unit);
-              String level = r.getLevel();
+              String level = r.getLevel() == null ? "-" : r.getLevel();
               Map<String, Long> levelMap = buckets.computeIfAbsent(hour, k -> new TreeMap<>());
               levelMap.put(level, levelMap.getOrDefault(level, 0L) + 1);
             });

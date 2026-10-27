@@ -48,12 +48,12 @@ public class KeyValueLogParser implements LogParser {
     if (fields.isEmpty()) {
       return null;
     }
-    Object timestamp = JsonLogParser.take(fields, TIMESTAMP_KEYS);
+    Object timestamp = Fields.take(fields, TIMESTAMP_KEYS);
     LogRecord record =
         new LogRecord(
             Timestamps.parse(timestamp),
-            JsonLogParser.asText(JsonLogParser.take(fields, LEVEL_KEYS)),
-            JsonLogParser.asText(JsonLogParser.take(fields, MESSAGE_KEYS)),
+            Fields.asText(Fields.take(fields, LEVEL_KEYS)),
+            Fields.asText(Fields.take(fields, MESSAGE_KEYS)),
             fields);
     if (record.getTimestamp() == null && timestamp != null) {
       fields.put("timestamp", timestamp);

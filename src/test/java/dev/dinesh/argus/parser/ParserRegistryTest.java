@@ -68,12 +68,19 @@ class ParserRegistryTest {
   }
 
   @Test
-  void rawPrimaryNeverMarksLinesUnparsed() {
-    ParserChain chain = registry.chain(registry.detect(List.of("plain")).parser(), true);
+  void rawPrimaryStillParsesStructuredLinesAfterAPlainTextHeader() {
+    FormatDetector.Detection banner = registry.detect(List.of("Starting up", "Version 1.2"));
+    ParserChain chain = registry.chain(banner.parser(), true);
 
-    Parsed parsed = chain.parse("plain");
-    assertEquals(Outcome.PRIMARY, parsed.outcome());
-    assertTrue(!parsed.record().getMeta().containsKey(ParserChain.UNPARSED_ATTRIBUTE));
+    assertEquals("raw", banner.parser().name());
+    assertEquals(0, banner.parsedLines());
+    Parsed json = chain.parse(JSON);
+    assertEquals(Outcome.FALLBACK, json.outcome());
+    assertEquals("json", json.format());
+    Parsed plain = chain.parse("plain");
+    assertEquals(Outcome.UNPARSED, plain.outcome());
+    assertEquals(true, plain.record().getMeta().get(ParserChain.UNPARSED_ATTRIBUTE));
+    assertNull(registry.chain(banner.parser(), false).parse("plain"));
   }
 
   @Test

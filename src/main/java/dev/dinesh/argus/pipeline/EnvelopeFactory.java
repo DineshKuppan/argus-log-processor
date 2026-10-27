@@ -3,6 +3,7 @@ package dev.dinesh.argus.pipeline;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.model.LogRecord;
 import dev.dinesh.argus.model.Severity;
+import dev.dinesh.argus.parser.Fields;
 import dev.dinesh.argus.parser.ParserChain;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -42,7 +43,7 @@ public final class EnvelopeFactory {
   public LogEnvelope create(ParserChain.Parsed parsed, long lineOffset, Instant observedAt) {
     LogRecord record = parsed.record();
     Map<String, Object> attributes = record.getMeta();
-    String service = text(take(attributes, SERVICE_KEYS));
+    String service = serviceName(attributes);
     return new LogEnvelope(
         eventId(lineOffset),
         tenantId,
@@ -51,8 +52,8 @@ public final class EnvelopeFactory {
         record.getLevel(),
         Severity.of(record.getLevel()).number(),
         record.getMessage(),
-        text(take(attributes, TRACE_ID_KEYS)),
-        text(take(attributes, SPAN_ID_KEYS)),
+        Fields.takeText(attributes, TRACE_ID_KEYS),
+        Fields.takeText(attributes, SPAN_ID_KEYS),
         service == null ? null : Map.of("service.name", service),
         attributes,
         new LogEnvelope.Source(sourceId, generation, lineOffset, parsed.format()));
@@ -64,17 +65,17 @@ public final class EnvelopeFactory {
     return UUID.nameUUIDFromBytes(key.getBytes(StandardCharsets.UTF_8)).toString();
   }
 
-  private static Object take(Map<String, Object> attributes, List<String> keys) {
-    for (String key : keys) {
-      Object value = attributes.remove(key);
-      if (value != null) {
-        return value;
-      }
+  /**
+   * A flat {@code service.name}/{@code service}/{@code app} value is moved into the resource. An
+   * ECS {@code service} object ({@code {"name": ..., "version": ...}}) only lends its name and
+   * stays in the attributes, so its other fields are kept.
+   */
+  private static String serviceName(Map<String, Object> attributes) {
+    String service = Fields.takeText(attributes, SERVICE_KEYS);
+    if (service == null && attributes.get("service") instanceof Map<?, ?> ecs) {
+      Object name = ecs.get("name");
+      service = name instanceof String s ? s : null;
     }
-    return null;
-  }
-
-  private static String text(Object value) {
-    return value == null ? null : value.toString();
+    return service;
   }
 }

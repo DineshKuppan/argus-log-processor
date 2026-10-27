@@ -5,7 +5,8 @@ import java.util.List;
 
 /**
  * Parses each line with a source's primary parser, then with the other registered parsers in
- * priority order, and finally (if configured) keeps it as raw text. Thread-safe.
+ * priority order, and finally (if configured) keeps it as raw text. A {@code raw} primary means the
+ * source has no structured format, so every line goes straight to the other parsers. Thread-safe.
  */
 public final class ParserChain {
 
@@ -26,7 +27,9 @@ public final class ParserChain {
    */
   public record Parsed(LogRecord record, String format, Outcome outcome) {}
 
+  /** Null when the source has no structured primary format. */
   private final LogParser primary;
+
   private final List<LogParser> fallbacks;
   private final RawTextParser raw;
 
@@ -36,13 +39,9 @@ public final class ParserChain {
     this.raw = raw;
   }
 
-  public LogParser primary() {
-    return primary;
-  }
-
   /** Returns the parsed line, or null if nothing parsed it and unparsed lines are not kept. */
   public Parsed parse(String line) {
-    LogRecord record = tryParse(primary, line);
+    LogRecord record = primary == null ? null : tryParse(primary, line);
     if (record != null) {
       return new Parsed(record, primary.name(), Outcome.PRIMARY);
     }

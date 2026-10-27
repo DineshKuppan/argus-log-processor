@@ -47,30 +47,16 @@ public class JsonLogParser implements LogParser {
     } catch (JsonProcessingException e) {
       return null;
     }
-    Object timestamp = take(fields, TIMESTAMP_KEYS);
+    Object timestamp = Fields.take(fields, TIMESTAMP_KEYS);
     LogRecord record =
         new LogRecord(
             Timestamps.parse(timestamp),
-            asText(take(fields, LEVEL_KEYS)),
-            asText(take(fields, MESSAGE_KEYS)),
+            Fields.asText(Fields.take(fields, LEVEL_KEYS)),
+            Fields.asText(Fields.take(fields, MESSAGE_KEYS)),
             fields);
     if (record.getTimestamp() == null && timestamp != null) {
       fields.put("timestamp", timestamp); // unparseable: keep the original value
     }
     return record;
-  }
-
-  /** Removes and returns the first present key's value. */
-  static Object take(Map<String, Object> fields, List<String> keys) {
-    for (String key : keys) {
-      if (fields.containsKey(key)) {
-        return fields.remove(key);
-      }
-    }
-    return null;
-  }
-
-  static String asText(Object value) {
-    return value == null ? null : value.toString();
   }
 }

@@ -73,7 +73,7 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
 **Parsers** (`dev.dinesh.argus.parser`)
 - `LogParser` port: `name()`, a cheap `canParse()` probe (no false negatives) and `parse()` returning null, never throwing. Must pass `ParserContractTest`
 - Built-ins, in priority order: `ServerAccessLogParser` (`nginx_access`), `JsonLogParser` (`json`), `CriLogParser` (`cri`, Kubernetes), `KeyValueLogParser` (`kv`); plus `RawTextParser` (`raw`, last fallback) and `LogbackPatternParser` (`logback`, a layout compiled to a regex; only when requested)
-- `ParserRegistry`: resolves a requested format, `detect()`s one from a sample (`FormatDetector`: most parsed lines wins), and builds a `ParserChain` (primary → other parsers → raw)
+- `ParserRegistry`: resolves a requested format, `detect()`s one from a sample (`FormatDetector`: most parsed lines wins), and builds a `ParserChain` (primary → other parsers → raw). When detection finds no format (`raw`), every line still tries the structured parsers first
 
 **Service Layer** (`dev.dinesh.argus.service`)
 - `LogService`: Central service orchestrating parsing, filtering, aggregation, and export operations
@@ -137,7 +137,7 @@ Verified against the code; fix these before or alongside scaling work:
 - **v1 has no path restriction:** `?file=` / `"file"` accepts any readable path on the host (arbitrary file read). v2 enforces `allowed-roots`.
 - **Access-log dates use `Locale.ROOT`** (English `Sep`, as Nginx writes). Local `nginx.log` files generated before this change on an `en_GB` / `en_IN` JVM contain `Sept` and are now rejected; regenerate them with `DataSeeder`.
 - **No multiline framing:** a Java stack trace becomes one record per line (each continuation line is `raw` / `unparsed` unless it matches a format). Logback `%ex` is ignored for the same reason.
-- **Records without an event time** (JSON / kv lines with no timestamp field) land in `dt=unknown`, and v1's time filters and time buckets skip them.
+- **Records without an event time** (JSON / kv lines with no timestamp field, or a Logback layout whose `%d` has no date, e.g. `%d{HH:mm:ss.SSS}`, whose time is kept as the `timestamp` attribute) land in `dt=unknown`, and v1's time filters and time buckets skip them.
 - **Non-streaming aggregation:** `Aggregator.compute(List<LogRecord>)` requires every record in memory.
 - **Durability is local only:** v2 checkpoints and writes NDJSON to a local/PVC volume. No object storage, WAL watermarks or retries yet (P2).
 - **Redis unused:** configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
