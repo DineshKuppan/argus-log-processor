@@ -8,10 +8,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import dev.dinesh.argus.aggregate.impl.CountByLevelAggregator;
 import dev.dinesh.argus.aggregate.impl.TopNEndpointsAggregator;
 import dev.dinesh.argus.config.IngestProperties;
+import dev.dinesh.argus.config.LogProperties;
 import dev.dinesh.argus.filter.FilterSpec;
 import dev.dinesh.argus.filter.impl.LevelFilter;
 import dev.dinesh.argus.model.LogRecord;
 import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.source.AllowedPaths.OutsideAllowedRootsException;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,18 +25,32 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.util.unit.DataSize;
 
 class LogServiceTest {
 
-  private static final IngestProperties DEFAULTS =
-      new IngestProperties(0, null, null, 0, 0, null, 0, List.of(), null, null);
-
-  private final LogService service = new LogService(new ParserRegistry(), DEFAULTS);
-
   @TempDir Path dir;
+
+  private LogService service;
+
+  /** v1 may read the temp dir and the bundled samples. */
+  private IngestProperties ingest() {
+    return new IngestProperties(
+        0, null, null, 0, 0, null, 0, List.of(dir, Path.of("src/main/resources/logs")), null, null);
+  }
+
+  private LogService service(DataSize maxFileSize, int slots, boolean enforceAllowedRoots) {
+    return new LogService(
+        new ParserRegistry(), ingest(), new LogProperties(maxFileSize, slots, enforceAllowedRoots));
+  }
+
+  @BeforeEach
+  void defaults() {
+    service = service(null, 0, true);
+  }
 
   private String write(String... lines) throws IOException {
     Path file = dir.resolve("app.log");
@@ -122,7 +138,7 @@ class LogServiceTest {
         file,
         "{\"timestamp\":\"2025-09-19T22:21:35Z\",\"level\":\"ERROR\",\"message\":\"a\"}\n"
             + "{\"timestamp\":\"2025-09-19T22:21:36Z\",\"level\":\"INFO\",\"message\":\"b\"}");
-    ReflectionTestUtils.setField(service, "maxFileSize", 10L);
+    service = service(DataSize.ofBytes(10), 0, true);
 
     assertThrows(IllegalArgumentException.class, () -> service.parseFile(file.toString()));
     Map<String, Object> aggregates = service.aggregate(file.toString(), List.of(), 3);
@@ -132,7 +148,7 @@ class LogServiceTest {
 
   @Test
   void rejectsAggregationsBeyondTheSlotsInsteadOfQueueing() throws Exception {
-    LogService oneSlot = new LogService(new ParserRegistry(), DEFAULTS, 1);
+    LogService oneSlot = service(null, 1, true);
     String file = write("{\"level\":\"INFO\",\"message\":\"a\"}");
     CountDownLatch scanning = new CountDownLatch(1);
     CountDownLatch release = new CountDownLatch(1);
@@ -185,5 +201,25 @@ class LogServiceTest {
     assertThrows(
         IllegalArgumentException.class,
         () -> service.aggregate("/no/such/file/is/read", List.of(), -1));
+  }
+
+  @Test
+  void refusesFilesOutsideTheAllowedRootsUnlessEnforcementIsOff(@TempDir Path elsewhere)
+      throws Exception {
+    Path outside = elsewhere.resolve("secret.log");
+    Files.writeString(outside, "{\"level\":\"INFO\",\"message\":\"secret\"}\n");
+
+    assertThrows(OutsideAllowedRootsException.class, () -> service.parseFile(outside.toString()));
+    assertThrows(
+        OutsideAllowedRootsException.class,
+        () -> service.aggregate(outside.toString(), List.of(), 3));
+    assertThrows(
+        OutsideAllowedRootsException.class,
+        () ->
+            service.parseFile(
+                dir.resolve("../" + elsewhere.getFileName() + "/secret.log").toString()));
+    LogService warnOnly = service(null, 0, false);
+    assertEquals(1, warnOnly.parseFile(outside.toString()).size());
+    assertEquals(1L, warnOnly.aggregate(outside.toString(), List.of(), 3).get("totalLogs"));
   }
 }

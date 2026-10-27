@@ -6,18 +6,17 @@ import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.ingest.IngestPipeline.Request;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.source.AllowedPaths;
 import dev.dinesh.argus.source.SourceOffset;
 import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
 import java.util.HexFormat;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -45,7 +44,7 @@ public class IngestJobService {
 
   private final IngestPipeline pipeline;
   private final ParserRegistry parsers;
-  private final List<Path> allowedRoots;
+  private final AllowedPaths allowedPaths;
   private final ThreadPoolExecutor executor;
   private final Map<String, IngestJob> jobs = new ConcurrentHashMap<>();
   private final Map<String, String> activeJobBySource = new ConcurrentHashMap<>();
@@ -53,7 +52,7 @@ public class IngestJobService {
   public IngestJobService(IngestPipeline pipeline, ParserRegistry parsers, IngestProperties props) {
     this.pipeline = pipeline;
     this.parsers = parsers;
-    this.allowedRoots = props.allowedRoots();
+    this.allowedPaths = new AllowedPaths(props.allowedRoots());
     AtomicInteger threadCount = new AtomicInteger();
     this.executor =
         new ThreadPoolExecutor(
@@ -99,21 +98,7 @@ public class IngestJobService {
       String format,
       String pattern)
       throws IOException {
-    if (rawPath == null || rawPath.isBlank()) {
-      throw new IllegalArgumentException("path is required");
-    }
-    // Check the roots before existence, so a 404 never reveals whether a path outside them exists.
-    Path path = Path.of(rawPath).toAbsolutePath().normalize();
-    requireAllowed(path);
-    if (!Files.exists(path)) {
-      throw new NoSuchFileException(rawPath);
-    }
-    // Again after resolving symlinks, which may point outside the roots.
-    Path realPath = path.toRealPath();
-    requireAllowed(realPath);
-    if (!Files.isRegularFile(realPath)) {
-      throw new IllegalArgumentException("Not a regular file: " + rawPath);
-    }
+    Path realPath = allowedPaths.requireFile(rawPath);
     String sourceId =
         requestedSourceId == null || requestedSourceId.isBlank()
             ? defaultSourceId(realPath)
@@ -178,19 +163,6 @@ public class IngestJobService {
     } finally {
       activeJobBySource.remove(job.sourceId(), job.id());
     }
-  }
-
-  /** {@code path} must be absolute and normalized; compared with each root as written and real. */
-  private void requireAllowed(Path path) throws IOException {
-    for (Path root : allowedRoots) {
-      if (Files.isDirectory(root)
-          && (path.startsWith(root.toRealPath())
-              || path.startsWith(root.toAbsolutePath().normalize()))) {
-        return;
-      }
-    }
-    throw new IllegalArgumentException(
-        "Path is outside the allowed ingest roots (argus.ingest.allowed-roots)");
   }
 
   private static String defaultSourceId(Path realPath) {

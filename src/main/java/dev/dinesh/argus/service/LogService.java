@@ -9,6 +9,7 @@ import dev.dinesh.argus.aggregate.impl.DurationAggregator;
 import dev.dinesh.argus.aggregate.impl.ErrorRateAggregator;
 import dev.dinesh.argus.aggregate.impl.TopNEndpointsAggregator;
 import dev.dinesh.argus.config.IngestProperties;
+import dev.dinesh.argus.config.LogProperties;
 import dev.dinesh.argus.filter.FilterSpec;
 import dev.dinesh.argus.filter.LogFilter;
 import dev.dinesh.argus.model.LogRecord;
@@ -16,6 +17,8 @@ import dev.dinesh.argus.parser.FormatDetector;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserChain;
 import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.source.AllowedPaths;
+import dev.dinesh.argus.source.AllowedPaths.OutsideAllowedRootsException;
 import dev.dinesh.argus.source.FileSource;
 import dev.dinesh.argus.source.RawBatch;
 import java.io.IOException;
@@ -32,17 +35,16 @@ import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.unit.DataSize;
 
 /**
- * Service for parsing, filtering, analyzing, and exporting log records. Aggregations stream the
- * file in bounded batches, so they work on files of any size; at most {@code
- * log.max-concurrent-aggregations} run at once (more are rejected, never queued). Methods that
- * return every record load the whole file and are limited to {@code log.max-file-size} (50MB by
- * default).
+ * Service for parsing, filtering, analyzing, and exporting log records. Files must be under {@code
+ * argus.ingest.allowed-roots}, as for v2 (see {@link LogProperties#enforceAllowedRoots()}).
+ * Aggregations stream the file in bounded batches, so they work on files of any size; at most
+ * {@code log.max-concurrent-aggregations} run at once (more are rejected, never queued). Methods
+ * that return every record load the whole file and are limited to {@code log.max-file-size} (50MB
+ * by default).
  */
 @Service
 @Slf4j
@@ -50,8 +52,6 @@ public class LogService {
 
   /** Source id for v1's one-off reads; v1 keeps no checkpoints, so it only labels batches. */
   private static final String V1_SOURCE_ID = "v1";
-
-  public static final int DEFAULT_MAX_CONCURRENT_AGGREGATIONS = 2;
 
   /**
    * v1 used {@code readAllLines}, which never cut a line. Streaming needs some bound, so it is far
@@ -69,32 +69,20 @@ public class LogService {
   private final ObjectMapper mapper = new ObjectMapper();
   private final ParserRegistry parsers;
   private final IngestProperties ingest;
+  private final AllowedPaths allowedPaths;
+  private final boolean enforceAllowedRoots;
+  private final long maxFileSize;
   private final int aggregationSlots;
   private final Semaphore aggregations;
 
-  @Value("${log.max-file-size}")
-  private long maxFileSize;
-
-  private static final long DEFAULT_MAX_FILE_SIZE = 50L * 1024 * 1024;
-
-  public LogService(ParserRegistry parsers, IngestProperties ingest) {
-    this(parsers, ingest, DEFAULT_MAX_CONCURRENT_AGGREGATIONS);
-  }
-
-  @Autowired
-  public LogService(
-      ParserRegistry parsers,
-      IngestProperties ingest,
-      @Value("${log.max-concurrent-aggregations:" + DEFAULT_MAX_CONCURRENT_AGGREGATIONS + "}")
-          int maxConcurrentAggregations) {
-    if (maxConcurrentAggregations < 1) {
-      throw new IllegalArgumentException(
-          "log.max-concurrent-aggregations must be positive: " + maxConcurrentAggregations);
-    }
+  public LogService(ParserRegistry parsers, IngestProperties ingest, LogProperties props) {
     this.parsers = parsers;
     this.ingest = withMaxLineBytes(ingest, V1_MAX_LINE_BYTES);
-    this.aggregationSlots = maxConcurrentAggregations;
-    this.aggregations = new Semaphore(maxConcurrentAggregations);
+    this.allowedPaths = new AllowedPaths(ingest.allowedRoots());
+    this.enforceAllowedRoots = props.enforceAllowedRoots();
+    this.maxFileSize = props.maxFileSize().toBytes();
+    this.aggregationSlots = props.maxConcurrentAggregations();
+    this.aggregations = new Semaphore(aggregationSlots);
   }
 
   private static IngestProperties withMaxLineBytes(IngestProperties p, DataSize maxLineBytes) {
@@ -158,12 +146,12 @@ public class LogService {
   }
 
   private List<String> readLines(String filePath) throws Exception {
-    Path path = Path.of(filePath);
-    long maxSize = maxFileSize > 0 ? maxFileSize : DEFAULT_MAX_FILE_SIZE;
+    Path path = resolve(filePath);
     long fileSize = Files.size(path);
     log.info("File size: {}", formatSmartSize(fileSize));
-    if (fileSize > maxSize) {
-      throw new IllegalArgumentException("File size exceeds 50MB limit");
+    if (fileSize > maxFileSize) {
+      throw new IllegalArgumentException(
+          "File size exceeds the " + formatSmartSize(maxFileSize) + " limit (log.max-file-size)");
     }
     List<String> lines = Files.readAllLines(path);
     log.info("Total lines: {}", lines.size());
@@ -209,6 +197,7 @@ public class LogService {
    * @throws AggregationSlotsBusyException if every slot is taken
    */
   public void forEachRecord(String filePath, Consumer<LogRecord> consumer) throws IOException {
+    Path path = resolve(filePath);
     if (!aggregations.tryAcquire()) {
       throw new AggregationSlotsBusyException(aggregationSlots);
     }
@@ -218,7 +207,7 @@ public class LogService {
     long truncated = 0;
     String format = null;
     String outcome = "FAILED";
-    try (FileSource source = FileSource.open(Path.of(filePath), V1_SOURCE_ID, ingest)) {
+    try (FileSource source = FileSource.open(path, V1_SOURCE_ID, ingest)) {
       // v1 reads finished files, so the last line counts even without a trailing newline.
       source.startAt(0, true);
       List<String> sample =
@@ -252,6 +241,25 @@ public class LogService {
           lines - records,
           truncated,
           (System.nanoTime() - start) / 1_000_000);
+    }
+  }
+
+  /**
+   * The file v1 may read for {@code filePath}: under the allowed roots, or (with enforcement off)
+   * anywhere, with a warning.
+   */
+  private Path resolve(String filePath) throws IOException {
+    try {
+      return allowedPaths.requireFile(filePath);
+    } catch (OutsideAllowedRootsException e) {
+      if (enforceAllowedRoots) {
+        throw e;
+      }
+      log.warn(
+          "v1 read outside argus.ingest.allowed-roots file={}; refused once"
+              + " log.enforce-allowed-roots=true",
+          filePath);
+      return Path.of(filePath);
     }
   }
 
