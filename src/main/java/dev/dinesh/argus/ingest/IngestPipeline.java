@@ -59,7 +59,7 @@ public class IngestPipeline {
   private static final Set<Reason> FILE_CHANGED =
       EnumSet.of(Reason.FILE_REPLACED, Reason.FILE_TRUNCATED, Reason.FILE_REWRITTEN);
   private static final RawBatch END_OF_RAW =
-      new RawBatch(null, -1, -1, List.of(), -1, -1, false, 0);
+      new RawBatch(null, -1, -1, List.of(), new long[0], -1, -1, false, 0);
   private static final LogBatch END_OF_PARSED =
       new LogBatch(null, -1, -1, List.of(), -1, -1, false, 0);
 

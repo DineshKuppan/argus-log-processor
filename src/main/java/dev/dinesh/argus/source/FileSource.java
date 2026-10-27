@@ -34,6 +34,7 @@ public final class FileSource implements Closeable {
 
   private static final int READ_BUFFER_BYTES = 64 * 1024;
   private static final int INITIAL_LINE_BYTES = 8 * 1024;
+  private static final int INITIAL_OFFSETS = 1024;
   private static final int OPEN_ATTEMPTS = 3;
 
   private final String sourceId;
@@ -163,14 +164,20 @@ public final class FileSource implements Closeable {
     }
     long start = consumed;
     List<String> lines = new ArrayList<>();
+    long[] lineOffsets = new long[Math.min(batchMaxLines, INITIAL_OFFSETS)];
     int truncated = 0;
     while (consumed < limit && lines.size() < batchMaxLines && consumed - start < batchMaxBytes) {
+      long lineStart = consumed;
       readLine();
       if (lineTruncated) {
         truncated++;
       }
       String line = decodeLine();
       if (!line.isBlank()) {
+        if (lines.size() == lineOffsets.length) {
+          lineOffsets = Arrays.copyOf(lineOffsets, lineOffsets.length * 2);
+        }
+        lineOffsets[lines.size()] = lineStart;
         lines.add(line);
       }
     }
@@ -178,7 +185,15 @@ public final class FileSource implements Closeable {
     boolean lastInSegment = endOfSource || consumed - segmentStart >= segmentBytes;
     RawBatch batch =
         new RawBatch(
-            sourceId, segmentIndex, sequence++, lines, start, consumed, lastInSegment, truncated);
+            sourceId,
+            segmentIndex,
+            sequence++,
+            lines,
+            Arrays.copyOf(lineOffsets, lines.size()),
+            start,
+            consumed,
+            lastInSegment,
+            truncated);
     if (lastInSegment && !endOfSource) {
       segmentIndex++;
       segmentStart = consumed;

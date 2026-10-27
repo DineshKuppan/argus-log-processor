@@ -1,5 +1,6 @@
 package dev.dinesh.argus.source;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -108,6 +109,17 @@ class FileSourceTest {
       List<String> resumed = linesOf(readAll(file, batch.endOffset(), props));
       assertEquals(expected.subList(linesSoFar, expected.size()), resumed);
     }
+  }
+
+  @Test
+  void recordsTheByteOffsetOfEveryNonBlankLine() throws IOException {
+    Path file = write("ab\n\ncdé\r\nf\n");
+
+    List<RawBatch> batches = readAll(file, 0, linesOnly(2));
+
+    assertEquals(List.of("ab", "cdé"), batches.get(0).lines());
+    assertArrayEquals(new long[] {0, 4}, batches.get(0).lineOffsets());
+    assertArrayEquals(new long[] {10}, batches.get(1).lineOffsets()); // "cdé\r\n" is 6 bytes
   }
 
   @Test
