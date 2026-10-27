@@ -20,6 +20,8 @@
     <java.version>17</java.version>
     <excludedGroups>load</excludedGroups>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Boot 3.3.3 manages 1.19.8, whose Docker API 1.32 is rejected by Docker Engine 29+ (minimum 1.40) -->
+    <testcontainers.version>1.21.4</testcontainers.version>
   </properties>
 
   <licenses>
@@ -89,6 +91,13 @@
       <scope>test</scope>
     </dependency>
 
+    <!-- Real Redis for RedisSuppressionStoreTest; the test is skipped without Docker -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
@@ -110,6 +119,12 @@
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+
+    <!-- Suppression windows (P1b); version managed by Spring Boot -->
+    <dependency>
+      <groupId>com.github.ben-manes.caffeine</groupId>
+      <artifactId>caffeine</artifactId>
     </dependency>
 
     <dependency>
