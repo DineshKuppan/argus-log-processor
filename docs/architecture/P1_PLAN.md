@@ -2,7 +2,7 @@
 
 > Phase P1 of [`SCALING_DESIGN.md`](SCALING_DESIGN.md) §12. Builds on P0 ([`P0_PLAN.md`](P0_PLAN.md)).
 > Exit criteria: **T1** (≥4,150 lines/s sustained on one 4GB node) and **T6** (correct allow/deny at the 10s boundary, p99 decision <1ms locally).
-> Ships as two PRs: **P1a** (parsers + envelope, §2–§7; **implemented**, results in §10) and **P1b** (suppression + streaming aggregation, §8).
+> Ships as two PRs: **P1a** (parsers + envelope, §2–§7; results in §10) and **P1b** (suppression + streaming aggregation, §8; results in §11). Both **implemented**.
 
 ## 1. Goal and scope
 
@@ -97,13 +97,69 @@ v2 output lines change from `LogRecord` to `LogEnvelope`:
 4. Pipeline + sink on envelopes; API `format`/`pattern`; job status fields; delete `LineParser` (the pipeline used it until this step).
 5. Docs (CLAUDE.md, SCALING_DESIGN.md) and load test results.
 
-## 8. P1b outline (second PR)
-- **`Suppressor` port** with `LocalSuppressionStore` (Caffeine `expireAfterWrite(10s)`, `maximumSize` 1M) and `RedisSuppressionStore` (`SET key 1 NX PX 10000`, fail open on errors). Key = `tenantId + ":" + xxHash64(trim(body))`; template fingerprinting (numbers/UUIDs → placeholders) is an opt-in flag.
-- **`POST /api/v2/suppression/check`** `{"message": "..."}` → `{"decision":"ALLOW"|"DENY","windowEndsAt":…,"suppressedCount":N}`. Tenant from the `X-Argus-Tenant` header (a stand-in until P3's API keys; never from the body, guardrail 4).
-- **Summaries:** when a window that denied ≥1 message expires, log one canonical line `"<msg>" suppressed N times in 10s`.
-- **T6 tests:** a fake ticker for the exact boundary (9.999s deny, 10.000s allow), concurrency (exactly one ALLOW among N concurrent identical calls), Redis via Testcontainers, a latency check tagged `load` (p99 <1ms local).
-- **`StreamingAggregator<S, T>`** (`accept`, `merge`, `result`) ports of the four aggregators; v1 `/aggregate` and `/aggregateV2` stream the file through `FileSource` + the registry, so the 50MB limit only remains on endpoints that return every record.
-- New dependency: `com.github.ben-manes.caffeine:caffeine` (managed by Spring Boot); Testcontainers for Redis.
+## 8. P1b: suppression and streaming aggregation (second PR)
+
+### 8.1 Decisions (STAR)
+
+#### D6. Suppression store: Caffeine locally, one Lua call in Redis
+- **Situation:** the brief needs an immediate allow/deny per `(tenant, message)` for 10s. Peak ingest is ~4k lines/s, so at most ~40k distinct keys can be live in one window.
+- **Task:** atomic first-wins decisions (exactly one ALLOW among concurrent identical calls), a per-window suppressed count, and T6's p99 <1ms locally.
+- **Action:** options were (a) `ConcurrentHashMap` + a sweeper thread, (b) **Caffeine** (`expireAfterWrite`, `maximumSize`, removal listener), (c) Redis only. Chosen: `LocalSuppressionStore` on (b) by default; `asMap().putIfAbsent` is the atomic decision, and an expired-but-not-yet-evicted entry counts as absent. `RedisSuppressionStore` (`argus.suppression.store=redis`) runs one Lua script per call: `SET key 0 NX PX window` → ALLOW, else `INCR key` (keeps the TTL) + `PTTL` → DENY with the count. That is one round trip, and the counter is the key's own value. Any Redis error **fails open** (ALLOW, guardrail 8) with a rate-limited warning, under a 100ms command timeout.
+- **Result:** decisions in microseconds locally. Redis keys start with the tenant (`<tenant>:supp:<hash>`, guardrail 4). `max-keys` defaults to 100k (2.5× the peak window), about 30MB. A size eviction can only end a window early, which allows a duplicate rather than losing a line.
+
+#### D7. Key hash: truncated SHA-256 instead of xxHash64
+- **Situation:** the outline named xxHash64, which the JDK doesn't ship.
+- **Action:** a new dependency (zero-allocation-hashing) for a 64-bit hash, or the JDK's **SHA-256 truncated to 128 bits** (hardware-accelerated, well under 1µs for a log line). Chosen: SHA-256 → 22 base64url characters.
+- **Result:** no new dependency, and no realistic collisions; one tenant can't craft a collision that suppresses another tenant's message, because the tenant is part of the key prefix anyway.
+
+#### D8. Summaries: on expiry locally, not yet in Redis
+- **Action:** the local store's removal listener logs one line per window that denied ≥1 message (`Suppressed message="…" count=N window=10s`); Caffeine's system scheduler evicts expired windows promptly. Redis has no expiry callback without keyspace notifications, so Redis-mode summaries are deferred to P4 (canonical lines and metrics). Each Redis DENY still returns the running count.
+- **Result:** with the default local store, no suppressed signal is lost silently.
+
+#### D9. Streaming aggregation: mergeable accumulators, bounded top-N
+- **Situation:** `Aggregator.compute(List)` needs every record in memory, so v1 caps files at 50MB. `LogService` also duplicates three of the aggregators.
+- **Action:** `StreamingAggregator<A, T>` with `newState()`, `accept(state, record)`, `merge(a, b)`, `result(state)` (the shape of `java.util.stream.Collector`, so it parallelizes later). It extends `Aggregator<T>` with a default `compute(List)`, so existing callers and tests are unchanged. The four aggregators become streaming; the `LogService` copies are deleted. Top-N endpoints uses **Misra–Gries** with 100k counters: exact while there are ≤100k distinct endpoints, and beyond that every endpoint with more than N/100k hits is kept, with its count low by at most N/100k. Error rate takes a bucket unit (v1 `/aggregate` keeps per-minute buckets).
+- **Result:** v1 `/aggregate`, `/aggregateV2`, `/export/json`, `/export/csv` and `/cli-summary` stream the file through `FileSource` and the registry in ≤10,000-line batches, with no size limit. The 50MB limit remains only on `/parse`, `/parse/regexp` and `/filter`, which return every record.
+
+### 8.2 Components
+| Class | Package | Responsibility |
+|---|---|---|
+| `Suppressor` | `suppression` | `check(tenantId, message)` → `SuppressionDecision(decision, windowEndsAt, suppressedCount)`; builds the key with `MessageFingerprint` |
+| `MessageFingerprint` | `suppression` | `trim`, optional template mode (UUIDs, hex ids, numbers → placeholders), SHA-256/128 base64url |
+| `SuppressionStore` port, `LocalSuppressionStore`, `RedisSuppressionStore` | `suppression` | D6, D8 |
+| `SuppressionController` | `controller` | `POST /api/v2/suppression/check` |
+| `SuppressionProperties` | `config` | `argus.suppression.*` |
+| `StreamingAggregator` + the four aggregators | `aggregate` | D9 |
+| `FileSource.startAt(offset, includeUnterminatedLine)` | `source` | v1 reads a static file to its end, including a last line without `\n` (`readAllLines` did) |
+
+### 8.3 API
+`POST /api/v2/suppression/check`, header `X-Argus-Tenant` (optional, default `default`; `[A-Za-z0-9._-]{1,64}`, else 400; a stand-in until P3's API keys, never read from the body), body `{"message": "..."}` (missing → 400):
+```json
+{"decision":"DENY","windowEndsAt":"2026-10-27T09:00:10Z","suppressedCount":3}
+```
+`windowEndsAt` is when the same message is next allowed; `suppressedCount` is how many copies this window has denied, including this one (0 on ALLOW).
+
+### 8.4 Configuration
+- `argus.suppression.window` (default `10s`), `max-keys` (`100000`), `store` (`local` | `redis`), `template-fingerprint` (`false`).
+- `spring.data.redis.timeout=100ms`, so a slow Redis fails open quickly instead of after Lettuce's 60s default.
+
+### 8.5 Tests (T6)
+| Test | Covers |
+|---|---|
+| `LocalSuppressionStoreTest` | Fake clock: DENY at 9.999s, ALLOW at 10.000s; counts; 32 concurrent identical calls → exactly one ALLOW; summary on expiry; size bound |
+| `RedisSuppressionStoreTest` | Same semantics against a real Redis (Testcontainers; skipped without Docker); fail open when Redis is unreachable |
+| `MessageFingerprintTest`, `SuppressorTest` | Trim, template mode, tenant isolation |
+| `SuppressionControllerTest` | 200 ALLOW then DENY; 400 for a bad tenant header or missing message |
+| `SuppressionLatencyIT` (tag `load`) | p99 decision <1ms with the local store |
+| `AggregatorTest` | Each streaming aggregator: `merge` of split halves equals one pass; Misra–Gries exact below capacity, bounded error above |
+| `LogServiceTest` | Streaming endpoints match the list-based results; a file larger than `log.max-file-size` aggregates; last line without `\n` is counted |
+
+### 8.6 Implementation order (one commit per step)
+1. This plan section.
+2. `StreamingAggregator`, the four aggregators, `FileSource` option, v1 streaming endpoints (delete the `LogService` copies).
+3. Suppression: fingerprint, stores, `Suppressor`, properties.
+4. `POST /api/v2/suppression/check` + controller tests.
+5. Docs and results (CLAUDE.md, SCALING_DESIGN.md, §11 here).
 
 ## 9. Risks
 | Risk | Mitigation |
@@ -121,3 +177,33 @@ v2 output lines change from `LogRecord` to `LogEnvelope`:
   - `LineParser` was deleted in step 4, not step 2, because the pipeline used it until then.
   - Replayed segments are no longer byte-identical: `observedTimestamp` is the time of each run. `eventId`s, paths and every other field are identical, and the crash-replay test compares output with that field removed.
   - A record's `dt` comes from the first record in the segment that *has* an event time.
+
+## 11. Results (P1b)
+- **Tests:** 183 pass (`mvn -P ci test`), up from 155 at the end of P1a, including the Redis store against a real Redis 7.2 (Testcontainers).
+- **T6:** with the fake clock, a copy at 9.999s is denied and one at 10.000s is allowed; exactly one of 32 concurrent identical calls is allowed (16 against Redis). `SuppressionLatencyIT`, 1M decisions on a mix of hot and unique messages with the local store: **p50 1µs, p99 8.8µs, p99.9 16.5µs** (target p99 <1ms).
+- **T1:** the 1GB ingest load test still runs at 377,065 lines/s with a 202MB peak heap (ingest doesn't call the suppressor).
+- **Real app:**
+  - Local store: ALLOW, then DENY with counts 1 and 2 (a copy with surrounding spaces counts as the same message), ALLOW for another tenant, 400 for `X-Argus-Tenant: bad:tenant` and for a missing message. When the window ended, the app logged `Suppressed key=acme:supp:… count=2 window=10s message="disk full on /var"`.
+  - Redis store: the same decisions; Redis held one key, `acme:supp:…`, with value 2 and a 9.5s TTL. With Redis stopped, calls were allowed after the 100ms timeout, with one fail-open warning.
+  - v1 `/aggregateV2` on a 120MB, 1,291,417-line access log (over the 50MB limit) returned in 2.3s; `/cli-summary` and `/export/csv` also returned 200. `/parse` on the same file is still refused.
+- **Deviations:**
+  - SHA-256/128 instead of xxHash64 for the key (D7), to avoid a new dependency.
+  - Testcontainers is pinned to 1.21.4: Spring Boot 3.3.3 manages 1.19.8, which Docker Engine 29 rejects (API 1.32 < minimum 1.40).
+  - Real-app testing found that Redis-mode `windowEndsAt` was dated from before the call, so a slow first round trip made it 330ms early. It is now dated from the reply (`c82ec25`).
+  - The streaming-vs-list test generates its access lines rather than reading `src/main/resources/logs/nginx.log`: that file is git-ignored (`*.log`), so a clean checkout doesn't have it.
+
+### Review fixes (`/code-review high` on P1b)
+| # | Finding | Fix |
+|---|---|---|
+| 1 | v1 aggregations lost the 50MB cap with nothing in its place | `log.max-concurrent-aggregations` (2) slots; more get 429 + `Retry-After` (guardrail 2). v1 now maps `IllegalArgumentException` → 400 and a missing file → 404 instead of 500. Path restriction is still open (see Known Gaps) |
+| 2 | Tenant from an unauthenticated header | Accepted until P3's API keys; documented as a known gap |
+| 3 | Aggregator state grows with distinct levels | At most 64 distinct levels, the rest under `other`. Time buckets are bounded by the file's time span (documented) |
+| 4 | v1 silently cut lines at 1MB | v1 reads lines up to 16MB; the canonical scan line reports `truncated` and `dropped` |
+| 5 | Canonical lines | Suppression: in `finally`, failures included (still DEBUG: one per message). v1: one INFO `v1 scan finished` line per scan |
+| 6 | Denied copy missed by a window's summary | `compute` (under the eviction lock) instead of `putIfAbsent` + increment; a custom `Expiry` keeps updates from extending the window |
+| 7 | Sub-millisecond `window` silently disabled Redis suppression | Rejected at startup |
+| 8 | Negative `topN` failed after the whole scan | Rejected when the aggregator is built (400) |
+| 9 | `split()` per record for the endpoint | Two `indexOf` calls, property-tested against `split` |
+| 10 | Unbounded message, digest looked up per call | 64K-character cap (400); one `MessageDigest` per thread |
+
+After the fixes: 193 tests pass; `SuppressionLatencyIT` p99 9.4µs.

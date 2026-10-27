@@ -25,7 +25,8 @@ import java.util.Objects;
  * <p>A run reads up to the last newline present when it starts ({@link #startAt}). A trailing line
  * without a newline may still be being written, so it is left for the next run rather than split in
  * two (the same rule as Filebeat and Fluent Bit). Bytes appended later are picked up by the next
- * run resuming from its checkpoint. Not thread-safe: one reader thread per source.
+ * run resuming from its checkpoint. A one-off read of a finished file can include that line instead
+ * ({@link #startAt(long, boolean)}). Not thread-safe: one reader thread per source.
  */
 public final class FileSource implements Closeable {
 
@@ -115,11 +116,20 @@ public final class FileSource implements Closeable {
    * file.
    */
   public void startAt(long startOffset) throws IOException {
+    startAt(startOffset, false);
+  }
+
+  /**
+   * Like {@link #startAt(long)}, but with {@code includeUnterminatedLine} the run reads to the end
+   * of the file, including a last line without a newline. Only for files that are no longer being
+   * written: a line still being appended would be read half-written.
+   */
+  public void startAt(long startOffset, boolean includeUnterminatedLine) throws IOException {
     if (startOffset < 0 || startOffset > size) {
       throw new IllegalArgumentException(
           "Start offset " + startOffset + " is outside file of " + size + " bytes");
     }
-    this.limit = endOfLastCompleteLine(startOffset);
+    this.limit = includeUnterminatedLine ? size : endOfLastCompleteLine(startOffset);
     this.filePosition = startOffset;
     this.consumed = startOffset;
     this.segmentStart = startOffset;
@@ -216,7 +226,10 @@ public final class FileSource implements Closeable {
     return batch;
   }
 
-  /** End of this run: just past the last newline in the file when {@link #startAt} ran. */
+  /**
+   * End of this run: just past the last newline in the file when {@link #startAt} ran, or the file
+   * size if the run includes an unterminated last line.
+   */
   public long limit() {
     requireStarted();
     return limit;

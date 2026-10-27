@@ -145,6 +145,20 @@ class FileSourceTest {
   }
 
   @Test
+  void aOneOffReadCanIncludeTheUnterminatedLastLine() throws IOException {
+    Path file = write("a\nb\nlast");
+    try (FileSource source = FileSource.open(file, "src", linesOnly(100))) {
+      source.startAt(0, true);
+
+      RawBatch batch = source.nextBatch();
+      assertEquals(List.of("a", "b", "last"), batch.lines());
+      assertEquals(8, batch.endOffset());
+      assertEquals(8, source.limit());
+      assertNull(source.nextBatch());
+    }
+  }
+
+  @Test
   void resumingAfterTheWriterFinishesTheLineReadsItWhole() throws IOException {
     Path file = write("a\npartial-wri");
     long end = readAll(file, 0, linesOnly(100)).get(0).endOffset();
