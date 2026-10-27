@@ -13,10 +13,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.config.IngestProperties;
+import dev.dinesh.argus.config.TenancyConfig;
 import dev.dinesh.argus.ingest.IngestJobService;
 import dev.dinesh.argus.ingest.IngestPipeline;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.tenant.ApiKeyTenantResolver;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
@@ -38,10 +40,24 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 
 /** Exercises the v2 ingest API against the real job service with a mocked pipeline. */
-@WebMvcTest(IngestController.class)
-@Import({IngestJobService.class, ParserRegistry.class, IngestControllerTest.Config.class})
+@WebMvcTest(
+    controllers = IngestController.class,
+    properties = {
+      "argus.tenancy.api-keys[0].tenant=acme",
+      // printf %s acme-key | shasum -a 256
+      "argus.tenancy.api-keys[0].key-sha256=afacab3575137afa4e00d9cbcafcb14c9ae25f779d964eb0ea5b2c4eb5dfd163",
+      "argus.tenancy.api-keys[1].tenant=globex",
+      "argus.tenancy.api-keys[1].key-sha256=f2a455b59b858a04c51108416af2042203cb6ac35fa4141fba4148bc856e78d4"
+    })
+@Import({
+  IngestJobService.class,
+  ParserRegistry.class,
+  TenancyConfig.class,
+  IngestControllerTest.Config.class
+})
 class IngestControllerTest {
 
   private static final Path ROOT;
@@ -95,11 +111,35 @@ class IngestControllerTest {
     }
   }
 
+  private static final String ACME_KEY = "acme-key";
+  private static final String GLOBEX_KEY = "globex-key";
+
+  /** As tenant acme. */
+  private ResultActions perform(MockHttpServletRequestBuilder request) throws Exception {
+    return as(ACME_KEY, request);
+  }
+
+  private ResultActions as(String apiKey, MockHttpServletRequestBuilder request) throws Exception {
+    return mvc.perform(request.header(ApiKeyTenantResolver.API_KEY_HEADER, apiKey));
+  }
+
   private ResultActions submit(Map<String, String> body) throws Exception {
-    return mvc.perform(
+    return submitAs(ACME_KEY, body);
+  }
+
+  private ResultActions submitAs(String apiKey, Map<String, String> body) throws Exception {
+    return as(
+        apiKey,
         post("/api/v2/ingest/file")
             .contentType(MediaType.APPLICATION_JSON)
             .content(mapper.writeValueAsString(body)));
+  }
+
+  private String jobIdOf(ResultActions submitted) throws Exception {
+    return mapper
+        .readTree(submitted.andReturn().getResponse().getContentAsString())
+        .get("jobId")
+        .asText();
   }
 
   @Test
@@ -120,18 +160,47 @@ class IngestControllerTest {
             .getContentAsString();
     String jobId = mapper.readTree(body).get("jobId").asText();
 
-    mvc.perform(get("/api/v2/ingest/jobs/" + jobId))
+    perform(get("/api/v2/ingest/jobs/" + jobId))
         .andExpect(status().isOk())
         .andExpect(jsonPath("$.jobId").value(jobId))
         .andExpect(jsonPath("$.state").exists())
         .andExpect(jsonPath("$.percent").exists());
-    mvc.perform(delete("/api/v2/ingest/jobs/" + jobId)).andExpect(status().isAccepted());
+    perform(delete("/api/v2/ingest/jobs/" + jobId)).andExpect(status().isAccepted());
+  }
+
+  @Test
+  void requestsWithoutAValidKeyAre401() throws Exception {
+    mvc.perform(
+            post("/api/v2/ingest/file")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"path\":\"" + ROOT.resolve("app.log") + "\"}"))
+        .andExpect(status().isUnauthorized());
+    as("wrong-key", get("/api/v2/ingest/jobs/nope")).andExpect(status().isUnauthorized());
+  }
+
+  @Test
+  void jobsArePerTenantAndAnotherTenantsJobIsNotFound() throws Exception {
+    String acmeJob =
+        jobIdOf(
+            submit(Map.of("path", ROOT.resolve("app.log").toString(), "sourceId", "shared"))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.tenantId").value("acme")));
+    // Free the single job slot; later runs of the mocked pipeline return at once.
+    releaseAndWaitForTheSlot();
+
+    // Same source id, other tenant: its own source, not a 409.
+    submitAs(GLOBEX_KEY, Map.of("path", ROOT.resolve("app.log").toString(), "sourceId", "shared"))
+        .andExpect(status().isAccepted())
+        .andExpect(jsonPath("$.tenantId").value("globex"));
+    as(GLOBEX_KEY, get("/api/v2/ingest/jobs/" + acmeJob)).andExpect(status().isNotFound());
+    as(GLOBEX_KEY, delete("/api/v2/ingest/jobs/" + acmeJob)).andExpect(status().isNotFound());
+    perform(get("/api/v2/ingest/jobs/" + acmeJob)).andExpect(status().isOk());
   }
 
   @Test
   void unknownJobIs404() throws Exception {
-    mvc.perform(get("/api/v2/ingest/jobs/nope")).andExpect(status().isNotFound());
-    mvc.perform(delete("/api/v2/ingest/jobs/nope")).andExpect(status().isNotFound());
+    perform(get("/api/v2/ingest/jobs/nope")).andExpect(status().isNotFound());
+    perform(delete("/api/v2/ingest/jobs/nope")).andExpect(status().isNotFound());
   }
 
   @Test

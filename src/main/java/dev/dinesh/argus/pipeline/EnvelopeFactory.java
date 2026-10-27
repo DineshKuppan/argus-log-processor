@@ -18,9 +18,6 @@ import java.util.UUID;
  */
 public final class EnvelopeFactory {
 
-  /** Tenant for every record until tenants are resolved from credentials (P3). */
-  public static final String DEFAULT_TENANT = "default";
-
   private static final List<String> TRACE_ID_KEYS = List.of("trace_id", "traceId", "trace.id");
   private static final List<String> SPAN_ID_KEYS = List.of("span_id", "spanId", "span.id");
   private static final List<String> SERVICE_KEYS =

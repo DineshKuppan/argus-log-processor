@@ -21,6 +21,7 @@ public final class IngestJob {
   }
 
   private final String id;
+  private final String tenantId;
   private final String sourceId;
   private final Path path;
   private final boolean fromBeginning;
@@ -35,8 +36,15 @@ public final class IngestJob {
   /**
    * @param parser requested primary parser, or null to detect it
    */
-  IngestJob(String id, String sourceId, Path path, boolean fromBeginning, LogParser parser) {
+  IngestJob(
+      String id,
+      String tenantId,
+      String sourceId,
+      Path path,
+      boolean fromBeginning,
+      LogParser parser) {
     this.id = id;
+    this.tenantId = tenantId;
     this.sourceId = sourceId;
     this.path = path;
     this.fromBeginning = fromBeginning;
@@ -55,6 +63,10 @@ public final class IngestJob {
 
   public String id() {
     return id;
+  }
+
+  public String tenantId() {
+    return tenantId;
   }
 
   public String sourceId() {

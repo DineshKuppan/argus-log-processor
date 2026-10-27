@@ -6,6 +6,7 @@ import java.util.List;
 /** JSON view of an {@link IngestJob} returned by the ingest API. */
 public record IngestJobStatus(
     String jobId,
+    String tenantId,
     String sourceId,
     String path,
     IngestJob.State state,
@@ -42,6 +43,7 @@ public record IngestJobStatus(
     }
     return new IngestJobStatus(
         job.id(),
+        job.tenantId(),
         job.sourceId(),
         job.path().toString(),
         job.state(),

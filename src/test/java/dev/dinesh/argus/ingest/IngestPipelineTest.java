@@ -1,6 +1,7 @@
 package dev.dinesh.argus.ingest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -144,6 +145,29 @@ class IngestPipelineTest {
   }
 
   @Test
+  void tenantsIngestingTheSameSourceShareNothing() throws Exception {
+    Path file = writeLog(20);
+    Path out = dir.resolve("out");
+    FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
+    IngestPipeline pipeline = pipeline(localSink(out), cps);
+
+    pipeline.run(
+        new Request("acme", file, "app", false, null), new IngestProgress(), new AtomicBoolean());
+    pipeline.run(
+        new Request("globex", file, "app", false, null), new IngestProgress(), new AtomicBoolean());
+
+    assertEquals(20, recordCount(outputFiles(out.resolve("tenant=acme"))));
+    assertEquals(20, recordCount(outputFiles(out.resolve("tenant=globex"))));
+    assertEquals(Files.size(file), cps.load("acme", "app").orElseThrow().byteOffset());
+    assertEquals(Files.size(file), cps.load("globex", "app").orElseThrow().byteOffset());
+    JsonNode acme = records(out.resolve("tenant=acme")).get(0);
+    JsonNode globex = records(out.resolve("tenant=globex")).get(0);
+    assertEquals("acme", acme.get("tenantId").asText());
+    assertEquals("globex", globex.get("tenantId").asText());
+    assertNotEquals(acme.get("eventId").asText(), globex.get("eventId").asText());
+  }
+
+  @Test
   void ingestsWholeFileInSegmentsAndCheckpointsTheEnd() throws Exception {
     Path file = writeLog(100);
     Path out = dir.resolve("out");
@@ -152,13 +176,13 @@ class IngestPipelineTest {
 
     Outcome outcome =
         pipeline(localSink(out), cps)
-            .run(new Request(file, "app", false, null), progress, new AtomicBoolean());
+            .run(new Request("default", file, "app", false, null), progress, new AtomicBoolean());
 
     assertEquals(Outcome.COMPLETED, outcome);
     Map<String, String> files = outputFiles(out);
     assertEquals(100, recordCount(files));
     assertTrue(files.size() > 1, "expected several segments, got " + files.keySet());
-    assertEquals(Files.size(file), cps.load("app").orElseThrow().byteOffset());
+    assertEquals(Files.size(file), cps.load("default", "app").orElseThrow().byteOffset());
     assertEquals(Files.size(file), progress.committedOffset());
     assertEquals(files.size(), progress.outputs().size());
     assertEquals(0, progress.rejected());
@@ -172,7 +196,7 @@ class IngestPipelineTest {
     Path out = dir.resolve("out");
 
     pipeline(localSink(out), checkpoints(dir.resolve("cp")))
-        .run(new Request(file, "app", false, null), progress, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), progress, new AtomicBoolean());
 
     assertEquals("nginx_access", progress.format());
     assertEquals("detected", progress.formatSource());
@@ -211,7 +235,7 @@ class IngestPipelineTest {
             new ParserRegistry(),
             localSink(dir.resolve("out")),
             checkpoints(dir.resolve("cp")))
-        .run(new Request(file, "app", false, null), progress, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), progress, new AtomicBoolean());
 
     assertEquals(20, progress.lines());
     assertEquals(1, progress.rejected());
@@ -232,7 +256,7 @@ class IngestPipelineTest {
     IngestProgress progress = new IngestProgress();
 
     pipeline(localSink(out), checkpoints(dir.resolve("cp")))
-        .run(new Request(file, "api", false, null), progress, new AtomicBoolean());
+        .run(new Request("default", file, "api", false, null), progress, new AtomicBoolean());
 
     assertEquals("json", progress.format());
     JsonNode first = records(out).get(0);
@@ -275,6 +299,7 @@ class IngestPipelineTest {
     pipeline(localSink(out), checkpoints(dir.resolve("cp")))
         .run(
             new Request(
+                "default",
                 file,
                 "app",
                 false,
@@ -310,7 +335,7 @@ class IngestPipelineTest {
         };
 
     pipeline(slowSink, checkpoints(dir.resolve("cp")))
-        .run(new Request(file, "app", false, null), progress, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), progress, new AtomicBoolean());
 
     // Read-ahead is limited to what the two queues and the reader/parser hands can hold.
     long maxBatchesAhead = PROPS.rawQueueCapacity() + PROPS.parsedQueueCapacity() + 2;
@@ -326,7 +351,10 @@ class IngestPipelineTest {
 
     Path cleanOut = dir.resolve("clean-out");
     pipeline(localSink(cleanOut), checkpoints(dir.resolve("clean-cp")))
-        .run(new Request(file, "app", false, null), new IngestProgress(), new AtomicBoolean());
+        .run(
+            new Request("default", file, "app", false, null),
+            new IngestProgress(),
+            new AtomicBoolean());
 
     Path out = dir.resolve("out");
     FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
@@ -346,14 +374,14 @@ class IngestPipelineTest {
             () ->
                 pipeline(crashingSink, cps)
                     .run(
-                        new Request(file, "app", false, null),
+                        new Request("default", file, "app", false, null),
                         new IngestProgress(),
                         new AtomicBoolean()));
     assertTrue(crash.getMessage().contains("simulated crash"));
 
     IngestProgress rerun = new IngestProgress();
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false, null), rerun, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), rerun, new AtomicBoolean());
 
     assertEquals("CHECKPOINT", rerun.resumeReason());
     assertTrue(rerun.startOffset() > 0);
@@ -376,10 +404,11 @@ class IngestPipelineTest {
         };
 
     Outcome outcome =
-        pipeline(cancellingSink, cps).run(new Request(file, "app", false, null), progress, cancel);
+        pipeline(cancellingSink, cps)
+            .run(new Request("default", file, "app", false, null), progress, cancel);
 
     assertEquals(Outcome.CANCELLED, outcome);
-    long checkpoint = cps.load("app").orElseThrow().byteOffset();
+    long checkpoint = cps.load("default", "app").orElseThrow().byteOffset();
     assertTrue(checkpoint > 0 && checkpoint < Files.size(file));
     assertTrue(outputFiles(out).keySet().stream().noneMatch(p -> p.endsWith(".part")));
   }
@@ -398,7 +427,7 @@ class IngestPipelineTest {
 
     Outcome outcome =
         pipeline(cancellingSink, checkpoints(dir.resolve("cp")))
-            .run(new Request(file, "app", false, null), new IngestProgress(), cancel);
+            .run(new Request("default", file, "app", false, null), new IngestProgress(), cancel);
 
     assertEquals(Outcome.COMPLETED, outcome);
   }
@@ -413,16 +442,16 @@ class IngestPipelineTest {
 
     IngestProgress first = new IngestProgress();
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false, null), first, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), first, new AtomicBoolean());
     Files.writeString(file, line.substring(30) + "\n", StandardOpenOption.APPEND);
     IngestProgress second = new IngestProgress();
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false, null), second, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), second, new AtomicBoolean());
 
     assertEquals(5, first.lines());
     assertEquals(1, second.lines());
     assertEquals(0, first.rejected() + second.rejected());
-    assertEquals(Files.size(file), cps.load("app").orElseThrow().byteOffset());
+    assertEquals(Files.size(file), cps.load("default", "app").orElseThrow().byteOffset());
   }
 
   @Test
@@ -431,7 +460,10 @@ class IngestPipelineTest {
     Path out = dir.resolve("out");
     FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false, null), new IngestProgress(), new AtomicBoolean());
+        .run(
+            new Request("default", file, "app", false, null),
+            new IngestProgress(),
+            new AtomicBoolean());
     Map<String, String> beforeRotation = outputFiles(out);
 
     // Truncated in place (same inode), then regrown past the old checkpoint with new lines.
@@ -440,7 +472,7 @@ class IngestPipelineTest {
     Files.writeString(file, rotated);
     IngestProgress rerun = new IngestProgress();
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false, null), rerun, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), rerun, new AtomicBoolean());
 
     assertEquals("FILE_REWRITTEN", rerun.resumeReason());
     assertEquals(0, rerun.startOffset());
@@ -448,7 +480,7 @@ class IngestPipelineTest {
     Map<String, String> after = outputFiles(out);
     assertTrue(after.entrySet().containsAll(beforeRotation.entrySet()), "old output was replaced");
     assertEquals(90, recordCount(after));
-    assertEquals(1, cps.load("app").orElseThrow().generation());
+    assertEquals(1, cps.load("default", "app").orElseThrow().generation());
   }
 
   @Test
@@ -457,19 +489,22 @@ class IngestPipelineTest {
     Path out = dir.resolve("out");
     FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false, null), new IngestProgress(), new AtomicBoolean());
+        .run(
+            new Request("default", file, "app", false, null),
+            new IngestProgress(),
+            new AtomicBoolean());
     long firstEnd = Files.size(file);
 
     IngestProgress nothingNew = new IngestProgress();
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false, null), nothingNew, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), nothingNew, new AtomicBoolean());
     assertEquals(0, nothingNew.lines());
 
     Files.writeString(
         file, accessLine(30) + "\n" + accessLine(31) + "\n", StandardOpenOption.APPEND);
     IngestProgress appended = new IngestProgress();
     pipeline(localSink(out), cps)
-        .run(new Request(file, "app", false, null), appended, new AtomicBoolean());
+        .run(new Request("default", file, "app", false, null), appended, new AtomicBoolean());
 
     assertEquals(firstEnd, appended.startOffset());
     assertEquals(2, appended.lines());
@@ -492,14 +527,14 @@ class IngestPipelineTest {
     void afterCommit() {}
 
     @Override
-    public void discardUncommitted(String sourceId) throws IOException {
-      delegate.discardUncommitted(sourceId);
+    public void discardUncommitted(String tenantId, String sourceId) throws IOException {
+      delegate.discardUncommitted(tenantId, sourceId);
     }
 
     @Override
-    public SegmentWriter open(String sourceId, int generation, long startOffset)
+    public SegmentWriter open(String tenantId, String sourceId, int generation, long startOffset)
         throws IOException {
-      SegmentWriter writer = delegate.open(sourceId, generation, startOffset);
+      SegmentWriter writer = delegate.open(tenantId, sourceId, generation, startOffset);
       return new SegmentWriter() {
         @Override
         public void write(LogBatch batch) throws IOException {

@@ -4,6 +4,7 @@ import dev.dinesh.argus.ingest.IngestJobService;
 import dev.dinesh.argus.ingest.IngestJobService.JobSlotsBusyException;
 import dev.dinesh.argus.ingest.IngestJobService.SourceBusyException;
 import dev.dinesh.argus.ingest.IngestJobStatus;
+import dev.dinesh.argus.tenant.CurrentTenant;
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
 import java.util.Map;
@@ -22,6 +23,7 @@ import org.springframework.web.bind.annotation.RestController;
 /**
  * Streaming ingest API (v2). Jobs run asynchronously with bounded memory; poll the job for
  * progress. Unlike v1, results are persisted to the configured sink rather than returned inline.
+ * Every call acts for the tenant of its API key: sources, output and jobs are per tenant.
  */
 @RestController
 @RequestMapping("/api/v2/ingest")
@@ -51,27 +53,34 @@ public class IngestController {
       String path, String sourceId, Boolean fromBeginning, String format, String pattern) {}
 
   @PostMapping("/file")
-  public ResponseEntity<IngestJobStatus> ingestFile(@RequestBody IngestFileRequest request)
-      throws IOException {
+  public ResponseEntity<IngestJobStatus> ingestFile(
+      @CurrentTenant String tenantId, @RequestBody IngestFileRequest request) throws IOException {
     boolean fromBeginning = Boolean.TRUE.equals(request.fromBeginning());
     var job =
         jobs.submit(
-            request.path(), request.sourceId(), fromBeginning, request.format(), request.pattern());
+            tenantId,
+            request.path(),
+            request.sourceId(),
+            fromBeginning,
+            request.format(),
+            request.pattern());
     return ResponseEntity.accepted()
         .header(HttpHeaders.LOCATION, "/api/v2/ingest/jobs/" + job.id())
         .body(IngestJobStatus.of(job));
   }
 
   @GetMapping("/jobs/{jobId}")
-  public ResponseEntity<IngestJobStatus> job(@PathVariable String jobId) {
-    return jobs.find(jobId)
+  public ResponseEntity<IngestJobStatus> job(
+      @CurrentTenant String tenantId, @PathVariable String jobId) {
+    return jobs.find(tenantId, jobId)
         .map(job -> ResponseEntity.ok(IngestJobStatus.of(job)))
         .orElse(ResponseEntity.notFound().build());
   }
 
   @DeleteMapping("/jobs/{jobId}")
-  public ResponseEntity<IngestJobStatus> cancel(@PathVariable String jobId) {
-    return jobs.cancel(jobId)
+  public ResponseEntity<IngestJobStatus> cancel(
+      @CurrentTenant String tenantId, @PathVariable String jobId) {
+    return jobs.cancel(tenantId, jobId)
         .map(job -> ResponseEntity.accepted().body(IngestJobStatus.of(job)))
         .orElse(ResponseEntity.notFound().build());
   }

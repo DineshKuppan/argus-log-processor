@@ -8,6 +8,7 @@ import dev.dinesh.argus.config.LocalSinkProperties;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.source.LogBatch;
 import dev.dinesh.argus.source.SourceOffset;
+import dev.dinesh.argus.tenant.TenantIds;
 import dev.dinesh.argus.utils.DurableFiles;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
@@ -26,8 +27,8 @@ import org.springframework.stereotype.Component;
  * Writes segments as NDJSON files on a local or Kubernetes-mounted volume:
  *
  * <pre>
- * root/tenant=default/_staging/source=ID/START.ndjson.part                   while writing
- * root/tenant=default/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson        after commit
+ * root/tenant=T/_staging/source=ID/START.ndjson.part                   while writing
+ * root/tenant=T/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson        after commit
  * </pre>
  *
  * <p>Names derive from source offsets, and {@code dt} from the first event time in the segment
@@ -39,24 +40,23 @@ import org.springframework.stereotype.Component;
 @Component
 public class LocalVolumeSink implements LogSink {
 
-  private static final String TENANT_DIR = "tenant=default";
   private static final String PART_SUFFIX = ".ndjson.part";
   private static final int WRITE_BUFFER_BYTES = 256 * 1024;
 
-  private final Path tenantRoot;
+  private final Path root;
   private final long minFreeBytes;
   private final ObjectWriter writer;
 
   public LocalVolumeSink(LocalSinkProperties props, ObjectMapper mapper) {
-    this.tenantRoot = props.root().resolve(TENANT_DIR);
+    this.root = props.root();
     this.minFreeBytes = props.minFreeBytes().toBytes();
     // Flushing per record would turn every record into a write syscall; commit flushes instead.
     this.writer = mapper.writer().without(SerializationFeature.FLUSH_AFTER_WRITE_VALUE);
   }
 
   @Override
-  public void discardUncommitted(String sourceId) throws IOException {
-    Path staging = stagingDir(sourceId);
+  public void discardUncommitted(String tenantId, String sourceId) throws IOException {
+    Path staging = stagingDir(tenantId, sourceId);
     if (!Files.isDirectory(staging)) {
       return;
     }
@@ -69,8 +69,9 @@ public class LocalVolumeSink implements LogSink {
   }
 
   @Override
-  public SegmentWriter open(String sourceId, int generation, long startOffset) throws IOException {
-    Path staging = Files.createDirectories(stagingDir(sourceId));
+  public SegmentWriter open(String tenantId, String sourceId, int generation, long startOffset)
+      throws IOException {
+    Path staging = Files.createDirectories(stagingDir(tenantId, sourceId));
     long usable = Files.getFileStore(staging).getUsableSpace();
     if (usable < minFreeBytes) {
       throw new IOException(
@@ -81,17 +82,26 @@ public class LocalVolumeSink implements LogSink {
               + " required");
     }
     return new LocalSegmentWriter(
-        sourceId, generation, startOffset, staging.resolve(startOffset + PART_SUFFIX));
+        tenantRoot(tenantId),
+        sourceId,
+        generation,
+        startOffset,
+        staging.resolve(startOffset + PART_SUFFIX));
   }
 
-  private Path stagingDir(String sourceId) {
-    return tenantRoot
+  private Path tenantRoot(String tenantId) {
+    return root.resolve("tenant=" + TenantIds.requireValid(tenantId));
+  }
+
+  private Path stagingDir(String tenantId, String sourceId) {
+    return tenantRoot(tenantId)
         .resolve("_staging")
         .resolve("source=" + SourceOffset.requireValidSourceId(sourceId));
   }
 
   private final class LocalSegmentWriter implements SegmentWriter {
 
+    private final Path tenantRoot;
     private final String sourceId;
     private final int generation;
     private final long startOffset;
@@ -101,8 +111,10 @@ public class LocalVolumeSink implements LogSink {
     private Instant firstTimestamp;
     private long records;
 
-    LocalSegmentWriter(String sourceId, int generation, long startOffset, Path part)
+    LocalSegmentWriter(
+        Path tenantRoot, String sourceId, int generation, long startOffset, Path part)
         throws IOException {
+      this.tenantRoot = tenantRoot;
       this.sourceId = sourceId;
       this.generation = generation;
       this.startOffset = startOffset;
