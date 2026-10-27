@@ -1,15 +1,14 @@
 package dev.dinesh.argus.controller;
 
-import dev.dinesh.argus.pipeline.EnvelopeFactory;
 import dev.dinesh.argus.suppression.SuppressionDecision;
 import dev.dinesh.argus.suppression.Suppressor;
+import dev.dinesh.argus.tenant.CurrentTenant;
 import java.util.Map;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -23,9 +22,6 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/v2/suppression")
 public class SuppressionController {
 
-  /** Stand-in for P3's API keys. The tenant never comes from the body (guardrail 4). */
-  static final String TENANT_HEADER = "X-Argus-Tenant";
-
   public record CheckRequest(String message) {}
 
   private final Suppressor suppressor;
@@ -36,9 +32,8 @@ public class SuppressionController {
 
   @PostMapping("/check")
   public SuppressionDecision check(
-      @RequestHeader(name = TENANT_HEADER, defaultValue = EnvelopeFactory.DEFAULT_TENANT)
-          String tenantId,
-      @RequestBody CheckRequest request) {
+      // From the caller's API key, never from the body (guardrail 4).
+      @CurrentTenant String tenantId, @RequestBody CheckRequest request) {
     long start = System.nanoTime();
     SuppressionDecision decision = null;
     try {
