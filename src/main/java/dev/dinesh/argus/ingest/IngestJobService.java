@@ -29,6 +29,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
@@ -54,17 +55,28 @@ public class IngestJobService {
   private final ThreadPoolExecutor executor;
   private final Map<String, IngestJob> jobs = new ConcurrentHashMap<>();
 
-  /** Active job id per {@code tenant/source}. */
-  private final Map<String, String> activeJobBySource = new ConcurrentHashMap<>();
+  /** Shared with stream runs: one run per source at a time. */
+  private final SourceLeases leases;
 
   public IngestJobService(
       IngestPipeline pipeline,
       ParserRegistry parsers,
       IngestProperties props,
       TenantRoots tenantRoots) {
+    this(pipeline, parsers, props, tenantRoots, new SourceLeases());
+  }
+
+  @Autowired
+  public IngestJobService(
+      IngestPipeline pipeline,
+      ParserRegistry parsers,
+      IngestProperties props,
+      TenantRoots tenantRoots,
+      SourceLeases leases) {
     this.pipeline = pipeline;
     this.parsers = parsers;
     this.tenantRoots = tenantRoots;
+    this.leases = leases;
     AtomicInteger threadCount = new AtomicInteger();
     this.executor =
         new ThreadPoolExecutor(
@@ -114,10 +126,10 @@ public class IngestJobService {
     }
   }
 
-  /** Thrown when the source already has a running job; maps to HTTP 409. */
+  /** Thrown when the source already has a running job or stream run; maps to HTTP 409. */
   public static class SourceBusyException extends RuntimeException {
-    SourceBusyException(String sourceId, String jobId) {
-      super("Source " + sourceId + " already has an active job " + jobId);
+    SourceBusyException(String sourceId, String owner) {
+      super("Source " + sourceId + " is busy with " + owner);
     }
   }
 
@@ -152,10 +164,9 @@ public class IngestJobService {
     IngestJob job =
         new IngestJob(
             UUID.randomUUID().toString(), tenantId, sourceId, realPath, fromBeginning, parser);
-    String sourceKey = sourceKey(job);
-    String existing = activeJobBySource.putIfAbsent(sourceKey, job.id());
-    if (existing != null) {
-      throw new SourceBusyException(sourceId, existing);
+    Optional<String> owner = leases.tryAcquire(tenantId, sourceId, job.id());
+    if (owner.isPresent()) {
+      throw new SourceBusyException(sourceId, owner.get());
     }
     try {
       evictOldJobs(tenantId);
@@ -163,7 +174,7 @@ public class IngestJobService {
       executor.execute(() -> runJob(job));
     } catch (RejectedExecutionException e) {
       jobs.remove(job.id());
-      activeJobBySource.remove(sourceKey, job.id());
+      leases.release(tenantId, sourceId, job.id());
       throw new JobSlotsBusyException(executor.getMaximumPoolSize());
     }
     log.info(
@@ -214,12 +225,8 @@ public class IngestJobService {
     } catch (Exception e) {
       job.finished(State.FAILED, e.getClass().getSimpleName() + ": " + e.getMessage());
     } finally {
-      activeJobBySource.remove(sourceKey(job), job.id());
+      leases.release(job.tenantId(), job.sourceId(), job.id());
     }
-  }
-
-  private static String sourceKey(IngestJob job) {
-    return job.tenantId() + "/" + job.sourceId();
   }
 
   private static String defaultSourceId(Path realPath) {

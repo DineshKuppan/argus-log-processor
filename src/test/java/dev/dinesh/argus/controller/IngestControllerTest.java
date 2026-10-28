@@ -17,6 +17,7 @@ import dev.dinesh.argus.config.TenancyConfig;
 import dev.dinesh.argus.ingest.IngestJobService;
 import dev.dinesh.argus.ingest.IngestPipeline;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
+import dev.dinesh.argus.ingest.SourceLeases;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.tenant.ApiKeyTenantResolver;
 import dev.dinesh.argus.tenant.TenantRoots;
@@ -49,6 +50,7 @@ import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilde
 @WebMvcTest(IngestController.class)
 @Import({
   IngestJobService.class,
+  SourceLeases.class,
   ParserRegistry.class,
   TenancyConfig.class,
   TenantRoots.class,
