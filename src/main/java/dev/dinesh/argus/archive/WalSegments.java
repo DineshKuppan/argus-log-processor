@@ -1,6 +1,7 @@
 package dev.dinesh.argus.archive;
 
 import dev.dinesh.argus.sink.EventTimePartition;
+import dev.dinesh.argus.sink.LocalVolumeSink;
 import dev.dinesh.argus.tenant.TenantIds;
 import dev.dinesh.argus.utils.DurableFiles;
 import java.io.IOException;
@@ -20,8 +21,8 @@ import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * The committed segments {@link dev.dinesh.argus.sink.LocalVolumeSink} wrote, read as the WAL the
- * archiver drains. Only committed {@code .ndjson} files are listed: they appear by atomic rename,
+ * The committed segments {@link LocalVolumeSink} wrote, read as the WAL the archiver drains. Only
+ * committed {@code .ndjson} and {@code .ndjson.zst} files are listed: they appear by atomic rename,
  * so a listed segment is always complete. Uncommitted output under {@code _staging} never matches.
  */
 @Slf4j
@@ -36,7 +37,8 @@ public final class WalSegments {
 
   /** {@code tenant=T/dt=D/source=S/gen=G/START-END.ndjson}, as LocalVolumeSink names segments. */
   private static final Pattern SEGMENT =
-      Pattern.compile("tenant=([^/]+)/dt=[^/]+/source=([^/]+)/gen=(\\d+)/(\\d+)-(\\d+)\\.ndjson");
+      Pattern.compile(
+          "tenant=([^/]+)/dt=[^/]+/source=([^/]+)/gen=(\\d+)/(\\d+)-(\\d+)\\.ndjson(\\.zst)?");
 
   private static final int SEGMENT_DEPTH = 5;
 
@@ -50,7 +52,9 @@ public final class WalSegments {
     return root;
   }
 
-  /** A committed segment of one tenant's source. */
+  /**
+   * A committed segment of one tenant's source; zstd-compressed if its name ends in {@code .zst}.
+   */
   public record Segment(
       Path file,
       String tenantId,
@@ -59,6 +63,10 @@ public final class WalSegments {
       long startOffset,
       long endOffset,
       FileTime modified) {
+
+    public boolean compressed() {
+      return file.getFileName().toString().endsWith(LocalVolumeSink.ZSTD_SUFFIX);
+    }
 
     /**
      * Key of the archived object holding this segment's lines from byte {@code from} up to {@code
@@ -92,7 +100,7 @@ public final class WalSegments {
         Files.find(
             root,
             SEGMENT_DEPTH,
-            (path, attrs) -> attrs.isRegularFile() && path.toString().endsWith(".ndjson"),
+            (path, attrs) -> attrs.isRegularFile() && isSegmentName(path.toString()),
             new FileVisitOption[0])) {
       files.forEach(
           file -> {
@@ -137,6 +145,10 @@ public final class WalSegments {
     Path target = segment.file().resolveSibling(segment.file().getFileName() + UNREADABLE_SUFFIX);
     DurableFiles.moveAtomically(segment.file(), target);
     return target;
+  }
+
+  private static boolean isSegmentName(String name) {
+    return name.endsWith(".ndjson") || name.endsWith(".ndjson" + LocalVolumeSink.ZSTD_SUFFIX);
   }
 
   private static Path marker(Segment segment) {

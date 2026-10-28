@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import com.github.luben.zstd.ZstdOutputStream;
 import dev.dinesh.argus.config.LocalSinkProperties;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.source.LogBatch;
@@ -11,7 +12,9 @@ import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.tenant.TenantIds;
 import dev.dinesh.argus.utils.DurableFiles;
 import java.io.BufferedOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
 import java.nio.file.DirectoryStream;
@@ -27,7 +30,7 @@ import org.springframework.stereotype.Component;
  *
  * <pre>
  * root/tenant=T/_staging/source=ID/START.ndjson.part                   while writing
- * root/tenant=T/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson        after commit
+ * root/tenant=T/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson        after commit (.ndjson.zst with zstd)
  * </pre>
  *
  * <p>Names derive from source offsets, and {@code dt} from the first event time in the segment
@@ -42,13 +45,21 @@ public class LocalVolumeSink implements LogSink {
   private static final String PART_SUFFIX = ".ndjson.part";
   private static final int WRITE_BUFFER_BYTES = 256 * 1024;
 
+  /** Suffix of a segment written with {@code compression=zstd}. */
+  public static final String ZSTD_SUFFIX = ".zst";
+
+  /** zstd's fastest level: ingest writes faster than higher levels compress. */
+  private static final int ZSTD_LEVEL = 1;
+
   private final Path root;
   private final long minFreeBytes;
+  private final boolean zstd;
   private final ObjectWriter writer;
 
   public LocalVolumeSink(LocalSinkProperties props, ObjectMapper mapper) {
     this.root = props.root();
     this.minFreeBytes = props.minFreeBytes().toBytes();
+    this.zstd = props.compression() == LocalSinkProperties.Compression.ZSTD;
     // Flushing per record would turn every record into a write syscall; commit flushes instead.
     this.writer = mapper.writer().without(SerializationFeature.FLUSH_AFTER_WRITE_VALUE);
   }
@@ -98,6 +109,24 @@ public class LocalVolumeSink implements LogSink {
         .resolve("source=" + SourceOffset.requireValidSourceId(sourceId));
   }
 
+  /** Passes writes through; {@code close} only flushes, leaving the channel to the writer. */
+  private static final class KeepOpenOutputStream extends FilterOutputStream {
+
+    KeepOpenOutputStream(OutputStream out) {
+      super(out);
+    }
+
+    @Override
+    public void write(byte[] b, int off, int len) throws IOException {
+      out.write(b, off, len);
+    }
+
+    @Override
+    public void close() throws IOException {
+      flush();
+    }
+  }
+
   private final class LocalSegmentWriter implements SegmentWriter {
 
     private final Path tenantRoot;
@@ -106,6 +135,7 @@ public class LocalVolumeSink implements LogSink {
     private final long startOffset;
     private final Path part;
     private final FileChannel channel;
+    private final OutputStream out;
     private final JsonGenerator json;
     private Instant firstTimestamp;
     private long records;
@@ -124,9 +154,14 @@ public class LocalVolumeSink implements LogSink {
               StandardOpenOption.CREATE,
               StandardOpenOption.TRUNCATE_EXISTING,
               StandardOpenOption.WRITE);
-      this.json =
-          writer.createGenerator(
-              new BufferedOutputStream(Channels.newOutputStream(channel), WRITE_BUFFER_BYTES));
+      // Closing the streams must not close the channel: commit fsyncs it after the zstd frame (if
+      // any) is complete.
+      OutputStream file = new KeepOpenOutputStream(Channels.newOutputStream(channel));
+      this.out =
+          new BufferedOutputStream(
+              zstd ? new ZstdOutputStream(file, ZSTD_LEVEL) : file, WRITE_BUFFER_BYTES);
+      this.json = writer.createGenerator(out);
+      json.disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET);
       // NDJSON: records are separated by the newline written below, not the default space.
       json.setRootValueSeparator(null);
     }
@@ -145,9 +180,10 @@ public class LocalVolumeSink implements LogSink {
 
     @Override
     public String commit(long endOffset) throws IOException {
-      json.flush();
-      channel.force(true);
       json.close();
+      out.close(); // ends the zstd frame
+      channel.force(true);
+      channel.close();
       if (records == 0) {
         Files.deleteIfExists(part);
         return null;
@@ -168,7 +204,7 @@ public class LocalVolumeSink implements LogSink {
           Files.deleteIfExists(p);
         }
       }
-      Path target = segmentDir.resolve(prefix + endOffset + ".ndjson");
+      Path target = segmentDir.resolve(prefix + endOffset + ".ndjson" + (zstd ? ZSTD_SUFFIX : ""));
       // Also makes the deletes above durable: they are in the same directory.
       DurableFiles.moveAtomically(part, target);
       return target.toString();
@@ -176,8 +212,9 @@ public class LocalVolumeSink implements LogSink {
 
     @Override
     public void abort() {
-      try {
+      try (channel) {
         json.close();
+        out.close();
       } catch (IOException e) {
         log.debug("Ignoring close failure while aborting {}", part, e);
       }

@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import dev.dinesh.argus.archive.Archiver.Outcome;
 import dev.dinesh.argus.archive.Archiver.Pass;
 import dev.dinesh.argus.config.ArchiveProperties;
+import dev.dinesh.argus.config.LocalSinkProperties;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -73,7 +74,7 @@ class ArchiverTest {
 
   private List<Path> walSegments() throws IOException {
     try (Stream<Path> files = Files.walk(walRoot)) {
-      return files.filter(p -> p.toString().endsWith(".ndjson")).toList();
+      return files.filter(p -> p.toString().matches(".*\\.ndjson(\\.zst)?$")).toList();
     }
   }
 
@@ -100,6 +101,29 @@ class ArchiverTest {
             .size());
     assertEquals(List.of(), walSegments());
     assertEquals(List.of(), Files.list(dir.resolve("staging")).toList());
+  }
+
+  @Test
+  void archivesZstdSegmentsLikePlainOnes() throws Exception {
+    Path segment =
+        new WalFixture(walRoot, LocalSinkProperties.Compression.ZSTD)
+            .segment("acme", "app", 0, 0, 3, T);
+    assertTrue(segment.toString().endsWith(".ndjson.zst"));
+
+    assertEquals(new Pass(1, 0, 0, 0), archiver(archive).runOnce());
+
+    assertEquals(3, ParquetTestFiles.rows(archived(ACME_APP_13 + "0-30.parquet")).size());
+    assertFalse(Files.exists(segment));
+  }
+
+  @Test
+  void aCorruptZstdSegmentIsSetAside() throws Exception {
+    Path bad = walRoot.resolve("tenant=acme/dt=2025-10-09/source=app/gen=0/0-100.ndjson.zst");
+    Files.createDirectories(bad.getParent());
+    Files.write(bad, new byte[] {0x28, (byte) 0xb5, 0x2f, (byte) 0xfd, 1, 2, 3, 4, 5, 6, 7});
+
+    assertEquals(new Pass(0, 0, 1, 0), archiver(archive).runOnce());
+    assertTrue(Files.exists(Path.of(bad + WalSegments.UNREADABLE_SUFFIX)));
   }
 
   @Test

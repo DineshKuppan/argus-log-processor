@@ -1,8 +1,10 @@
 package dev.dinesh.argus.archive;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.dinesh.argus.archive.WalSegments.Segment;
+import dev.dinesh.argus.config.LocalSinkProperties;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
@@ -40,6 +42,19 @@ class WalSegmentsTest {
     assertEquals(2, first.generation());
     assertEquals(0, first.startOffset());
     assertEquals(30, first.endOffset());
+  }
+
+  @Test
+  void listsZstdSegmentsToo() throws Exception {
+    Path file =
+        new WalFixture(root, LocalSinkProperties.Compression.ZSTD)
+            .segment("acme", "app", 0, 0, 2, T);
+
+    List<Segment> pending = new WalSegments(root).pending();
+
+    assertEquals(List.of(file.toAbsolutePath()), pending.stream().map(Segment::file).toList());
+    assertEquals(20, pending.get(0).endOffset());
+    assertTrue(pending.get(0).compressed());
   }
 
   @Test

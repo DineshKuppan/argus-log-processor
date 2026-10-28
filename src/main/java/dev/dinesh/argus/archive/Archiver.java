@@ -4,12 +4,16 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.MappingIterator;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
+import com.github.luben.zstd.ZstdIOException;
+import com.github.luben.zstd.ZstdInputStream;
 import dev.dinesh.argus.archive.ArchiveIndex.Entry;
 import dev.dinesh.argus.archive.WalSegments.Segment;
 import dev.dinesh.argus.config.ArchiveProperties;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.sink.EventTimePartition;
+import java.io.BufferedInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -57,7 +61,7 @@ public class Archiver implements SmartLifecycle {
     EMPTY,
     /** Replaced in the WAL by a replay while it was being archived; the replacement goes next. */
     SUPERSEDED,
-    /** Not valid NDJSON; renamed {@code .unreadable}, kept on disk and not retried. */
+    /** Not valid NDJSON (or zstd); renamed {@code .unreadable}, kept on disk and not retried. */
     UNREADABLE,
     /** The store, the local disk or the code failed; the pass stops and backs off. */
     FAILED
@@ -74,6 +78,7 @@ public class Archiver implements SmartLifecycle {
   static final int MAX_OBJECTS_PER_SEGMENT = 24;
 
   private static final int MAX_BACKOFF_DOUBLINGS = 30;
+  private static final int READ_BUFFER = 256 * 1024;
   private static final long STOP_TIMEOUT_SECONDS = 30;
 
   private final ObjectStore store;
@@ -235,7 +240,8 @@ public class Archiver implements SmartLifecycle {
         walBytes = Files.size(segment.file());
         convert(segment, parts);
         convertNanos = System.nanoTime() - started;
-      } catch (JsonProcessingException e) {
+      } catch (JsonProcessingException | ZstdIOException e) {
+        // The data itself: not valid NDJSON, or not a valid zstd stream.
         error = e;
         outcome = wal.exists(segment) ? quarantine(segment) : Outcome.SUPERSEDED;
         return outcome;
@@ -308,7 +314,8 @@ public class Archiver implements SmartLifecycle {
     // The part's dt/hour, decided by its first line with an event time.
     String partition = null;
     Instant partitionTime = null;
-    try (MappingIterator<LogEnvelope> records = envelopes.readValues(segment.file().toFile())) {
+    try (InputStream in = open(segment);
+        MappingIterator<LogEnvelope> records = envelopes.readValues(in)) {
       while (records.hasNextValue()) {
         LogEnvelope record = records.nextValue();
         Instant time = EnvelopeParquetWriter.archivedTimestamp(record);
@@ -353,6 +360,11 @@ public class Archiver implements SmartLifecycle {
         }
       }
     }
+  }
+
+  private static InputStream open(Segment segment) throws IOException {
+    InputStream file = new BufferedInputStream(Files.newInputStream(segment.file()), READ_BUFFER);
+    return segment.compressed() ? new ZstdInputStream(file) : file;
   }
 
   private Outcome upload(Segment segment, List<Part> parts) throws IOException {
