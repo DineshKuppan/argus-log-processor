@@ -34,10 +34,10 @@ Today Argus only pulls: a caller names a file and a job reads it. The target wor
   | **(c) Append the raw request body to a per-stream spool file (fsync, then ack); a stream runner ingests the spool with the existing pipeline** | Reuses everything: `FileSource` offsets give `eventId`s, the pipeline batches minutes of pushes into one segment and one Parquet object | Data is written twice (spool, then WAL); the raw spool is ≈1x the input and is deleted once ingested |
 
   Chosen (c), as in Fluent Bit's filesystem buffer and Vector's disk buffer.
-  - **Spool:** `spool-dir/tenant=T/stream=S/NNNNNN.log`, numbered. A request appends its lines under the stream's lock, always ending in `\n`, then `force()`s the file before answering.
-  - **Visible length:** the stream runner reads only up to the stream's acknowledged length (`FileSource` gains an explicit limit), never into an append in progress. An append that fails part-way (disk full, client gone) is truncated back before the lock is released. At startup, a spool's visible length is its size up to the last `\n`.
-  - **Stream runner:** a stream is a source (`sourceId` = stream id) whose runs are ordinary `IngestPipeline` runs over the spool. A run starts when the stream has `segment-bytes` waiting or its oldest waiting byte is `flush-interval` (1 minute) old. So a stream at 120KB/s writes one ~7MB segment a minute, not one per request.
-  - **Rotation:** once a spool file is fully checkpointed and over `spool-rotate-bytes` (256MB), the runner deletes it and the next append starts `NNNNNN+1.log`. A spool's number is part of its identity: a run on a spool whose path differs from the checkpointed one starts the next generation at 0, so the rotation never depends on inode comparison (inodes can be reused).
+  - **Spool:** `spool-dir/tenant=T/stream=S/NNNNNN.log`, numbered, plus one `index.log` per stream (D2). A request appends its lines under the stream's lock, always ending in `\n`, then `force()`s the file, then its index entry, before answering.
+  - **Visible length:** the stream runner reads only up to the stream's acknowledged length (`FileSource.startBetween`), never into an append in progress. An append that fails part-way (disk full, client gone) is truncated back before the lock is released. At startup, bytes of the newest spool file past its last index entry belonged to a request that was never acknowledged, and are truncated.
+  - **Stream runner:** a stream is a source (`sourceId` = stream id) whose runs are ordinary `IngestPipeline` runs over one spool file each. A run starts when the stream has `segment-bytes` waiting, a sealed spool file waiting, or its oldest waiting byte is `flush-interval` (1 minute) old. So a stream at 120KB/s writes one ~7MB segment a minute, not one per request. Runs and file jobs share `SourceLeases`, so a source has at most one of either at a time.
+  - **Rotation:** a spool file is sealed once it reaches `spool-rotate-bytes` (64MB), or once it is fully read and at least 1MB (so an idle stream frees its disk); the next append starts `NNNNNN+1.log`, and a sealed file is deleted once fully read. Numbers are never reused. A spool's number is part of its identity: a run on a spool whose path differs from the checkpointed one starts the next generation at 0 (`ResumePoint.Reason.PATH_CHANGED`), so rotation never depends on inode comparison (inodes can be reused).
 - **Result:**
   - Guardrails 1–3 and 6 hold unchanged for push: bounded memory, a durable copy before the acknowledgement, deterministic `eventId = (tenant, stream, generation, spool offset)`, and the WAL watermarks from P2b.
   - The cost is one extra sequential write of the raw bytes, about 120KB/s at the 10GB/day target, plus up to `flush-interval` of extra latency before data reaches the WAL. P5's hot tier (T5, ≤30s) will need a shorter interval.
@@ -45,8 +45,8 @@ Today Argus only pulls: a caller names a file and a job reads it. The target wor
 ### D2. Acknowledge after fsync; `Idempotency-Key` makes retries safe
 - **Situation:** agents retry when a response is lost. Without help, a retried batch gets new spool offsets, so new `eventId`s, so real duplicates in the archive, which T4 forbids.
 - **Task:** make a retry of an acknowledged request a no-op, durably, without a database.
-- **Action:** an optional `Idempotency-Key` header (the IETF httpapi draft's name). Each accepted request appends one line to the stream's **spool index** (`NNNNNN.idx`: key, start, end, received-at) and fsyncs it after the spool. A request whose key is among the stream's last `idempotency-window` (1,024) keys is answered `200` with the original offsets and writes nothing. The index is also the record of each stream's acknowledged length.
-- **Result:** with a key, a retry is exact even across a restart; without one, delivery stays at-least-once. Fluent Bit and Vector don't send a key by default; Argus documents a header for each. Cost: a second fsync per request (≈1ms on SSD; ~10 requests/s at the target).
+- **Action:** an optional `Idempotency-Key` header (the IETF httpapi draft's name). Each accepted request appends one line to the stream's **index** (`index.log`, spanning its spool files: spool number, start, end, key, received-at) and fsyncs it after the spool. A request whose key is among the stream's last `idempotency-window` (1,024) keys is answered `200` with the original offsets and writes nothing. The index is also the record of each spool file's acknowledged length. It is compacted (temp file + fsync + atomic rename) to the remembered keys plus the last entry of each spool file on disk once it holds about twice the window.
+- **Result:** with a key, a retry is exact even across a restart (`PushCrashIT`). Without one, delivery stays at-least-once. Fluent Bit's and Vector's HTTP outputs send only static headers, so they can't send a per-batch key: for them a retried batch can be ingested twice. A client that can (an SDK, the P3b export jobs) gets exactly-once. Cost: a second fsync per request (≈1ms on SSD; ~10 requests/s at the target).
 
 ### D3. Suppression happens at the edge, on receive time
 - **Situation:** P1b's `Suppressor` answers allow/deny for one message per tenant per 10s window, using the time of the check (guardrail 8). The stream runner processes a minute of spool in well under a second, so checking there would treat copies 50s apart as being inside one 10s window.
@@ -65,7 +65,7 @@ Today Argus only pulls: a caller names a file and a job reads it. The target wor
 | One line | `max-line-bytes` (1MB) | Truncated and counted, as for files |
 | Tenant quota | token bucket (D5) | 429, `Retry-After` = seconds until the request fits |
 | WAL (P2b) | high watermark | 429, `Retry-After: 60` |
-| Spool | `max-spool-bytes` (2GB) across all streams | 429, `Retry-After: 30` |
+| Spool | `max-spool-bytes` (2GB) of acknowledged, not yet ingested bytes across all streams | 429, `Retry-After: 30` |
 | Streams | `max-streams-per-tenant` (32) | 409 for a new stream id |
 | Stream runs | `max-concurrent-runs` (2) | Runs wait; their spool absorbs it |
 
@@ -91,8 +91,9 @@ The checks run cheapest first and before the body is read, except the ones that 
 | `StreamController` | `controller` | `POST /api/v2/ingest/streams/{streamId}` (lines, `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`), `GET /streams/{id}`, `GET /streams`. 202 `{accepted, suppressed, truncated, startOffset, endOffset}`; 200 for a duplicate key |
 | `PushIngestService` | `ingest` | The admission checks of D4 in order, decode and line splitting, suppression (D3), append, canonical line `Push request finished …` |
 | `StreamSpool` | `source` | One stream's numbered spool files and index: locked append + fsync, visible length, idempotency window, rotation, startup recovery |
-| `StreamRunner` | `ingest` | Schedules spool runs (size or age), shares source exclusivity with `IngestJobService`, deletes ingested spools |
-| `FileSource` | `source` | Gains an explicit read limit (the spool's visible length) |
+| `StreamRunner` | `ingest` | Schedules spool runs (size, sealed file or age), shares source exclusivity with `IngestJobService` through `SourceLeases`, deletes ingested spools |
+| `StreamRegistry`, `PushStream` | `ingest` | Each tenant's streams and their open spools; reopens every spool under `spool-dir` at startup |
+| `FileSource` | `source` | Gains an explicit read limit (`startBetween`: the spool's visible length) |
 | `IngestPipeline.Request` | `ingest` | Gains `limit` and "path is part of the identity" (D1 rotation) |
 | `QuotaStore`, `LocalQuotaStore`, `RedisQuotaStore`, `QuotaService` | `quota` (new) | D5 |
 | `PushProperties`, `QuotaProperties`, `PushConfig`, `QuotaConfig` | `config` | Binding and wiring |
@@ -103,10 +104,11 @@ The checks run cheapest first and before the body is read, except the ones that 
 ```properties
 argus.push.spool-dir=./data/spool
 argus.push.max-request-bytes=8MB          # after gzip
+argus.push.max-request-lines=10000
 argus.push.max-concurrent-requests=16
 argus.push.flush-interval=1m              # oldest spooled byte waits at most this long for a run
-argus.push.max-spool-bytes=2GB
-argus.push.spool-rotate-bytes=256MB
+argus.push.max-spool-bytes=2GB            # acknowledged, not yet ingested
+argus.push.spool-rotate-bytes=64MB
 argus.push.max-streams-per-tenant=32
 argus.push.max-concurrent-runs=2
 argus.push.idempotency-window=1024        # keys remembered per stream
@@ -118,7 +120,7 @@ argus.quota.burst-seconds=2
 # argus.quota.tenants.acme.ingest-bytes-per-second=10MB
 ```
 
-Disk budget (§2 of the design): WAL 30GB + Parquet staging ≤2GB + spool ≤2GB + checkpoints, within the 100GB SSD.
+Disk budget (§2 of the design): WAL 30GB + Parquet staging ≤2GB + spool ≤2GB not yet ingested (plus at most one already-ingested 64MB file per stream) + checkpoints, within the 100GB SSD.
 
 ## 5. Tests (P3a)
 
@@ -168,4 +170,15 @@ Disk budget (§2 of the design): WAL 30GB + Parquet staging ≤2GB + spool ≤2G
 - **Result:** measured by `ReplayIsolationIT`: push p99 with and without a 1GB replay running; target ≤20% worse.
 
 ## 9. Results (P3a)
-To be filled in after the build.
+Measured on an Apple M1 Pro (10 cores, SSD), JDK 17, with the application in its own JVM at `-Xmx256m` and the clients in the test JVM, over HTTP on localhost. Lines are ~200-byte JSON records, pushed gzipped in batches.
+
+| Test | Result |
+|---|---|
+| **T1** `PushIngestIT`: 8 clients, 2M lines in 1,000-line batches | 150k lines/s acknowledged; **132k lines/s end to end** (pushed, spooled, ingested, committed; 32x the 4,150 target). Request p50 43ms, p99 93ms, max 1.2s (warm-up). Peak heap 243MB of 256MB (in use, garbage included). No 429s; all 2M lines in the output |
+| **Tenant isolation** `PushIngestIT`: one tenant floods past its 1MB/s quota on 6 threads while another pushes 200-line batches | The flooding tenant got 5,539 429s; the calm tenant was never refused, and its p99 went from 25ms to 40ms (the flood still uses the same CPU and disk) |
+| **T3** `PushBackpressureIT`: archive store unwritable for 20s, 4 clients, 1M lines, WAL capped at 40MB, spool at 32MB | 222 429s (206 `WAL_FULL` with `Retry-After: 60`, 16 `SPOOL_FULL` with 30), honoured by the clients. No OOM (peak heap 217MB). After the outage the WAL drained in 19.5s and all 1,000,000 acknowledged lines were archived, exactly once |
+| **T4** `PushCrashIT`: `kill -9` at a random 20–80% of a 400k-line load with an `Idempotency-Key` per batch, then a restart on the same disk; clients retry what wasn't acknowledged | 5 runs: 0 lines lost, 0 lines with two `eventId`s, 400,000 distinct lines. Each run had 1–3 requests that were spooled just before the kill and whose retry was answered 200 from the index |
+
+Found while building:
+- **The local quota's refill overflowed at high rates.** Elapsed nanoseconds × bytes/s was computed in a `long` before dividing, which overflows after about 9s at 1GB/s and then denied requests. `PushBackpressureIT` showed it as unexplained 429s; fixed, with a regression test.
+- **`max-spool-bytes` must count unread bytes, not bytes on disk.** A stream's active spool file holds already-ingested bytes until it rotates, so a disk-size cap would have refused pushes while nothing was waiting.

@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Java 17 (the build target). **Build with JDK 17 or 21, not 24+**: the Lombok version managed by Spring Boot 3.3.3 (1.18.34) crashes on JDK 24, and every Lombok-generated getter then fails to compile. If your default JDK is newer, prefix Maven commands with e.g. `JAVA_HOME=~/.sdkman/candidates/java/17.0.14-tem`.
 - Maven 3.8+
 - Redis (optional: only with `argus.suppression.store=redis`; the default suppression store is in memory)
-- Docker (optional: `RedisSuppressionStoreTest`, `S3ObjectStoreTest` and `GcsObjectStoreTest` use Testcontainers (Redis, S3Mock, fake-gcs-server) and are skipped without it; also the 4GB-container load check under Testing)
+- Docker (optional: `RedisSuppressionStoreTest`, `RedisQuotaStoreTest`, `S3ObjectStoreTest` and `GcsObjectStoreTest` use Testcontainers (Redis, S3Mock, fake-gcs-server) and are skipped without it; also the 4GB-container load check under Testing)
 
 ## Build and Run Commands
 
@@ -56,7 +56,10 @@ mvn test -Dtest=AggregatorTest#testCountByLevel
 # Load tests (tag "load", excluded by default): LargeFileIngestIT ingests a generated file in a JVM capped
 # at 256MB, then archives it to Parquet and reports the compression (-Dargus.load.wal-compression=zstd);
 # WalBackpressureIT is T3: the archive store is down while 500MB ingests, so ingest must pause at the
-# WAL watermark, then everything is archived; SuppressionLatencyIT times 1M suppression decisions (p99 < 1ms)
+# WAL watermark, then everything is archived; SuppressionLatencyIT times 1M suppression decisions (p99 < 1ms).
+# Push (P3a; the app runs in its own 256MB JVM, clients push gzip NDJSON over HTTP): PushIngestIT is T1 (2M lines,
+# -Dargus.load.push-lines) and tenant isolation; PushBackpressureIT is T3 for push (archive unwritable for
+# -Dargus.load.outage-seconds → 429s, then all archived); PushCrashIT is T4 for push (kill -9, restart, no loss)
 mvn test -Dgroups=load -DexcludedGroups=none                              # 1GB input
 mvn test -Dgroups=load -DexcludedGroups=none -Dargus.load.input-size=4GB  # needs ~4x input in free disk
 
@@ -89,6 +92,7 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
 **Controller** (`dev.dinesh.argus.controller`)
 - `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous. `/aggregate`, `/aggregateV2`, `/export/*` and `/cli-summary` stream files of any size; `/parse`, `/parse/regexp` and `/filter` return every record and keep the 50MB cap. Needs an API key like v2, and reads only the caller tenant's roots (`log.enforce-allowed-roots=false` only warns, for a migration window). v1 persists nothing. Errors: 400 bad input (`IllegalArgumentException`, e.g. outside the roots, over the size cap or a negative `topN`), 404 missing file, 429 + `Retry-After` when the aggregation slots are busy
 - `SuppressionController` (`/api/v2/suppression`): `POST /check` `{"message"}` → `{"decision":"ALLOW"|"DENY","windowEndsAt","suppressedCount"}`; tenant from the caller's API key (see Tenancy); 400 for a missing or too long message, 401 without a valid key
+- `StreamController` (`/api/v2/ingest/streams`): HTTP push ingest (P3a). `POST /{streamId}` with lines (NDJSON or text, `Content-Encoding: gzip`), optional `Idempotency-Key`, `format`, `pattern` → 202 `{accepted, suppressed, truncated, spool, startOffset, endOffset}` once durable in the spool, 200 with the original offsets for a repeated key; 429 + `Retry-After` (request slots 1s, quota exact, WAL full 60s, spool full 30s), 413 (body or lines), 409 (streams per tenant), 415 (encoding), 400. `GET /{streamId}` and `GET` (the tenant's streams; another tenant's is 404)
 - `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` with `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` when the job slots are busy (30s) or the WAL is full (60s)), `GET` and `DELETE /jobs/{id}` (401 without a valid key; another tenant's job is 404). Sources, checkpoints, output and jobs are per tenant
 
 ### Tenancy
@@ -124,6 +128,17 @@ Read → parse → write stages in separate threads, connected by bounded queues
 - **WAL watermarks (P2b, T3):** `WatermarkWalCapacity` (the `sink.WalCapacity` port; only with an archive store) measures pending (not yet archived) WAL bytes. From `argus.wal.high-watermark` × `max-bytes` (80% of 30GB), the pipeline's writer waits before its next segment, so the bounded queues stop the reader (guardrail 2); below the low watermark (60%) it resumes. It measures afresh at each segment boundary, so a job passes the high watermark by at most one segment. Job status shows `paused: WAL_FULL` and `pausedMs`; a paused job can be cancelled; new jobs get 429. Without an archive store, `WalCapacity.UNBOUNDED`: nothing drains the WAL, so `min-free-bytes` stays the only limit
 - **WAL compression:** `argus.sink.local.compression=zstd` writes `START-END.ndjson.zst` (level 1; the frame is closed before the fsync), 10x smaller than NDJSON for 9% of ingest speed; the archiver reads both. A corrupt zstd stream is set aside like invalid NDJSON
 - One archiver per WAL volume; memory is one row group (64MB), disk one segment's staged Parquet files
+
+### Push Ingest (P3a)
+
+[`P3_PLAN.md`](docs/architecture/P3_PLAN.md). Pushed lines are made durable in a per-stream **spool**, and the existing pipeline ingests the spool like a file: no second implementation of parsing, segments, checkpoints, WAL or archive.
+- `ingest.PushIngestService`: the push bounds in order, cheapest first and before the body is read where possible: request slots (`max-concurrent-requests`, 429), WAL full (429), spool full (`max-spool-bytes` not yet ingested, 429), streams per tenant (409), a repeated `Idempotency-Key` (answered before the body or quota), `Content-Length` and the decompressed body (`max-request-bytes`, read at most one byte past it, so gzip bombs stop there; 413), line count (413), then the tenant's quota (429). Lines are truncated to `max-line-bytes`, blank lines dropped and a missing final `\n` added, compacting the body in place. One `Push request finished …` canonical line per request
+- **Suppression at receive time (D3):** each line is parsed with the stream's format (requested, or detected from its first request) to find its message, checked with the `Suppressor`, and only allowed lines are spooled, so a replay never suppresses again (guardrail 8). `argus.push.suppress=false` turns it off
+- `source.StreamSpool`: `spool-dir/tenant=T/stream=S/NNNNNN.log` + `index.log`. An append fsyncs the lines, then the index entry, then moves the visible length; a failure truncates both back. At startup, bytes of the newest file past its last index entry were never acknowledged and are truncated. The index holds the last `idempotency-window` keys (compacted to about twice that). A file is sealed at `spool-rotate-bytes` (or fully read and ≥1MB) and deleted once read; numbers are never reused
+- `ingest.StreamRunner` (`SmartLifecycle`): every second, a run for each stream with `segment-bytes`, a sealed file, or a line older than `flush-interval` waiting, on `max-concurrent-runs` threads. A run is `IngestPipeline.Request(…, endOffset = visible length, pathIsIdentity = true)`: each spool file is its own generation (`ResumePoint.Reason.PATH_CHANGED`), without trusting inodes. It shares `ingest.SourceLeases` with `IngestJobService` (one run or job per source), and after any run reads the checkpoint back into the spool (`markRead`), which deletes ingested files
+- `ingest.StreamRegistry`: the tenant's streams and open spools; reopens every spool under `spool-dir` at startup, so acknowledged lines are ingested after a restart
+- **Quotas (D5):** `quota.QuotaStore` port, a token bucket per key (`<tenant>:quota:ingest`, decompressed bytes): `LocalQuotaStore` (default; Caffeine, lazy refill) or `RedisQuotaStore` (one Lua call on Redis's clock; fails open). A request fits when the bucket holds `min(amount, capacity)`, so one larger than the burst still passes a full bucket and leaves it in debt; `Retry-After` is exact. Wired by `config.QuotaConfig`
+- **Delivery:** with an `Idempotency-Key` a retry is exactly-once, across restarts; without one, at-least-once. Fluent Bit's and Vector's HTTP outputs only send static headers, so for them a retried batch can be ingested twice. `observedTimestamp` is the run's time, up to `flush-interval` after receipt
 
 ### Filter Architecture
 
@@ -174,9 +189,10 @@ Verified against the code; fix these before or alongside scaling work:
 - **Records without an event time** (JSON / kv lines with no timestamp field, or a Logback layout whose `%d` has no date, e.g. `%d{HH:mm:ss.SSS}`, whose time is kept as the `timestamp` attribute) land in `dt=unknown`, and v1's time filters and time buckets skip them.
 - **Archive gaps:** WAL segments not yet uploaded are lost if the node's disk is lost. `compression` defaults to `none` (NDJSON is ≈4x the input; set `zstd` with an archive store). The GCS store is tested against fake-gcs-server and a protocol stub, not real GCS; S3 only against S3Mock. One archiver per WAL volume.
 - **Health is DOWN without Redis:** the Redis health indicator reports DOWN even when the suppression store is `local`.
-- **Redis is only used by the optional Redis suppression store:** `spring.cache.type=redis` is configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
-- **Suppression is API-only:** no ingest path calls it yet (HTTP push ingest, P3). Redis-mode windows have no end-of-window summary.
-- **Static API keys only:** tenants come from configured API keys (no rotation API, expiry or identity provider yet); per-tenant quotas, rate limits and allowed roots are P3.
+- **Redis is only used by the optional Redis suppression and quota stores:** `spring.cache.type=redis` is configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
+- **Suppression applies to push only:** file ingest bypasses it by design (guardrail 8). Redis-mode windows have no end-of-window summary.
+- **Static API keys only:** tenants come from configured API keys (no rotation API, expiry or identity provider yet). Quotas cover push ingest bytes only (no storage or tail-connection quotas yet).
+- **Push gaps (P3a):** no OTLP or Fluent Bit `forward` protocol (agents use their HTTP / NDJSON outputs); streams can't be deleted through the API; tested with an HTTP client, not real Fluent Bit or Vector.
 - **v1 time buckets** (`errorRate`, `duration`) grow with the time span the file covers (per-minute buckets: ~525k a year).
 
 ## Target Architecture & Guardrails
@@ -191,7 +207,7 @@ source → framing → parser (ParserRegistry/FormatDetector) → pipeline (norm
        → WAL → sink (OpenSearch hot 1-14d | Parquet+ZSTD on S3/GCS/PVC cold 1-7y)
                  ↳ tail (SSE live tail, after suppression)      checkpoint ← sink acks
 ```
-Planned packages: `framing`, `tail`, alongside the existing `source`, `parser`, `pipeline`, `sink`, `archive`, `checkpoint`, `suppression`, `tenant`, `model` (`LogEnvelope`), `filter` and `aggregate` (`StreamingAggregator`).
+Planned packages: `framing`, `tail`, alongside the existing `source`, `parser`, `pipeline`, `sink`, `archive`, `checkpoint`, `suppression`, `quota`, `tenant`, `model` (`LogEnvelope`), `filter` and `aggregate` (`StreamingAggregator`).
 
 **Guardrails (every change must follow these):**
 1. **Never load unbounded data.** Stream sources in ≤500MB segments and process ≤10,000-line / ≤8MB micro-batches. No `readAllLines`, no `List` of a whole file.
@@ -225,6 +241,8 @@ Key properties in `application.properties`:
 - `spring.devtools.*`: LiveReload and restart configuration for local development
 - `argus.ingest.*`: streaming ingest. `batch-max-lines` / `batch-max-bytes` (in-memory unit), `segment-bytes` (commit unit), `raw-queue-capacity` / `parsed-queue-capacity`, `max-line-bytes` (longer lines are truncated and counted), `max-concurrent-jobs`, `allowed-roots`, `checkpoint-dir`, `keep-unparsed` (default `true`)
 - `argus.sink.local.*`: `root` (output volume; the WAL when an archive store is set), `min-free-bytes` (a new segment fails fast below this) and `compression` (`none` | `zstd`)
+- `argus.push.*` (P3a): `spool-dir`, `max-request-bytes` (`8MB` decompressed), `max-request-lines` (`10000`), `max-concurrent-requests` (`16`), `flush-interval` (`1m`), `max-spool-bytes` (`2GB` not yet ingested), `spool-rotate-bytes` (`64MB`), `max-streams-per-tenant` (`32`), `max-concurrent-runs` (`2`), `idempotency-window` (`1024`), `suppress` (`true`)
+- `argus.quota.*`: `store` (`local` | `redis`), `ingest-bytes-per-second` (`2MB`, decompressed push bytes), `burst-seconds` (`2`), `tenants.<id>.ingest-bytes-per-second`
 - `argus.wal.*` (only with an archive store): `max-bytes` (`30GB` of pending segments), `high-watermark` (`0.8`: ingest pauses, new jobs get 429), `low-watermark` (`0.6`: ingest resumes)
 - `argus.archive.*`: `store` (`none` | `filesystem` | `s3` | `gcs`), `prefix`, `delete-after-upload` (`true`), `scan-interval` (`10s`), `staging-dir`, `row-group-size` (`64MB`), `retry-initial` / `retry-max` (`1s` / `5m`), `filesystem.root` (must be outside the WAL), `s3.bucket` / `s3.region` / `s3.endpoint` / `s3.path-style` / `s3.checksums` (`when-required` for S3-compatible stores that reject SDK checksums), `gcs.bucket` / `gcs.endpoint` / `gcs.anonymous` (emulators)
 - Runtime data (`./data/` by default) is git-ignored
@@ -239,6 +257,7 @@ Key properties in `application.properties`:
 - Filter tests verify filtering conditions
 - `ArgusWebApplicationTest` starts the full context, so bean wiring and property binding errors fail `mvn test`
 - Ingest tests cover offsets and resume (`FileSourceTest`), crash-safe checkpoints (`FileCheckpointStoreTest`), idempotent segments (`LocalVolumeSinkTest`), backpressure / crash-rerun / cancel (`IngestPipelineTest`), and job slots and path checks (`IngestJobServiceTest`, `IngestControllerTest`)
+- Push tests: `StreamSpoolTest` (acknowledged appends, startup truncation of unacknowledged bytes and a torn index entry, keys across restarts, compaction, sealing and numbering, the run-due clock), `PushIngestServiceTest` (every bound and its reason, gzip and gzip bombs, truncation, suppression, keys, tenant isolation, request slots), `StreamRunnerTest` (real pipeline: age / size / sealed-file triggers, one generation per spool file, a file job holding the source, restart), `StreamControllerTest` (statuses and `Retry-After`), `LocalQuotaStoreTest` / `RedisQuotaStoreTest` / `QuotaServiceTest`. Load: `PushIngestIT`, `PushBackpressureIT`, `PushCrashIT` (shared `PushLoad` / `PushServerMain`)
 - Archive tests: the Parquet round trip (`EnvelopeParquetWriterTest`, read back Hadoop-free via `ParquetTestFiles`), every store against `ObjectStoreContractTest` (`S3ObjectStoreTest` on S3Mock and `GcsObjectStoreTest` on fake-gcs-server, skipped without Docker; `GcsResumableUploadTest` covers chunk resume against a protocol stub), `WatermarkWalCapacityTest` (hysteresis, cancel while paused), and `ArchiverTest` (keys, delete vs mark, store failures and backoff, superseded copies, a segment replaced mid-upload, unreadable segments) on real WAL segments (`WalFixture`)
 
 ## Common Development Tasks
