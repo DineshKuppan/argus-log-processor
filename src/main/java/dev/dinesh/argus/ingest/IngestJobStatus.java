@@ -3,13 +3,20 @@ package dev.dinesh.argus.ingest;
 import java.time.Instant;
 import java.util.List;
 
-/** JSON view of an {@link IngestJob} returned by the ingest API. */
+/**
+ * JSON view of an {@link IngestJob} returned by the ingest API.
+ *
+ * @param paused why a running job is waiting ({@code WAL_FULL}), or null
+ * @param pausedMs total time the job has waited for WAL room
+ */
 public record IngestJobStatus(
     String jobId,
     String tenantId,
     String sourceId,
     String path,
     IngestJob.State state,
+    String paused,
+    long pausedMs,
     String resumeReason,
     long startOffset,
     long totalBytes,
@@ -47,6 +54,8 @@ public record IngestJobStatus(
         job.sourceId(),
         job.path().toString(),
         job.state(),
+        p.pauseReason(),
+        p.pausedMs(),
         p.resumeReason(),
         p.startOffset(),
         p.totalBytes(),

@@ -80,10 +80,37 @@ public class IngestJobService {
             });
   }
 
-  /** Thrown when every job slot is busy; maps to HTTP 429. */
-  public static class JobSlotsBusyException extends RuntimeException {
+  /** Ingest can't take a new job right now; maps to HTTP 429 + {@code Retry-After}. */
+  public abstract static class IngestBusyException extends RuntimeException {
+    private final int retryAfterSeconds;
+
+    IngestBusyException(String message, int retryAfterSeconds) {
+      super(message);
+      this.retryAfterSeconds = retryAfterSeconds;
+    }
+
+    public int retryAfterSeconds() {
+      return retryAfterSeconds;
+    }
+  }
+
+  /** Thrown when every job slot is busy. */
+  public static class JobSlotsBusyException extends IngestBusyException {
+    /** About how long a job slot takes to free up. */
+    static final int RETRY_AFTER_SECONDS = 30;
+
     JobSlotsBusyException(int slots) {
-      super("All " + slots + " ingest job slots are busy; retry later");
+      super("All " + slots + " ingest job slots are busy; retry later", RETRY_AFTER_SECONDS);
+    }
+  }
+
+  /** Thrown while the WAL is above its high watermark: the archive is behind (P2 D7). */
+  public static class WalFullException extends IngestBusyException {
+    /** Longer than for busy slots: the archive must drain a fifth of the WAL first. */
+    static final int RETRY_AFTER_SECONDS = 60;
+
+    WalFullException() {
+      super("The WAL is full while the archive catches up; retry later", RETRY_AFTER_SECONDS);
     }
   }
 
@@ -118,6 +145,9 @@ public class IngestJobService {
             ? defaultSourceId(realPath)
             : SourceOffset.requireValidSourceId(requestedSourceId);
     LogParser parser = parsers.resolve(format, pattern).orElse(null);
+    if (pipeline.walFull()) {
+      throw new WalFullException();
+    }
 
     IngestJob job =
         new IngestJob(

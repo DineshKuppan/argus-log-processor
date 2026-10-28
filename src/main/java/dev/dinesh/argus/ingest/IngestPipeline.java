@@ -12,6 +12,7 @@ import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.pipeline.EnvelopeFactory;
 import dev.dinesh.argus.sink.LogSink;
 import dev.dinesh.argus.sink.LogSink.SegmentWriter;
+import dev.dinesh.argus.sink.WalCapacity;
 import dev.dinesh.argus.source.FileSource;
 import dev.dinesh.argus.source.LogBatch;
 import dev.dinesh.argus.source.RawBatch;
@@ -30,6 +31,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -76,13 +79,41 @@ public class IngestPipeline {
   private final ParserRegistry parsers;
   private final LogSink sink;
   private final CheckpointStore checkpoints;
+  private final WalCapacity walCapacity;
+
+  /** Without an archive store nothing drains the WAL, so there is no WAL limit to wait for. */
+  @Autowired
+  public IngestPipeline(
+      IngestProperties props,
+      ParserRegistry parsers,
+      LogSink sink,
+      CheckpointStore checkpoints,
+      ObjectProvider<WalCapacity> walCapacity) {
+    this(
+        props, parsers, sink, checkpoints, walCapacity.getIfAvailable(() -> WalCapacity.UNBOUNDED));
+  }
 
   public IngestPipeline(
       IngestProperties props, ParserRegistry parsers, LogSink sink, CheckpointStore checkpoints) {
+    this(props, parsers, sink, checkpoints, WalCapacity.UNBOUNDED);
+  }
+
+  public IngestPipeline(
+      IngestProperties props,
+      ParserRegistry parsers,
+      LogSink sink,
+      CheckpointStore checkpoints,
+      WalCapacity walCapacity) {
     this.props = props;
     this.parsers = parsers;
     this.sink = sink;
     this.checkpoints = checkpoints;
+    this.walCapacity = walCapacity;
+  }
+
+  /** True while the WAL is above its high watermark: new jobs would only wait. */
+  public boolean walFull() {
+    return walCapacity.isFull();
   }
 
   /**
@@ -107,7 +138,8 @@ public class IngestPipeline {
       log.info(
           "Ingest finished tenant={} source={} outcome={} error={} resumeReason={} format={}"
               + " formatSource={} startOffset={} committedOffset={} totalBytes={} segments={}"
-              + " lines={} fallbackParsed={} unparsed={} rejected={} truncated={} durationMs={}",
+              + " lines={} fallbackParsed={} unparsed={} rejected={} truncated={} pausedMs={}"
+              + " durationMs={}",
           tenantId,
           sourceId,
           outcome == null ? "FAILED" : outcome,
@@ -124,6 +156,7 @@ public class IngestPipeline {
           progress.unparsed(),
           progress.rejected(),
           progress.truncated(),
+          progress.pausedMs(),
           TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
     }
   }
@@ -350,6 +383,15 @@ public class IngestPipeline {
             return;
           }
           if (segment == null) {
+            // Segment boundary: wait here while the WAL is full. The queues behind this thread
+            // then fill and stop the parser and reader, so memory stays bounded (guardrail 2).
+            if (!walCapacity.awaitRoom(this::stopping, progress::paused)) {
+              if (Thread.currentThread().isInterrupted()) {
+                // Like takeNext / handOff: an interrupt fails the run, it isn't a cancel.
+                fail(new InterruptedException("Interrupted while waiting for WAL room"));
+              }
+              return;
+            }
             segment =
                 sink.open(tenantId, sourceId, checkpointTemplate.generation(), batch.startOffset());
           }
@@ -395,13 +437,22 @@ public class IngestPipeline {
 
     void stopAndJoin() throws InterruptedException {
       stop.set(true);
-      for (Thread thread : threads) {
-        thread.join();
-      }
+      // An interrupted writer still waits for the stages (each stops at its next poll) and closes
+      // the source; the interrupt is restored afterwards.
+      boolean interrupted = Thread.interrupted();
       try {
-        source.close();
-      } catch (Exception e) {
-        log.debug("Ignoring close failure for source {}", sourceId, e);
+        for (Thread thread : threads) {
+          thread.join();
+        }
+      } finally {
+        try {
+          source.close();
+        } catch (Exception e) {
+          log.debug("Ignoring close failure for source {}", sourceId, e);
+        }
+        if (interrupted) {
+          Thread.currentThread().interrupt();
+        }
       }
     }
 

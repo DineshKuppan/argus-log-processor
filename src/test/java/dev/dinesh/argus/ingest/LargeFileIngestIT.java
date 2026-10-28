@@ -26,6 +26,8 @@ class LargeFileIngestIT {
 
   private static final String HEAP = "-Xmx256m";
   private static final String INPUT_SIZE = System.getProperty("argus.load.input-size", "1GB");
+  private static final String WAL_COMPRESSION =
+      System.getProperty("argus.load.wal-compression", "none");
 
   @TempDir Path work;
 
@@ -42,7 +44,8 @@ class LargeFileIngestIT {
                 System.getProperty("java.class.path"),
                 LargeFileIngestRunner.class.getName(),
                 work.toString(),
-                INPUT_SIZE)
+                INPUT_SIZE,
+                WAL_COMPRESSION)
             .redirectErrorStream(true)
             .redirectOutput(output.toFile())
             .start();

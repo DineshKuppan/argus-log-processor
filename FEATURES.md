@@ -28,13 +28,15 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Feature | Details |
 |---|---|
 | Local NDJSON output / WAL | `tenant=T/dt=YYYY-MM-DD/source=ID/gen=G/START-END.ndjson`, durable before checkpointing. Names come from offsets, so a replay replaces a file rather than duplicating it |
+| WAL compression | `argus.sink.local.compression=zstd`: `.ndjson.zst` segments, 10x smaller than NDJSON (0.40x the input) for 9% of ingest speed |
+| Backpressure from the archive | With an archive store, ingest pauses before its next segment while more than 80% of `argus.wal.max-bytes` (30GB) is waiting for upload, and resumes below 60%. Job status shows `paused: WAL_FULL`; new jobs get 429. Tested with a 30s store outage during a 500MB ingest at a 256MB heap |
 | Parquet + ZSTD archive | Opt-in with `argus.archive.store=filesystem|s3`. Each committed segment becomes Parquet, is uploaded, and only then leaves the WAL. Measured 14.6x smaller than the input on synthetic data |
 | Exact hour partitions | `…/tenant=T/dt=…/hour=HH/source=…/gen=…/FROM-TO.parquet`: one object per hour of data, Hive-partitioned for Athena and BigQuery |
-| Outage tolerance | An object-store outage never stalls ingest: segments wait in the WAL and are retried with exponential backoff (1s → 5min) |
+| Outage tolerance | An object-store outage never fails ingest: segments wait in the WAL and are retried with exponential backoff (1s → 5min); if the outage outlasts the WAL's room, ingest pauses rather than failing |
 | No duplicate objects | Re-uploads replace objects. A replayed segment deletes its earlier copy through `ArchiveIndex`, even in other partitions |
-| Stores | A directory or Kubernetes PersistentVolume; AWS S3 or an S3-compatible endpoint (path-style, optional checksum relaxation). S3 credentials come only from the AWS SDK's default chain |
+| Stores | A directory or Kubernetes PersistentVolume; AWS S3 or an S3-compatible endpoint (path-style, optional checksum relaxation), with credentials only from the AWS SDK's default chain; Google Cloud Storage through its JSON API (resumable 16MB chunks that resume after a failure; Application Default Credentials / Workload Identity) |
 | Bad data | A segment that isn't valid NDJSON is set aside as `.unreadable`. An event time that microseconds can't hold is archived as null and kept in `argus.timestamp` |
-| Lean dependencies | Parquet needs only the shaded `hadoop-client-api`, with no Hadoop runtime and no Avro |
+| Lean dependencies | Parquet needs only the shaded `hadoop-client-api`, with no Hadoop runtime and no Avro; GCS needs only Google's auth library (6MB) instead of `google-cloud-storage` (43MB) |
 
 ## Suppression
 | Feature | Details |
@@ -71,4 +73,4 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | OpenAPI | Swagger UI at `/swagger-ui.html`, with the API-key scheme declared |
 | Actuator | `/actuator/health` and the other Spring Boot endpoints |
 | Test data | `DataSeeder` streams a reproducible Nginx log of any size to disk |
-| Tests | 261 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis and S3, and load tests (1GB ingest + archive at a 256MB heap, 1M suppression decisions) |
+| Tests | 291 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3 and GCS, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions) |

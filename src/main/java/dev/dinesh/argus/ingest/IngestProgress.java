@@ -2,6 +2,7 @@ package dev.dinesh.argus.ingest;
 
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 /** Live counters for one ingest run, updated by pipeline threads and read by the job API. */
@@ -21,6 +22,10 @@ public final class IngestProgress {
   private volatile String resumeReason;
   private volatile String format;
   private volatile String formatSource;
+  // Guarded by this: the writer resumes while the job API reads, and a wait must count once.
+  private long pausedNanos;
+  private long pausedSince;
+  private boolean paused;
 
   void started(long offset, long total, String reason) {
     startOffset.set(offset);
@@ -45,6 +50,31 @@ public final class IngestProgress {
     rejected.addAndGet(rejectedLines);
     unparsed.addAndGet(unparsedLines);
     fallbackParsed.addAndGet(fallbackLines);
+  }
+
+  /** The writer waits for WAL room ({@code true}) or resumes ({@code false}). */
+  synchronized void paused(boolean nowPaused) {
+    if (nowPaused) {
+      pausedSince = System.nanoTime();
+      paused = true;
+    } else if (paused) {
+      pausedNanos += System.nanoTime() - pausedSince;
+      paused = false;
+    }
+  }
+
+  /** Why the run is waiting right now, or null if it isn't. */
+  public synchronized String pauseReason() {
+    return paused ? "WAL_FULL" : null;
+  }
+
+  /** Time spent waiting for WAL room, including a wait in progress. */
+  public synchronized long pausedMs() {
+    long nanos = pausedNanos;
+    if (paused) {
+      nanos += System.nanoTime() - pausedSince;
+    }
+    return TimeUnit.NANOSECONDS.toMillis(nanos);
   }
 
   void committed(long endOffset, String location) {

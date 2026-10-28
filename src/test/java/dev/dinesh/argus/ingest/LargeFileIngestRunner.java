@@ -15,13 +15,10 @@ import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.seeder.DataSeeder;
 import dev.dinesh.argus.sink.LocalVolumeSink;
 import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.lang.management.MemoryMXBean;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.conf.PlainParquetConfiguration;
@@ -34,13 +31,17 @@ import org.springframework.util.unit.DataSize;
  * Parquet (P2), then prints one summary line. Run in a separate JVM by {@link LargeFileIngestIT} so
  * its heap limit is enforced.
  *
- * <p>Args: {@code <workDir> <inputSize>}.
+ * <p>Args: {@code <workDir> <inputSize> [none|zstd]} (WAL compression).
  */
 public final class LargeFileIngestRunner {
 
   public static void main(String[] args) throws Exception {
     Path work = Path.of(args[0]);
     long inputBytes = DataSize.parse(args[1]).toBytes();
+    LocalSinkProperties.Compression compression =
+        args.length > 2
+            ? LocalSinkProperties.Compression.valueOf(args[2].toUpperCase(java.util.Locale.ROOT))
+            : LocalSinkProperties.Compression.NONE;
     Path input = Files.createDirectories(work.resolve("in")).resolve("big.log");
     long generatedLines = DataSeeder.generateNginxLogs(input, inputBytes, 42L);
 
@@ -55,7 +56,8 @@ public final class LargeFileIngestRunner {
             props,
             new ParserRegistry(),
             new LocalVolumeSink(
-                new LocalSinkProperties(work.resolve("out"), DataSize.ofBytes(0)), mapper),
+                new LocalSinkProperties(work.resolve("out"), DataSize.ofBytes(0), compression),
+                mapper),
             new FileCheckpointStore(props, mapper));
 
     HeapSampler heap = HeapSampler.start();
@@ -72,7 +74,7 @@ public final class LargeFileIngestRunner {
     // Then archive everything ingested, as P2's Archiver does in the background, with the
     // production row group size.
     Path wal = work.resolve("out");
-    long walBytes = sizeOf(wal, ".ndjson");
+    long walBytes = sizeOf(wal, ".ndjson") + sizeOf(wal, ".ndjson.zst");
     Path archiveRoot = work.resolve("archive");
     ArchiveProperties archiveProps =
         new ArchiveProperties(
@@ -85,6 +87,7 @@ public final class LargeFileIngestRunner {
             null,
             null,
             new ArchiveProperties.FileSystem(archiveRoot),
+            null,
             null);
     long archiveStarted = System.nanoTime();
     Archiver.Pass pass =
@@ -101,7 +104,8 @@ public final class LargeFileIngestRunner {
             + " inputBytes=%d seconds=%.1f linesPerSec=%.0f peakHeapMB=%d maxHeapMB=%d"
             + " archived=%d archiveFailed=%d archivedRows=%d walBytes=%d parquetBytes=%d"
             + " walLeftBytes=%d archiveSeconds=%.1f archiveLinesPerSec=%.0f"
-            + " compressionVsInput=%.1f compressionVsNdjson=%.1f archivePeakHeapMB=%d%n",
+            + " compressionVsInput=%.1f compressionVsNdjson=%.1f archivePeakHeapMB=%d"
+            + " walCompression=%s walVsInput=%.2f%n",
         outcome,
         generatedLines,
         progress.lines(),
@@ -118,12 +122,14 @@ public final class LargeFileIngestRunner {
         parquetRows(archiveRoot),
         walBytes,
         parquetBytes,
-        sizeOf(wal, ".ndjson"),
+        sizeOf(wal, ".ndjson") + sizeOf(wal, ".ndjson.zst"),
         archiveSeconds,
         progress.lines() / archiveSeconds,
         (double) inputSize / parquetBytes,
         (double) walBytes / parquetBytes,
-        heap.peakUsedBytes() / (1024 * 1024));
+        heap.peakUsedBytes() / (1024 * 1024),
+        compression,
+        (double) walBytes / inputSize);
   }
 
   private static long sizeOf(Path dir, String suffix) throws IOException {
@@ -150,44 +156,5 @@ public final class LargeFileIngestRunner {
       }
     }
     return rows;
-  }
-
-  /**
-   * Samples total heap in use. Summing each pool's own peak would overstate it, because pools peak
-   * at different moments.
-   */
-  private static final class HeapSampler {
-    private static final long INTERVAL_MS = 20;
-    private final MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
-    private final AtomicLong peak = new AtomicLong();
-    private final AtomicBoolean running = new AtomicBoolean(true);
-    private final Thread thread = new Thread(this::sample, "heap-sampler");
-
-    static HeapSampler start() {
-      HeapSampler sampler = new HeapSampler();
-      sampler.thread.setDaemon(true);
-      sampler.thread.start();
-      return sampler;
-    }
-
-    private void sample() {
-      while (running.get()) {
-        peak.accumulateAndGet(memory.getHeapMemoryUsage().getUsed(), Math::max);
-        try {
-          Thread.sleep(INTERVAL_MS);
-        } catch (InterruptedException e) {
-          return;
-        }
-      }
-    }
-
-    void stop() throws InterruptedException {
-      running.set(false);
-      thread.join();
-    }
-
-    long peakUsedBytes() {
-      return peak.get();
-    }
   }
 }

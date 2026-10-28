@@ -27,7 +27,13 @@ final class WalFixture {
   private final LocalVolumeSink sink;
 
   WalFixture(Path root) {
-    this.sink = new LocalVolumeSink(new LocalSinkProperties(root, DataSize.ofBytes(0)), MAPPER);
+    this(root, LocalSinkProperties.Compression.NONE);
+  }
+
+  WalFixture(Path root, LocalSinkProperties.Compression compression) {
+    this.sink =
+        new LocalVolumeSink(
+            new LocalSinkProperties(root, DataSize.ofBytes(0), compression), MAPPER);
   }
 
   /** Commits {@code records} lines at offsets {@code start, start+10, …}; returns the file. */

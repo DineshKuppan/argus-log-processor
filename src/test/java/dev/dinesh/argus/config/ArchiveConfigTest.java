@@ -5,8 +5,11 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.archive.Archiver;
 import dev.dinesh.argus.archive.FileSystemObjectStore;
+import dev.dinesh.argus.archive.GcsObjectStore;
 import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
+import dev.dinesh.argus.archive.WatermarkWalCapacity;
+import dev.dinesh.argus.sink.WalCapacity;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -21,7 +24,11 @@ class ArchiveConfigTest {
   @TempDir Path dir;
 
   @Configuration
-  @EnableConfigurationProperties({ArchiveProperties.class, LocalSinkProperties.class})
+  @EnableConfigurationProperties({
+    ArchiveProperties.class,
+    LocalSinkProperties.class,
+    WalProperties.class
+  })
   static class Base {
     @Bean
     ObjectMapper mapper() {
@@ -45,6 +52,7 @@ class ArchiveConfigTest {
               assertThat(context).hasNotFailed();
               assertThat(context).doesNotHaveBean(Archiver.class);
               assertThat(context).doesNotHaveBean(ObjectStore.class);
+              assertThat(context).doesNotHaveBean(WalCapacity.class);
             });
   }
 
@@ -71,6 +79,8 @@ class ArchiveConfigTest {
               assertThat(context.getBean(ObjectStore.class))
                   .isInstanceOf(FileSystemObjectStore.class);
               assertThat(context.getBean(Archiver.class).isRunning()).isTrue();
+              assertThat(context.getBean(WalCapacity.class))
+                  .isInstanceOf(WatermarkWalCapacity.class);
               assertThat(context).doesNotHaveBean(S3AsyncClient.class);
             });
   }
@@ -82,6 +92,25 @@ class ArchiveConfigTest {
             "argus.archive.store=FILESYSTEM",
             "argus.archive.filesystem.root=" + dir.resolve("wal/archive"))
         .run(context -> assertThat(context).hasFailed());
+  }
+
+  @Test
+  void aGcsStoreNeedsABucket() {
+    runner()
+        .withPropertyValues("argus.archive.store=gcs")
+        .run(context -> assertThat(context).hasFailed());
+    runner()
+        .withPropertyValues(
+            "argus.archive.store=gcs",
+            "argus.archive.gcs.bucket=logs",
+            "argus.archive.gcs.endpoint=http://localhost:1",
+            "argus.archive.gcs.anonymous=true")
+        .run(
+            context -> {
+              assertThat(context).hasNotFailed();
+              assertThat(context.getBean(ObjectStore.class)).isInstanceOf(GcsObjectStore.class);
+              assertThat(context.getBean(ObjectStore.class).describe()).isEqualTo("gs://logs");
+            });
   }
 
   @Test

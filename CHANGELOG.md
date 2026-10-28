@@ -6,6 +6,29 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
+### P2b: WAL watermarks, WAL compression and GCS (unmerged)
+Plan and results: [`P2_PLAN.md`](docs/architecture/P2_PLAN.md) §8, §10.
+
+#### Added
+- **Backpressure from the archive (T3).**
+  - With an archive store, `WatermarkWalCapacity` pauses ingest before its next segment while more than `argus.wal.high-watermark` × `max-bytes` (80% of 30GB) is waiting for upload, and resumes below the low watermark (60%).
+  - The bounded queues then stop the reader too.
+  - Job status gains `paused` (`WAL_FULL`) and `pausedMs`. A paused job can be cancelled.
+  - New jobs get 429 + `Retry-After: 60` while the WAL is full.
+- **WAL compression:** `argus.sink.local.compression=zstd` writes `.ndjson.zst` segments, 10.4x smaller than NDJSON, for 9% of ingest speed. The archiver reads both, and a corrupt zstd stream is set aside like invalid NDJSON.
+- **`GcsObjectStore`** (`argus.archive.store=gcs`): the GCS JSON API with resumable 16MB chunks that resume after a failed chunk. Application Default Credentials, or `gcs.anonymous` for emulators.
+- `WalBackpressureIT` (tag `load`): an archive outage during a 500MB ingest at a 256MB heap.
+
+#### Changed
+- The 429 for busy job slots and for a full WAL share `IngestBusyException`; their `Retry-After` values are 30s and 60s.
+- The ingest canonical line gains `pausedMs`.
+- The archive canonical line's `compression` is now source bytes / Parquet bytes (it was WAL bytes / Parquet bytes, which a zstd WAL would skew), and it gains `sourceBytes`.
+- zstd WAL segments carry a content checksum, so a corrupt segment fails to decompress rather than decoding to wrong bytes.
+
+#### Measured
+- **T3, scaled to a 30s outage:** the job paused for 49s and then completed; the WAL peaked within one segment of its high watermark; all 5,381,072 lines were archived; heap peak 219MB.
+- **zstd WAL:** 0.40x the input, against 4.14x for NDJSON.
+
 ### P2a: Parquet archive: [#5](https://github.com/DineshKuppan/argus-log-processor/pull/5) (2026-10-28)
 Plan and results: [`P2_PLAN.md`](docs/architecture/P2_PLAN.md).
 

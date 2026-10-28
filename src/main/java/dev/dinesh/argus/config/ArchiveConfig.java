@@ -3,9 +3,13 @@ package dev.dinesh.argus.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.archive.Archiver;
 import dev.dinesh.argus.archive.FileSystemObjectStore;
+import dev.dinesh.argus.archive.GcsObjectStore;
 import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
 import dev.dinesh.argus.archive.WalSegments;
+import dev.dinesh.argus.archive.WatermarkWalCapacity;
+import dev.dinesh.argus.sink.WalCapacity;
+import java.io.IOException;
 import java.nio.file.Path;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
@@ -38,6 +42,21 @@ public class ArchiveConfig {
         null);
   }
 
+  /** Fails startup without Application Default Credentials, rather than on the first upload. */
+  private static ObjectStore gcsStore(ArchiveProperties.Gcs gcs) {
+    try {
+      return new GcsObjectStore(
+          gcs.endpoint(),
+          gcs.bucket(),
+          gcs.anonymous() ? null : GcsObjectStore.defaultCredentials());
+    } catch (IOException e) {
+      throw new IllegalStateException(
+          "argus.archive.store=gcs needs Application Default Credentials (Workload Identity,"
+              + " GOOGLE_APPLICATION_CREDENTIALS or gcloud auth application-default login)",
+          e);
+    }
+  }
+
   @Bean
   ObjectStore archiveStore(
       ArchiveProperties props, LocalSinkProperties wal, ObjectProvider<S3AsyncClient> s3) {
@@ -52,8 +71,15 @@ public class ArchiveConfig {
         yield new FileSystemObjectStore(root);
       }
       case S3 -> new S3ObjectStore(s3.getObject(), props.s3().bucket());
+      case GCS -> gcsStore(props.gcs());
       case NONE -> throw new IllegalStateException("No archive store is configured");
     };
+  }
+
+  /** Ingest waits on this before each segment (P2 D7): the archive is what drains the WAL. */
+  @Bean
+  WalCapacity walCapacity(LocalSinkProperties wal, WalProperties limits) {
+    return new WatermarkWalCapacity(new WalSegments(wal.root()), limits);
   }
 
   @Bean

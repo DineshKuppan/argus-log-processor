@@ -16,8 +16,12 @@ A Spring Boot service that ingests, parses, filters, aggregates and archives log
 
 ## What's new
 
+- **Backpressure, a compressed WAL and GCS (P2b).**
+  - When the archive falls behind (e.g. S3 or GCS is down), ingest **pauses** at the WAL's high watermark instead of failing, then resumes. Tested with a 30s outage during a 500MB ingest at a 256MB heap.
+  - `argus.sink.local.compression=zstd` makes the local WAL 10x smaller, so 30GB holds about a week of backlog.
+  - `argus.archive.store=gcs`: native Google Cloud Storage with Workload Identity.
 - **Parquet archive (P2a, PR #5).**
-  - Ingested logs are converted to Parquet + ZSTD and uploaded to a directory (PVC) or to S3. The local output becomes a write-ahead buffer, so an S3 outage doesn't stop ingest.
+  - Ingested logs are converted to Parquet + ZSTD and uploaded to a directory (PVC) or to S3 (GCS since P2b). The local output becomes a write-ahead buffer, so an S3 outage doesn't stop ingest.
   - **14.6x smaller than the raw input** on a 1GB synthetic test.
   - Opt-in: `argus.archive.store=filesystem|s3`.
 - **API keys and tenants (PR #4).**
@@ -43,7 +47,7 @@ Details: [CHANGELOG.md](CHANGELOG.md).
 - Optional:
   - **Docker**, for the Redis and S3 tests (Testcontainers; they're skipped without it).
   - **Redis**, only for `argus.suppression.store=redis`.
-  - An **S3 bucket** or S3-compatible store, only for `argus.archive.store=s3`.
+  - An **S3 bucket** (or S3-compatible store) or a **GCS bucket**, only for `argus.archive.store=s3|gcs`.
 
 ## Build and run
 
@@ -120,11 +124,19 @@ argus.archive.filesystem.root=./data/archive
 argus.archive.store=s3
 argus.archive.s3.bucket=my-log-archive
 argus.archive.s3.region=eu-west-1
+
+# …or GCS, with Application Default Credentials (Workload Identity, a service account, gcloud)
+argus.archive.store=gcs
+argus.archive.gcs.bucket=my-log-archive
+
 argus.archive.prefix=argus/prod
+# Recommended with any store: a zstd WAL, 10x smaller than NDJSON
+argus.sink.local.compression=zstd
 ```
 - **Keys:** `<prefix>/tenant=T/dt=YYYY-MM-DD/hour=HH/source=ID/gen=G/FROM-TO.parquet`, Hive-partitioned for Athena and BigQuery.
 - **Lifecycle:** each local segment is deleted once its upload succeeds.
 - **S3-compatible stores:** set `s3.endpoint`, `s3.path-style=true` and, if the store rejects the AWS SDK's checksums, `s3.checksums=when-required`.
+- **Backpressure:** when more than 80% of `argus.wal.max-bytes` (30GB) is waiting for upload, ingest pauses (job status `paused: WAL_FULL`) and new jobs get 429. It resumes below 60%.
 
 ## API
 
@@ -132,8 +144,8 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 
 | Method | Endpoint | What it does |
 |---|---|---|
-| POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`. 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` |
-| GET | `/api/v2/ingest/jobs/{id}` | Job progress: bytes, lines, format, segments, outputs. Another tenant's job is 404 |
+| POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`. 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (job slots busy, or the WAL full while the archive catches up) |
+| GET | `/api/v2/ingest/jobs/{id}` | Job progress: bytes, lines, format, segments, outputs, `paused` / `pausedMs`. Another tenant's job is 404 |
 | DELETE | `/api/v2/ingest/jobs/{id}` | Cancel a job at its next batch; committed segments stay |
 | POST | `/api/v2/suppression/check` | `{"message"}` → `ALLOW` / `DENY`, `windowEndsAt`, `suppressedCount` |
 | POST | `/api/v1/logs/aggregate` | `file`, `topN`: counts by level, top endpoints, error rate per minute. Any file size |
@@ -159,9 +171,9 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 261 tests; Redis and S3 tests need Docker
+mvn test                                         # 291 tests; Redis, S3 and GCS tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
-mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, 1M suppression decisions
+mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression decisions
 ```
 
 ## License

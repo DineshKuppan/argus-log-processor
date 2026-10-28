@@ -293,6 +293,16 @@ class IngestControllerTest {
 
     submit(Map.of("path", ROOT.resolve("other.log").toString(), "sourceId", "api-busy-2"))
         .andExpect(status().isTooManyRequests())
-        .andExpect(header().string("Retry-After", IngestController.RETRY_AFTER_SECONDS));
+        .andExpect(header().string("Retry-After", "30"));
+  }
+
+  @Test
+  void aFullWalReturns429UntilTheArchiveCatchesUp() throws Exception {
+    when(pipeline.walFull()).thenReturn(true);
+
+    submit(Map.of("path", ROOT.resolve("app.log").toString(), "sourceId", "api-wal-full"))
+        .andExpect(status().isTooManyRequests())
+        .andExpect(header().string("Retry-After", "60"))
+        .andExpect(jsonPath("$.error").value(org.hamcrest.Matchers.containsString("WAL is full")));
   }
 }

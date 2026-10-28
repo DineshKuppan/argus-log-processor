@@ -9,11 +9,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.github.luben.zstd.ZstdInputStream;
 import dev.dinesh.argus.config.LocalSinkProperties;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.sink.LogSink.SegmentWriter;
 import dev.dinesh.argus.source.LogBatch;
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -112,6 +115,31 @@ class LocalVolumeSinkTest {
     assertEquals(1, files.size());
     assertTrue(files.get(0).endsWith("0-60.ndjson"));
     assertFalse(Files.exists(Path.of(earlier + ".archived")), "marker of the replaced copy");
+  }
+
+  @Test
+  void zstdSegmentsHoldTheSameNdjsonAndReplaceEarlierCopies() throws IOException {
+    LocalVolumeSink zstd =
+        new LocalVolumeSink(
+            new LocalSinkProperties(
+                root, DataSize.ofBytes(0), LocalSinkProperties.Compression.ZSTD),
+            mapper);
+    SegmentWriter plain = sink().open("default", "app", 0, 0);
+    plain.write(batch(0, 40, "one"));
+    plain.commit(40);
+
+    // A replay after switching compression on replaces the plain copy.
+    SegmentWriter writer = zstd.open("default", "app", 0, 0);
+    writer.write(batch(0, 60, "one", "two"));
+    Path committed = Path.of(writer.commit(60));
+
+    assertTrue(committed.toString().endsWith("0-60.ndjson.zst"));
+    assertEquals(List.of(), committedFiles());
+    try (InputStream in = new ZstdInputStream(Files.newInputStream(committed))) {
+      List<String> lines = new String(in.readAllBytes(), StandardCharsets.UTF_8).lines().toList();
+      assertEquals(2, lines.size());
+      assertEquals("two", mapper.readValue(lines.get(1), LogEnvelope.class).body());
+    }
   }
 
   @Test
