@@ -51,8 +51,10 @@ Today v2 ingest writes NDJSON segments to a local volume and stops there. The ou
   | DuckDB JDBC `COPY TO` | ~70MB native library | Converting needs a temporary table |
   | **`parquet-hadoop` 1.15 + `hadoop-client-api` (shaded) + a `WriteSupport<LogEnvelope>`** | parquet (≈8MB), zstd-jni (7MB), hadoop-client-api (20MB, no transitive deps) | `LocalOutputFile`, `PlainParquetConfiguration`: no Hadoop `FileSystem` or `Configuration` at runtime |
 
-  Chosen: the third row. A spike on this machine wrote 200k rows to 448KB with ZSTD, using only `hadoop-client-api`. The class loader needs it (`org.apache.hadoop.conf.Configurable`); `hadoop-client-runtime` isn't needed.
-- **Result:** about 35MB of new jars and no Avro schema to maintain. The schema (§3) lives in one class, next to the code that writes it.
+  Chosen: the third row. A spike on this machine wrote 200k rows to 448KB with ZSTD. The class loader needs `hadoop-client-api` (`org.apache.hadoop.conf.Configurable`).
+  - Parquet's default codec factory builds a Hadoop `Configuration`, which needs `hadoop-client-runtime` (another 30MB of shaded Hadoop dependencies). The spike first passed only because Maven had put that jar on the class path.
+  - So `ZstdCodecFactory` compresses and decompresses pages with zstd-jni directly, in about 50 lines. Parquet's writer and reader both accept it.
+- **Result:** about 35MB of new jars and no Avro schema to maintain. Nothing at runtime builds a Hadoop `Configuration`. The schema (§3) lives in one class, next to the code that writes it.
 
 ### D3. Archive layout and naming
 - **Action:** each object's key is derived from the WAL segment's path, following the layout in §3 of the design doc:
@@ -101,6 +103,7 @@ Today v2 ingest writes NDJSON segments to a local volume and stops there. The ou
 |---|---|---|
 | `EnvelopeSchema` | `archive` | The Parquet `MessageType` (below) and the column names |
 | `EnvelopeParquetWriter` | `archive` | `WriteSupport<LogEnvelope>` + builder over `LocalOutputFile`; ZSTD; reports the first event time and the row count |
+| `ZstdCodecFactory` | `archive` | Parquet `CompressionCodecFactory` on zstd-jni (D2), level 3 |
 | `ObjectStore` | `archive` | Port: `put(key, Path file)`, `list(prefix)`, `delete(key)`, `name()`. Keys use `/` and are relative to the store's prefix |
 | `FileSystemObjectStore` | `archive` | A directory (PVC): write to a temp file + fsync + atomic rename (`DurableFiles`) |
 | `S3ObjectStore` | `archive` | AWS SDK v2 `S3AsyncClient` with multipart enabled. Configurable endpoint and path-style access (MinIO; GCS interop untested). Credentials from the SDK's default chain, never from properties |
