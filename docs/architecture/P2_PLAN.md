@@ -157,7 +157,7 @@ argus.archive.s3.path-style=false
 | Test | Covers |
 |---|---|
 | `EnvelopeParquetWriterTest` | Read back with `ParquetFileReader`: every field, nulls, maps, non-string attributes as JSON, µs timestamps, ZSTD codec on every column |
-| `ObjectStoreContractTest` (abstract) + `FileSystemObjectStoreTest`, `S3ObjectStoreTest` | `put` replaces, `list` by prefix, `delete` is idempotent, large files go multipart. The S3 test uses MinIO via Testcontainers and is skipped without Docker |
+| `ObjectStoreContractTest` (abstract) + `FileSystemObjectStoreTest`, `S3ObjectStoreTest` | `put` replaces, `list` by prefix, `delete` is idempotent, large files go multipart. The S3 test uses S3Mock (`adobe/s3mock`) via Testcontainers, because MinIO no longer publishes images to Docker Hub; it is skipped without Docker |
 | `WalSegmentsTest` | Key mapping (hour from the first record, `unknown`), `_staging` and `.archived` skipped, oldest first |
 | `ArchiverTest` | Upload then delete; `delete-after-upload=false` marks instead; a failing store keeps the segment and backs off, then recovers; superseded siblings deleted; a segment replaced during upload; tenants stay under their own prefixes; staging cleaned at start |
 | `ArchiveConfigTest`, `ArgusWebApplicationTest` | `store=none` starts no worker; bad configuration fails at startup |
@@ -166,7 +166,7 @@ argus.archive.s3.path-style=false
 ## 6. Implementation order (P2a, one commit per step)
 1. This plan; design doc §5 and guardrail 3 (D1).
 2. `EnvelopeSchema` + `EnvelopeParquetWriter` + dependencies.
-3. `ObjectStore` port, filesystem and S3 adapters, contract tests (MinIO).
+3. `ObjectStore` port, filesystem and S3 adapters, contract tests (S3Mock).
 4. `WalSegments`, `Archiver`, `ArchiveProperties` / `ArchiveConfig`.
 5. Docs (CLAUDE.md, design doc) and results (§9).
 
@@ -175,7 +175,7 @@ argus.archive.s3.path-style=false
 |---|---|
 | A WAL segment whose source is still being written | Only committed `.ndjson` files are archived. They appear by atomic rename and change only when a replay supersedes them (D3) |
 | The archive is far behind and the disk fills up | `min-free-bytes` still fails new segments fast. P2b replaces that with watermarks that pause ingest |
-| AWS SDK 2.30+ sends checksum headers that some S3-compatible stores reject | MinIO is tested. Others can set `requestChecksumCalculation=WHEN_REQUIRED` (exposed as `argus.archive.s3.checksums`) |
+| AWS SDK 2.30+ sends checksum headers that some S3-compatible stores reject | S3Mock is tested. Others can set `requestChecksumCalculation=WHEN_REQUIRED` (exposed as `argus.archive.s3.checksums`) |
 | Hadoop classes on the classpath | Only the shaded `hadoop-client-api`, nothing that starts a Hadoop `FileSystem`. Checked by the dependency tree in the PR |
 | Two instances archiving one volume | Out of scope; documented. Uploads are idempotent, so the worst case is a duplicate upload, not data loss |
 

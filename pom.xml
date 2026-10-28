@@ -26,6 +26,7 @@
     <hadoop.version>3.4.1</hadoop.version>
     <!-- The version parquet-hadoop ${parquet.version} is built against -->
     <zstd-jni.version>1.5.6-6</zstd-jni.version>
+    <awssdk.version>2.31.6</awssdk.version>
   </properties>
 
   <licenses>
@@ -95,7 +96,7 @@
       <scope>test</scope>
     </dependency>
 
-    <!-- Real Redis for RedisSuppressionStoreTest; the test is skipped without Docker -->
+    <!-- Real Redis and S3 (S3Mock) for the store tests; they are skipped without Docker -->
     <dependency>
       <groupId>org.testcontainers</groupId>
       <artifactId>junit-jupiter</artifactId>
@@ -148,6 +149,20 @@
       <groupId>com.github.luben</groupId>
       <artifactId>zstd-jni</artifactId>
       <version>${zstd-jni.version}</version>
+    </dependency>
+
+    <!-- S3 archive store (P2): the async client with multipart uploads (Netty); the sync Apache
+         client is never used -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>s3</artifactId>
+      <version>${awssdk.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>software.amazon.awssdk</groupId>
+          <artifactId>apache-client</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
 
     <dependency>
