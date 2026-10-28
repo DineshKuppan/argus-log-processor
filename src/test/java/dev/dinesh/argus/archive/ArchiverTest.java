@@ -56,6 +56,7 @@ class ArchiverTest {
         Duration.ofMillis(10),
         Duration.ofMillis(80),
         new ArchiveProperties.FileSystem(dir.resolve("archive")),
+        null,
         null);
   }
 

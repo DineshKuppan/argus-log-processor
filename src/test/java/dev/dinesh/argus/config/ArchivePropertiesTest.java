@@ -10,7 +10,8 @@ import org.junit.jupiter.api.Test;
 class ArchivePropertiesTest {
 
   private static ArchiveProperties withPrefix(String prefix) {
-    return new ArchiveProperties(null, prefix, null, null, null, null, null, null, null, null);
+    return new ArchiveProperties(
+        null, prefix, null, null, null, null, null, null, null, null, null);
   }
 
   @Test
@@ -41,16 +42,36 @@ class ArchivePropertiesTest {
         IllegalArgumentException.class,
         () ->
             new ArchiveProperties(
-                ArchiveProperties.Store.S3, null, null, null, null, null, null, null, null, null));
+                ArchiveProperties.Store.S3,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null));
     assertThrows(
         IllegalArgumentException.class,
         () ->
             new ArchiveProperties(
-                null, null, null, Duration.ZERO, null, null, null, null, null, null));
+                null, null, null, Duration.ZERO, null, null, null, null, null, null, null));
     assertThrows(
         IllegalArgumentException.class,
         () ->
             new ArchiveProperties(
-                null, null, null, null, null, null, Duration.ofMinutes(10), null, null, null));
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                Duration.ofMinutes(10),
+                null,
+                null,
+                null,
+                null));
   }
 }

@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.archive.Archiver;
 import dev.dinesh.argus.archive.FileSystemObjectStore;
+import dev.dinesh.argus.archive.GcsObjectStore;
 import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
 import dev.dinesh.argus.archive.WatermarkWalCapacity;
@@ -91,6 +92,25 @@ class ArchiveConfigTest {
             "argus.archive.store=FILESYSTEM",
             "argus.archive.filesystem.root=" + dir.resolve("wal/archive"))
         .run(context -> assertThat(context).hasFailed());
+  }
+
+  @Test
+  void aGcsStoreNeedsABucket() {
+    runner()
+        .withPropertyValues("argus.archive.store=gcs")
+        .run(context -> assertThat(context).hasFailed());
+    runner()
+        .withPropertyValues(
+            "argus.archive.store=gcs",
+            "argus.archive.gcs.bucket=logs",
+            "argus.archive.gcs.endpoint=http://localhost:1",
+            "argus.archive.gcs.anonymous=true")
+        .run(
+            context -> {
+              assertThat(context).hasNotFailed();
+              assertThat(context.getBean(ObjectStore.class)).isInstanceOf(GcsObjectStore.class);
+              assertThat(context.getBean(ObjectStore.class).describe()).isEqualTo("gs://logs");
+            });
   }
 
   @Test

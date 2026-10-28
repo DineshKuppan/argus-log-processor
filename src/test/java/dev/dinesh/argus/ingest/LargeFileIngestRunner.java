@@ -85,6 +85,7 @@ public final class LargeFileIngestRunner {
             null,
             null,
             new ArchiveProperties.FileSystem(archiveRoot),
+            null,
             null);
     long archiveStarted = System.nanoTime();
     Archiver.Pass pass =

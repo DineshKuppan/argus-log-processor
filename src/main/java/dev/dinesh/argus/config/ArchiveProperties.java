@@ -29,7 +29,8 @@ public record ArchiveProperties(
     Duration retryInitial,
     Duration retryMax,
     FileSystem filesystem,
-    S3 s3) {
+    S3 s3,
+    Gcs gcs) {
 
   public enum Store {
     /** No archive: the local NDJSON segments are the output (the behaviour before P2). */
@@ -37,7 +38,9 @@ public record ArchiveProperties(
     /** A directory, e.g. a Kubernetes PersistentVolume. */
     FILESYSTEM,
     /** AWS S3 or an S3-compatible store. */
-    S3
+    S3,
+    /** Google Cloud Storage, through its JSON API. */
+    GCS
   }
 
   /**
@@ -60,6 +63,13 @@ public record ArchiveProperties(
       WHEN_REQUIRED
     }
   }
+
+  /**
+   * @param endpoint an emulator such as fake-gcs-server; null for {@code storage.googleapis.com}
+   * @param anonymous send no credentials (emulators only); otherwise Application Default
+   *     Credentials (Workload Identity, a service account, {@code gcloud})
+   */
+  public record Gcs(String bucket, URI endpoint, boolean anonymous) {}
 
   public ArchiveProperties {
     store = store != null ? store : Store.NONE;
@@ -90,6 +100,10 @@ public record ArchiveProperties(
     }
     if (store == Store.S3 && (s3.bucket() == null || s3.bucket().isBlank())) {
       throw new IllegalArgumentException("argus.archive.store=s3 needs argus.archive.s3.bucket");
+    }
+    gcs = gcs != null ? gcs : new Gcs(null, null, false);
+    if (store == Store.GCS && (gcs.bucket() == null || gcs.bucket().isBlank())) {
+      throw new IllegalArgumentException("argus.archive.store=gcs needs argus.archive.gcs.bucket");
     }
   }
 
