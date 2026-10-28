@@ -306,3 +306,35 @@ argus.archive.gcs.endpoint=              # fake-gcs-server etc.; empty = https:/
 | — | Guardrail 4 ("object prefix starts with the tenant") vs `argus.archive.prefix` | Guardrail 4 allows one fixed deployment prefix shared by all tenants |
 
 After the fixes: 261 tests pass on a clean checkout (Docker up), and the 1GB load test still archives every row at 14.6x.
+
+## 10. Results (P2b)
+- **Tests:** 288 pass on a clean checkout (`mvn -P ci test`, Docker up), up from 261 after P2a. New: `WatermarkWalCapacityTest`, `GcsObjectStoreTest` (`ObjectStoreContractTest` on fake-gcs-server), `GcsResumableUploadTest`, plus zstd cases in `LocalVolumeSinkTest` / `WalSegmentsTest` / `ArchiverTest`, the pause/cancel cases in `IngestPipelineTest` and the 429 in `IngestControllerTest`.
+- **T3** (`WalBackpressureIT`, tag `load`, scaled down): 500MB access log (5,381,072 lines) in one JVM capped at 256MB; zstd WAL; 25MB source segments; WAL capped at 40MB (high 32MiB, low 24MiB); the store failed every upload for the first 30s.
+
+  | Measure | Value |
+  |---|---|
+  | Outcome | `COMPLETED`: the outage paused ingest instead of failing it |
+  | Paused | 49.4s in all (the 30s outage, then until the archive drained the WAL below the low watermark) |
+  | WAL peak | 41.9MB pending against a 33.5MB high watermark: under one 10.5MB segment over, as designed |
+  | Recovery | All 5,381,072 lines archived; WAL empty; 10 failed uploads retried with backoff |
+  | Heap | peak 219MB of 256MB |
+
+  - The first run peaked at 52.4MB, almost two segments over: the gate reused a measurement up to 1s old, which could let a second segment through. `awaitRoom` now measures afresh at each segment boundary.
+  - The design's 10-minute outage is `-Dargus.load.outage-seconds` (30 by default). Memory doesn't depend on the outage's length: a paused writer holds only the bounded queues.
+- **WAL compression** (`LargeFileIngestIT`, 1GB, the same JVM and data as P2a):
+
+  | `compression` | WAL vs input | Ingest | Archive | Parquet vs input |
+  |---|---|---|---|---|
+  | `none` | 4.14x (4.45GB) | 419k lines/s | 178k lines/s | 14.6x smaller |
+  | `zstd` | **0.40x (428MB)**, 10.4x smaller | 380k lines/s (−9%) | 178k lines/s | 14.6x smaller |
+
+  With zstd a 30GB WAL holds ≈75GB of source, about 7.5 days at 10GB/day, against 17 hours with plain NDJSON.
+- **GCS:** the JSON-API store passes the shared contract test (including a 24MB, two-chunk upload) on fake-gcs-server 1.52.2. A protocol stub covers the resume paths: a failed chunk is resent from where the session is; a chunk stored but whose response was lost isn't sent twice; and repeated failures or a session that makes no progress fail instead of looping.
+  - The last case was a real bug, found when the first test run hung: a server answering 308 without taking bytes made `put` loop forever.
+  - fake-gcs-server finalizes an upload on a status query (`bytes */N`), where GCS answers 308. So the resume path can only be tested against the stub, and the normal path never sends a status query.
+- **Deviations from §8:**
+  - The GCS store uses `google-auth-library` + `java.net.http` (D9, as planned) and adds `gcs.anonymous` for emulators.
+  - The pause shows as `paused` / `pausedMs` fields in job status rather than a new job state, so `RUNNING` / `COMPLETED` keep their meaning.
+  - The job-slots 429 keeps its `Retry-After: 30`; the WAL-full 429 sends 60.
+- **Not done:** no run against real GCS or AWS S3.
+

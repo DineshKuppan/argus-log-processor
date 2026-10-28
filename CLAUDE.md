@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Java 17 (the build target). **Build with JDK 17 or 21, not 24+**: the Lombok version managed by Spring Boot 3.3.3 (1.18.34) crashes on JDK 24, and every Lombok-generated getter then fails to compile. If your default JDK is newer, prefix Maven commands with e.g. `JAVA_HOME=~/.sdkman/candidates/java/17.0.14-tem`.
 - Maven 3.8+
 - Redis (optional: only with `argus.suppression.store=redis`; the default suppression store is in memory)
-- Docker (optional: `RedisSuppressionStoreTest` and `S3ObjectStoreTest` use Testcontainers (Redis, S3Mock) and are skipped without it; also the 4GB-container load check under Testing)
+- Docker (optional: `RedisSuppressionStoreTest`, `S3ObjectStoreTest` and `GcsObjectStoreTest` use Testcontainers (Redis, S3Mock, fake-gcs-server) and are skipped without it; also the 4GB-container load check under Testing)
 
 ## Build and Run Commands
 
@@ -54,8 +54,9 @@ mvn test -Dtest=AggregatorTest
 mvn test -Dtest=AggregatorTest#testCountByLevel
 
 # Load tests (tag "load", excluded by default): LargeFileIngestIT ingests a generated file in a JVM capped
-# at 256MB, then archives it to Parquet and reports the compression; SuppressionLatencyIT times 1M
-# suppression decisions (p99 < 1ms)
+# at 256MB, then archives it to Parquet and reports the compression (-Dargus.load.wal-compression=zstd);
+# WalBackpressureIT is T3: the archive store is down while 500MB ingests, so ingest must pause at the
+# WAL watermark, then everything is archived; SuppressionLatencyIT times 1M suppression decisions (p99 < 1ms)
 mvn test -Dgroups=load -DexcludedGroups=none                              # 1GB input
 mvn test -Dgroups=load -DexcludedGroups=none -Dargus.load.input-size=4GB  # needs ~4x input in free disk
 
@@ -88,7 +89,7 @@ java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-proce
 **Controller** (`dev.dinesh.argus.controller`)
 - `LogController` (`/api/v1/logs`): parse, filter, aggregate, export. Synchronous. `/aggregate`, `/aggregateV2`, `/export/*` and `/cli-summary` stream files of any size; `/parse`, `/parse/regexp` and `/filter` return every record and keep the 50MB cap. Needs an API key like v2, and reads only the caller tenant's roots (`log.enforce-allowed-roots=false` only warns, for a migration window). v1 persists nothing. Errors: 400 bad input (`IllegalArgumentException`, e.g. outside the roots, over the size cap or a negative `topN`), 404 missing file, 429 + `Retry-After` when the aggregation slots are busy
 - `SuppressionController` (`/api/v2/suppression`): `POST /check` `{"message"}` → `{"decision":"ALLOW"|"DENY","windowEndsAt","suppressedCount"}`; tenant from the caller's API key (see Tenancy); 400 for a missing or too long message, 401 without a valid key
-- `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` with `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` slots busy), `GET` and `DELETE /jobs/{id}` (401 without a valid key; another tenant's job is 404). Sources, checkpoints, output and jobs are per tenant
+- `IngestController` (`/api/v2/ingest`): streaming ingest of files of any size, as async jobs. `POST /file` with `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern` (202, or 400 / 404 / 409 source busy / 429 + `Retry-After` when the job slots are busy (30s) or the WAL is full (60s)), `GET` and `DELETE /jobs/{id}` (401 without a valid key; another tenant's job is 404). Sources, checkpoints, output and jobs are per tenant
 
 ### Tenancy
 
@@ -111,15 +112,17 @@ Read → parse → write stages in separate threads, connected by bounded queues
 - `pipeline.EnvelopeFactory` turns parsed lines into `LogEnvelope`s: `eventId = UUIDv3(tenant, source, generation, line offset)`, so replays reproduce the same ids; trace/span ids and `service.name` are lifted out of the attributes.
 - Source ids become directory names, so `SourceOffset.requireValidSourceId` limits them to `[A-Za-z0-9._-]`. Ingest paths (v1 and v2, `source.AllowedPaths` via `TenantRoots`) must resolve (after symlinks) under the tenant's roots; the roots are checked before existence, so a 404 never reveals a path outside them.
 
-### Parquet Archive (P2a)
+### Parquet Archive (P2)
 
-`dev.dinesh.argus.archive`, opt-in with `argus.archive.store=filesystem|s3` (default `none`: the NDJSON segments stay the output). With a store, the local segments become the **WAL** ([`P2_PLAN.md`](docs/architecture/P2_PLAN.md) D1): the source checkpoint still advances when a segment is committed locally, and the `Archiver` uploads it afterwards, so an object-store outage never stalls ingest; it only grows the WAL.
+`dev.dinesh.argus.archive`, opt-in with `argus.archive.store=filesystem|s3|gcs` (default `none`: the NDJSON segments stay the output). With a store, the local segments become the **WAL** ([`P2_PLAN.md`](docs/architecture/P2_PLAN.md) D1): the source checkpoint still advances when a segment is committed locally, and the `Archiver` uploads it afterwards, so an object-store outage never stalls ingest; it only grows the WAL.
 - `Archiver` (`SmartLifecycle`, one thread): every `scan-interval`, oldest segment first (`WalSegments`): NDJSON → Parquet in `staging-dir` → `ObjectStore.put` → delete the objects of the copy a replay superseded → delete the WAL segment (or write a `.archived` marker with `delete-after-upload=false`, which keeps NDJSON forever: give the volume its own retention). A store, disk or code failure stops the pass and backs off (`retry-initial` doubling to `retry-max`, then 50–100% of that); the WAL is the retry queue, no Resilience4j. The loop catches `Throwable`, so even an `Error` only backs off. A segment that isn't valid NDJSON is renamed `.unreadable` (kept, not retried). One canonical `Archive segment finished …` line per segment
 - Keys: `<prefix>/tenant=T/dt=YYYY-MM-DD/hour=HH/source=ID/gen=G/FROM-TO.parquet`. A segment becomes one object per run of lines in the same UTC hour (`sink.EventTimePartition`, shared with the WAL's `dt`; lines without an event time stay in the current object; at most 24 objects per segment for out-of-order data), and the objects' byte ranges tile the segment's: deterministic, so a re-upload replaces them
 - `ArchiveIndex` (`root/tenant=T/_archive/source=S/gen=G.json`): the keys of each source's latest archived segment, written before the upload. A replay can change a segment's end and so its partitions; the index names the earlier copy's objects so they're deleted wherever they landed. Only the latest segment of a source can still be replayed
 - `EnvelopeParquetWriter` + `EnvelopeSchema`: ZSTD, snake_case columns, maps as `map<string,string>` (non-string attribute values as JSON text), timestamps in µs (an event time µs can't hold, beyond ±292,000 years, is archived as null and kept in the `argus.timestamp` attribute). **No `event_id` column**: it is a hash of `tenant_id`, `source_id`, `source_generation`, `source_offset`, re-derived with `EnvelopeFactory.eventId(…)`; storing it would triple the archive. Add columns, never rename them
 - `ZstdCodecFactory`: Parquet pages compressed with zstd-jni directly. Parquet's own codec factory builds a Hadoop `Configuration` and needs `hadoop-client-runtime`; with this, only the shaded `hadoop-client-api` is on the class path. Read archives with the same factory (`ParquetReadOptions.withCodecFactory`)
-- `ObjectStore` port (`put` replaces, `list(prefix)`, idempotent `delete`, keys checked by `ObjectKeys`): `FileSystemObjectStore` (PVC: temp file + fsync + rename) and `S3ObjectStore` (AWS SDK v2 async multipart client, 16MB parts; credentials only from the SDK's default chain). Every store must pass `ObjectStoreContractTest`
+- `ObjectStore` port (`put` replaces, `list(prefix)`, idempotent `delete`, keys checked by `ObjectKeys`): `FileSystemObjectStore` (PVC: temp file + fsync + rename), `S3ObjectStore` (AWS SDK v2 async multipart client, 16MB parts; credentials only from the SDK's default chain) and `GcsObjectStore` (the GCS JSON API over `java.net.http`, not `google-cloud-storage`: resumable 16MB chunks; a failed chunk asks the session where it is and resumes, up to 3 times; Application Default Credentials, or `anonymous` for emulators). Every store must pass `ObjectStoreContractTest`
+- **WAL watermarks (P2b, T3):** `WatermarkWalCapacity` (the `sink.WalCapacity` port; only with an archive store) measures pending (not yet archived) WAL bytes. From `argus.wal.high-watermark` × `max-bytes` (80% of 30GB), the pipeline's writer waits before its next segment, so the bounded queues stop the reader (guardrail 2); below the low watermark (60%) it resumes. It measures afresh at each segment boundary, so a job passes the high watermark by at most one segment. Job status shows `paused: WAL_FULL` and `pausedMs`; a paused job can be cancelled; new jobs get 429. Without an archive store, `WalCapacity.UNBOUNDED`: nothing drains the WAL, so `min-free-bytes` stays the only limit
+- **WAL compression:** `argus.sink.local.compression=zstd` writes `START-END.ndjson.zst` (level 1; the frame is closed before the fsync), 10x smaller than NDJSON for 9% of ingest speed; the archiver reads both. A corrupt zstd stream is set aside like invalid NDJSON
 - One archiver per WAL volume; memory is one row group (64MB), disk one segment's staged Parquet files
 
 ### Filter Architecture
@@ -169,7 +172,7 @@ Verified against the code; fix these before or alongside scaling work:
 - **Access-log dates use `Locale.ROOT`** (English `Sep`, as Nginx writes). Local `nginx.log` files generated before this change on an `en_GB` / `en_IN` JVM contain `Sept` and are now rejected; regenerate them with `DataSeeder`.
 - **No multiline framing:** a Java stack trace becomes one record per line (each continuation line is `raw` / `unparsed` unless it matches a format). Logback `%ex` is ignored for the same reason.
 - **Records without an event time** (JSON / kv lines with no timestamp field, or a Logback layout whose `%d` has no date, e.g. `%d{HH:mm:ss.SSS}`, whose time is kept as the `timestamp` attribute) land in `dt=unknown`, and v1's time filters and time buckets skip them.
-- **Archive gaps (P2b):** no native GCS store yet (S3-compatible endpoints only), and no WAL watermarks: if the archive falls behind until the disk is full, new segments fail (`min-free-bytes`) instead of pausing ingest. WAL segments are uncompressed NDJSON (≈4x the input). Segments not yet uploaded are lost if the node's disk is lost.
+- **Archive gaps:** WAL segments not yet uploaded are lost if the node's disk is lost. `compression` defaults to `none` (NDJSON is ≈4x the input; set `zstd` with an archive store). The GCS store is tested against fake-gcs-server and a protocol stub, not real GCS; S3 only against S3Mock. One archiver per WAL volume.
 - **Health is DOWN without Redis:** the Redis health indicator reports DOWN even when the suppression store is `local`.
 - **Redis is only used by the optional Redis suppression store:** `spring.cache.type=redis` is configured, but there is no `@EnableCaching` / `@Cacheable` anywhere.
 - **Suppression is API-only:** no ingest path calls it yet (HTTP push ingest, P3). Redis-mode windows have no end-of-window summary.
@@ -221,8 +224,9 @@ Key properties in `application.properties`:
 - `argus.suppression.*`: `window` (`10s`, at least 1ms), `max-keys` (`100000` windows in the local store), `store` (`local` | `redis`), `template-fingerprint` (`false`)
 - `spring.devtools.*`: LiveReload and restart configuration for local development
 - `argus.ingest.*`: streaming ingest. `batch-max-lines` / `batch-max-bytes` (in-memory unit), `segment-bytes` (commit unit), `raw-queue-capacity` / `parsed-queue-capacity`, `max-line-bytes` (longer lines are truncated and counted), `max-concurrent-jobs`, `allowed-roots`, `checkpoint-dir`, `keep-unparsed` (default `true`)
-- `argus.sink.local.*`: `root` (output volume; the WAL when an archive store is set) and `min-free-bytes` (a new segment fails fast below this)
-- `argus.archive.*`: `store` (`none` | `filesystem` | `s3`), `prefix`, `delete-after-upload` (`true`), `scan-interval` (`10s`), `staging-dir`, `row-group-size` (`64MB`), `retry-initial` / `retry-max` (`1s` / `5m`), `filesystem.root` (must be outside the WAL), `s3.bucket` / `s3.region` / `s3.endpoint` / `s3.path-style` / `s3.checksums` (`when-required` for S3-compatible stores that reject SDK checksums)
+- `argus.sink.local.*`: `root` (output volume; the WAL when an archive store is set), `min-free-bytes` (a new segment fails fast below this) and `compression` (`none` | `zstd`)
+- `argus.wal.*` (only with an archive store): `max-bytes` (`30GB` of pending segments), `high-watermark` (`0.8`: ingest pauses, new jobs get 429), `low-watermark` (`0.6`: ingest resumes)
+- `argus.archive.*`: `store` (`none` | `filesystem` | `s3` | `gcs`), `prefix`, `delete-after-upload` (`true`), `scan-interval` (`10s`), `staging-dir`, `row-group-size` (`64MB`), `retry-initial` / `retry-max` (`1s` / `5m`), `filesystem.root` (must be outside the WAL), `s3.bucket` / `s3.region` / `s3.endpoint` / `s3.path-style` / `s3.checksums` (`when-required` for S3-compatible stores that reject SDK checksums), `gcs.bucket` / `gcs.endpoint` / `gcs.anonymous` (emulators)
 - Runtime data (`./data/` by default) is git-ignored
 
 ## Testing Notes
@@ -235,7 +239,7 @@ Key properties in `application.properties`:
 - Filter tests verify filtering conditions
 - `ArgusWebApplicationTest` starts the full context, so bean wiring and property binding errors fail `mvn test`
 - Ingest tests cover offsets and resume (`FileSourceTest`), crash-safe checkpoints (`FileCheckpointStoreTest`), idempotent segments (`LocalVolumeSinkTest`), backpressure / crash-rerun / cancel (`IngestPipelineTest`), and job slots and path checks (`IngestJobServiceTest`, `IngestControllerTest`)
-- Archive tests: the Parquet round trip (`EnvelopeParquetWriterTest`, read back Hadoop-free via `ParquetTestFiles`), every store against `ObjectStoreContractTest` (`S3ObjectStoreTest` on S3Mock, skipped without Docker), and `ArchiverTest` (keys, delete vs mark, store failures and backoff, superseded copies, a segment replaced mid-upload, unreadable segments) on real WAL segments (`WalFixture`)
+- Archive tests: the Parquet round trip (`EnvelopeParquetWriterTest`, read back Hadoop-free via `ParquetTestFiles`), every store against `ObjectStoreContractTest` (`S3ObjectStoreTest` on S3Mock and `GcsObjectStoreTest` on fake-gcs-server, skipped without Docker; `GcsResumableUploadTest` covers chunk resume against a protocol stub), `WatermarkWalCapacityTest` (hysteresis, cancel while paused), and `ArchiverTest` (keys, delete vs mark, store failures and backoff, superseded copies, a segment replaced mid-upload, unreadable segments) on real WAL segments (`WalFixture`)
 
 ## Common Development Tasks
 
@@ -275,6 +279,7 @@ Key properties in `application.properties`:
 - **Testcontainers** (test, pinned to 1.21.4 for Docker Engine 29+): a real Redis for `RedisSuppressionStoreTest`, S3Mock for `S3ObjectStoreTest` (MinIO no longer publishes images to Docker Hub)
 - **Parquet** (`parquet-hadoop` 1.15, with only the shaded `hadoop-client-api`) and **zstd-jni**: the archive format
 - **AWS SDK v2** (`s3`, async Netty client; the Apache client is excluded): `S3ObjectStore`
+- **google-auth-library-oauth2-http**: Application Default Credentials for `GcsObjectStore` (6MB; `google-cloud-storage` would be 43MB)
 - **Spring DevTools**: Live reload and restart during development
 
 ---
