@@ -6,7 +6,7 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
-### P2b: WAL watermarks, WAL compression and GCS (unmerged)
+### P2b: WAL watermarks, WAL compression and GCS: [#7](https://github.com/DineshKuppan/argus-log-processor/pull/7) (2026-10-28)
 Plan and results: [`P2_PLAN.md`](docs/architecture/P2_PLAN.md) §8, §10.
 
 #### Added

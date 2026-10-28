@@ -13,8 +13,9 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | **P1b** | 10s suppression API, streaming aggregation | ✅ Done (#3) |
 | **Hardening** | API-key tenancy, v1 path restriction | ✅ Done (#4) |
 | **P2a** | Parquet + ZSTD archive to a PVC or S3; local segments become the WAL | ✅ Done (#5) |
-| **P2b** | GCS, WAL watermarks, WAL compression | ✅ Done |
-| **P3** | HTTP push ingest, quotas, export sources, replay lane | ⏭ Next |
+| **P2b** | GCS, WAL watermarks, WAL compression | ✅ Done (#7) |
+| **P3a** | HTTP push ingest, quotas, suppression on push | 🚧 In progress |
+| **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ⏭ Next |
 | **P4** | Live tail, metrics | Planned |
 | **P5** | OpenSearch hot tier, optional Kafka | Planned |
 
@@ -33,7 +34,7 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | T9 | Cost | Cold tier ≤3TiB at 7 years (≥8x compression) | ✅ 14.6x on synthetic data; re-measure on real logs |
 
 ## Next: P3
-Push ingest and tenancy at scale ([`SCALING_DESIGN.md`](docs/architecture/SCALING_DESIGN.md) §12). A STAR plan comes first, as for every phase.
+Push ingest and tenancy at scale. Plan: [`P3_PLAN.md`](docs/architecture/P3_PLAN.md).
 - **`HttpIngestSource`:** NDJSON / gzip batch POST. It returns 429 + `Retry-After` when the WAL is full (the gate P2b added) or a tenant is over quota, and applies suppression on that path.
 - **Quotas:** per-tenant ingest rate, storage and tail connections (a Redis token bucket).
 - **Export sources:** Elasticsearch (PIT + `search_after`) and Coralogix.
@@ -58,4 +59,4 @@ Push ingest and tenancy at scale ([`SCALING_DESIGN.md`](docs/architecture/SCALIN
 - **v1 `/parse`, `/parse/regexp` and `/filter`** still read whole files behind the 50MB cap.
 - **API keys:** static only. There's no rotation API, expiry or identity provider yet.
 - **One archiver per WAL volume.** Several instances sharing one volume isn't supported.
-- **Java 21** before P3, for virtual threads and many concurrent tail connections (ADR-6).
+- **Java 21** before P4, for virtual threads and many concurrent tail connections (ADR-6; P3 stays on 17, [`P3_PLAN.md`](docs/architecture/P3_PLAN.md) D6).

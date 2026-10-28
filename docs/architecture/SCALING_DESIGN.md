@@ -421,7 +421,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **S:** Java 17 (pom).
 - **T:** Throughput and simplicity for I/O-heavy stages.
 - **A:** Stay on 17 (no change) vs. move to 21 LTS (virtual threads, generational ZGC, Spring Boot 3.2+ support).
-  **Choice:** Recommend 21 before P3 (HTTP ingest + many concurrent tail connections). Not required for P0–P2.
+  **Choice:** Recommend 21 before P4 (many concurrent tail connections). Not required for P0–P3: push ingest is ~10 requests/s at the target, far within Tomcat's platform threads, and on 21 virtual threads still pin inside `synchronized`, which the pipeline uses ([`P3_PLAN.md`](P3_PLAN.md) D6).
 - **R:** A tail test with 1,000 concurrent SSE clients stays within the heap budget.
 
 ---
