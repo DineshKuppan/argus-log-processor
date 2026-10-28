@@ -15,8 +15,10 @@ import lombok.extern.slf4j.Slf4j;
  * full once they reach the high watermark, and again free only below the low watermark.
  * Thread-safe; shared by every ingest job.
  *
- * <p>The size is re-measured at most once per {@code refresh}: the WAL holds tens of segments, so a
- * scan is cheap, but every job asks before each segment.
+ * <p>{@link #awaitRoom} measures afresh at each segment boundary, so the WAL passes the high
+ * watermark by at most the segment being written per job; {@link #isFull} (new-job checks) and the
+ * polling while paused reuse a measurement for up to {@code refresh}. A WAL scan is cheap: it holds
+ * tens of segments.
  */
 @Slf4j
 public final class WatermarkWalCapacity implements WalCapacity {
@@ -47,9 +49,14 @@ public final class WatermarkWalCapacity implements WalCapacity {
   }
 
   @Override
-  public synchronized boolean isFull() {
+  public boolean isFull() {
+    return isFull(false);
+  }
+
+  /** {@code fresh}: measure now, ignoring the cached size. */
+  private synchronized boolean isFull(boolean fresh) {
     long now = System.nanoTime();
-    if (!measured || now - measuredAt >= refreshNanos) {
+    if (fresh || !measured || now - measuredAt >= refreshNanos) {
       lastBytes = pendingBytes.getAsLong();
       measuredAt = now;
       measured = true;
@@ -72,7 +79,9 @@ public final class WatermarkWalCapacity implements WalCapacity {
 
   @Override
   public boolean awaitRoom(BooleanSupplier stopping, Consumer<Boolean> paused) {
-    if (!isFull()) {
+    // Fresh at each segment boundary: a cached size from before the last commits could let
+    // another whole segment past the high watermark.
+    if (!isFull(true)) {
       return true;
     }
     paused.accept(true);
