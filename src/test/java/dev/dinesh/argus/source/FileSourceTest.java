@@ -159,6 +159,24 @@ class FileSourceTest {
   }
 
   @Test
+  void anExplicitEndStopsBeforeLaterCompleteLines() throws IOException {
+    // A spool: "c\n" is complete but not yet acknowledged, so it must not be read.
+    Path file = write("a\nb\nc\n");
+    try (FileSource source = FileSource.open(file, "src", linesOnly(100))) {
+      source.startBetween(2, 4);
+
+      RawBatch batch = source.nextBatch();
+      assertEquals(List.of("b"), batch.lines());
+      assertEquals(4, batch.endOffset());
+      assertTrue(batch.lastInSegment());
+      assertEquals(4, source.limit());
+      assertNull(source.nextBatch());
+      assertThrows(IllegalArgumentException.class, () -> source.startBetween(0, 7));
+      assertThrows(IllegalArgumentException.class, () -> source.startBetween(3, 2));
+    }
+  }
+
+  @Test
   void resumingAfterTheWriterFinishesTheLineReadsItWhole() throws IOException {
     Path file = write("a\npartial-wri");
     long end = readAll(file, 0, linesOnly(100)).get(0).endOffset();

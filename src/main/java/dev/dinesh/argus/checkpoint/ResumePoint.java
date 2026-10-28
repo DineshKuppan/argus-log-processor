@@ -27,7 +27,12 @@ public record ResumePoint(long offset, int generation, Reason reason) {
     /**
      * Same inode and large enough, but its first bytes changed: truncated in place, then regrown.
      */
-    FILE_REWRITTEN
+    FILE_REWRITTEN,
+    /**
+     * The source's path is part of its identity (a stream's numbered spool) and it moved to its
+     * next file.
+     */
+    PATH_CHANGED
   }
 
   /**
@@ -37,12 +42,29 @@ public record ResumePoint(long offset, int generation, Reason reason) {
   public static ResumePoint resolve(
       Optional<SourceOffset> checkpoint, FileSource file, boolean fromBeginning)
       throws IOException {
+    return resolve(checkpoint, file, null, fromBeginning);
+  }
+
+  /**
+   * Like {@link #resolve(Optional, FileSource, boolean)}, but {@code identityPath}, when not null,
+   * is also part of the file's identity: a checkpoint for another path restarts from 0 in a new
+   * generation, without relying on inodes (which the filesystem may reuse for the next file).
+   */
+  public static ResumePoint resolve(
+      Optional<SourceOffset> checkpoint,
+      FileSource file,
+      String identityPath,
+      boolean fromBeginning)
+      throws IOException {
     if (checkpoint.isEmpty()) {
       return new ResumePoint(
           0, 0, fromBeginning ? Reason.FROM_BEGINNING_REQUESTED : Reason.NO_CHECKPOINT);
     }
     SourceOffset cp = checkpoint.get();
-    Reason change = changeSince(cp, file);
+    Reason change =
+        identityPath != null && !identityPath.equals(cp.path())
+            ? Reason.PATH_CHANGED
+            : changeSince(cp, file);
     if (change != null) {
       return new ResumePoint(0, cp.generation() + 1, change);
     }

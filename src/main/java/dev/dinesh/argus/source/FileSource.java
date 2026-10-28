@@ -129,7 +129,25 @@ public final class FileSource implements Closeable {
       throw new IllegalArgumentException(
           "Start offset " + startOffset + " is outside file of " + size + " bytes");
     }
-    this.limit = includeUnterminatedLine ? size : endOfLastCompleteLine(startOffset);
+    position(startOffset, includeUnterminatedLine ? size : endOfLastCompleteLine(startOffset));
+  }
+
+  /**
+   * Reads from {@code startOffset} to exactly {@code endOffset}, which the caller guarantees ends a
+   * line (or is the start): for a file that is still being appended to, such as a stream's spool,
+   * whose acknowledged length the caller knows. Bytes past {@code endOffset} are never read, even
+   * complete lines.
+   */
+  public void startBetween(long startOffset, long endOffset) {
+    if (startOffset < 0 || startOffset > endOffset || endOffset > size) {
+      throw new IllegalArgumentException(
+          "Range " + startOffset + "-" + endOffset + " is outside file of " + size + " bytes");
+    }
+    position(startOffset, endOffset);
+  }
+
+  private void position(long startOffset, long endOffset) {
+    this.limit = endOffset;
     this.filePosition = startOffset;
     this.consumed = startOffset;
     this.segmentStart = startOffset;

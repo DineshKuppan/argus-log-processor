@@ -60,9 +60,26 @@ public class IngestPipeline {
    * @param sourceId stable id under which offsets are checkpointed
    * @param fromBeginning ignore any checkpoint and start at byte 0
    * @param parser the source's primary parser, or null to detect it from the file's first lines
+   * @param endOffset read exactly to this offset (a stream spool's acknowledged length), or null to
+   *     read to the file's last newline
+   * @param pathIsIdentity a checkpoint for a different path starts the next generation (a stream's
+   *     numbered spools), rather than resuming when the inode and head match
    */
   public record Request(
-      String tenantId, Path path, String sourceId, boolean fromBeginning, LogParser parser) {}
+      String tenantId,
+      Path path,
+      String sourceId,
+      boolean fromBeginning,
+      LogParser parser,
+      Long endOffset,
+      boolean pathIsIdentity) {
+
+    /** A file: read to its last newline, identified by inode and head. */
+    public Request(
+        String tenantId, Path path, String sourceId, boolean fromBeginning, LogParser parser) {
+      this(tenantId, path, sourceId, fromBeginning, parser, null, false);
+    }
+  }
 
   static final String THREAD_PREFIX = "ingest-";
   private static final long HANDOFF_POLL_MS = 100;
@@ -173,7 +190,10 @@ public class IngestPipeline {
     try {
       ResumePoint resume =
           ResumePoint.resolve(
-              checkpoints.load(request.tenantId(), sourceId), source, request.fromBeginning());
+              checkpoints.load(request.tenantId(), sourceId),
+              source,
+              request.pathIsIdentity() ? path.toString() : null,
+              request.fromBeginning());
       if (FILE_CHANGED.contains(resume.reason())) {
         log.warn(
             "Source {} ({}): {}; restarting from offset 0 as generation {}",
@@ -182,7 +202,11 @@ public class IngestPipeline {
             resume.reason(),
             resume.generation());
       }
-      source.startAt(resume.offset());
+      if (request.endOffset() == null) {
+        source.startAt(resume.offset());
+      } else {
+        source.startBetween(resume.offset(), request.endOffset());
+      }
       int headBytes = (int) Math.min(FileSource.FINGERPRINT_BYTES, source.limit());
       SourceOffset template =
           new SourceOffset(

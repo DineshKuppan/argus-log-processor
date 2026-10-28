@@ -1,5 +1,7 @@
 package dev.dinesh.argus.parser;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -43,6 +45,13 @@ final class Timestamps {
 
   /** Parses an ISO-8601 string, a "yyyy-MM-dd HH:mm:ss" string (UTC) or an epoch number. */
   static Instant parse(Object value) {
+    if (value instanceof Double || value instanceof Float || value instanceof BigDecimal) {
+      try {
+        return fromFractionalEpochSeconds(new BigDecimal(value.toString()));
+      } catch (NumberFormatException | ArithmeticException | DateTimeException e) {
+        return null; // NaN, infinite, or outside Instant's range
+      }
+    }
     if (value instanceof Number n) {
       return fromEpoch(n.longValue());
     }
@@ -71,6 +80,25 @@ final class Timestamps {
     } catch (DateTimeException e) {
       return null;
     }
+  }
+
+  /**
+   * A number with a fraction is epoch seconds (Fluent Bit's {@code date}, Python's {@code
+   * time.time()}), unless it is too large to be seconds; then its integer part is read like any
+   * epoch.
+   */
+  private static Instant fromFractionalEpochSeconds(BigDecimal value) {
+    if (value.abs().compareTo(BigDecimal.valueOf(MAX_EPOCH_SECONDS)) >= 0) {
+      return fromEpoch(value.setScale(0, RoundingMode.FLOOR).longValueExact());
+    }
+    long seconds = value.setScale(0, RoundingMode.FLOOR).longValueExact();
+    long nanos =
+        value
+            .subtract(BigDecimal.valueOf(seconds))
+            .movePointRight(9)
+            .setScale(0, RoundingMode.HALF_UP)
+            .longValue();
+    return Instant.ofEpochSecond(seconds, nanos);
   }
 
   private static Instant fromEpoch(long value) {
