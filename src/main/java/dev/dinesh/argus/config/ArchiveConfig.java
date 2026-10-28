@@ -6,6 +6,8 @@ import dev.dinesh.argus.archive.FileSystemObjectStore;
 import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
 import dev.dinesh.argus.archive.WalSegments;
+import dev.dinesh.argus.archive.WatermarkWalCapacity;
+import dev.dinesh.argus.sink.WalCapacity;
 import java.nio.file.Path;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
@@ -54,6 +56,12 @@ public class ArchiveConfig {
       case S3 -> new S3ObjectStore(s3.getObject(), props.s3().bucket());
       case NONE -> throw new IllegalStateException("No archive store is configured");
     };
+  }
+
+  /** Ingest waits on this before each segment (P2 D7): the archive is what drains the WAL. */
+  @Bean
+  WalCapacity walCapacity(LocalSinkProperties wal, WalProperties limits) {
+    return new WatermarkWalCapacity(new WalSegments(wal.root()), limits);
   }
 
   @Bean

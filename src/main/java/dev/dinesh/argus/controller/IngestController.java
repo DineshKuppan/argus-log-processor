@@ -1,7 +1,7 @@
 package dev.dinesh.argus.controller;
 
 import dev.dinesh.argus.ingest.IngestJobService;
-import dev.dinesh.argus.ingest.IngestJobService.JobSlotsBusyException;
+import dev.dinesh.argus.ingest.IngestJobService.IngestBusyException;
 import dev.dinesh.argus.ingest.IngestJobService.SourceBusyException;
 import dev.dinesh.argus.ingest.IngestJobStatus;
 import dev.dinesh.argus.tenant.CurrentTenant;
@@ -30,8 +30,6 @@ import org.springframework.web.bind.annotation.RestController;
 public class IngestController {
 
   /** Seconds a client should wait before retrying when all job slots are busy. */
-  static final String RETRY_AFTER_SECONDS = "30";
-
   private final IngestJobService jobs;
 
   public IngestController(IngestJobService jobs) {
@@ -100,10 +98,11 @@ public class IngestController {
     return error(HttpStatus.CONFLICT, e.getMessage());
   }
 
-  @ExceptionHandler(JobSlotsBusyException.class)
-  ResponseEntity<Map<String, String>> tooManyRequests(JobSlotsBusyException e) {
+  /** Every job slot is busy, or the WAL is full while the archive catches up. */
+  @ExceptionHandler(IngestBusyException.class)
+  ResponseEntity<Map<String, String>> tooManyRequests(IngestBusyException e) {
     return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-        .header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS)
+        .header(HttpHeaders.RETRY_AFTER, Integer.toString(e.retryAfterSeconds()))
         .body(Map.of("error", e.getMessage()));
   }
 

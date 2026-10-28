@@ -7,6 +7,8 @@ import dev.dinesh.argus.archive.Archiver;
 import dev.dinesh.argus.archive.FileSystemObjectStore;
 import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
+import dev.dinesh.argus.archive.WatermarkWalCapacity;
+import dev.dinesh.argus.sink.WalCapacity;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -21,7 +23,11 @@ class ArchiveConfigTest {
   @TempDir Path dir;
 
   @Configuration
-  @EnableConfigurationProperties({ArchiveProperties.class, LocalSinkProperties.class})
+  @EnableConfigurationProperties({
+    ArchiveProperties.class,
+    LocalSinkProperties.class,
+    WalProperties.class
+  })
   static class Base {
     @Bean
     ObjectMapper mapper() {
@@ -45,6 +51,7 @@ class ArchiveConfigTest {
               assertThat(context).hasNotFailed();
               assertThat(context).doesNotHaveBean(Archiver.class);
               assertThat(context).doesNotHaveBean(ObjectStore.class);
+              assertThat(context).doesNotHaveBean(WalCapacity.class);
             });
   }
 
@@ -71,6 +78,8 @@ class ArchiveConfigTest {
               assertThat(context.getBean(ObjectStore.class))
                   .isInstanceOf(FileSystemObjectStore.class);
               assertThat(context.getBean(Archiver.class).isRunning()).isTrue();
+              assertThat(context.getBean(WalCapacity.class))
+                  .isInstanceOf(WatermarkWalCapacity.class);
               assertThat(context).doesNotHaveBean(S3AsyncClient.class);
             });
   }

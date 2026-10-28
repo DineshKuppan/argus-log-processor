@@ -18,6 +18,7 @@ import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.pipeline.EnvelopeFactory;
 import dev.dinesh.argus.sink.LocalVolumeSink;
 import dev.dinesh.argus.sink.LogSink;
+import dev.dinesh.argus.sink.WalCapacity;
 import dev.dinesh.argus.source.LogBatch;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -28,9 +29,13 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.AfterEach;
@@ -556,5 +561,110 @@ class IngestPipelineTest {
         }
       };
     }
+  }
+
+  /** A WAL gate the test opens and closes. */
+  private static final class SwitchableCapacity implements WalCapacity {
+    final AtomicBoolean full = new AtomicBoolean(true);
+
+    @Override
+    public boolean isFull() {
+      return full.get();
+    }
+
+    @Override
+    public boolean awaitRoom(BooleanSupplier stopping, Consumer<Boolean> paused) {
+      if (!full.get()) {
+        return true;
+      }
+      paused.accept(true);
+      try {
+        while (full.get()) {
+          if (stopping.getAsBoolean()) {
+            return false;
+          }
+          Thread.sleep(5);
+        }
+        return true;
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        return false;
+      } finally {
+        paused.accept(false);
+      }
+    }
+  }
+
+  private static void awaitPaused(IngestProgress progress) throws InterruptedException {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (progress.pauseReason() == null && System.nanoTime() < deadline) {
+      Thread.sleep(5);
+    }
+    assertEquals("WAL_FULL", progress.pauseReason());
+  }
+
+  @Test
+  void aFullWalPausesTheRunWithBoundedReadAheadThenItResumes() throws Exception {
+    Path file = writeLog(2_000);
+    Path out = dir.resolve("out");
+    SwitchableCapacity wal = new SwitchableCapacity();
+    IngestProgress progress = new IngestProgress();
+    IngestPipeline pipeline =
+        new IngestPipeline(
+            PROPS, new ParserRegistry(), localSink(out), checkpoints(dir.resolve("cp")), wal);
+    CompletableFuture<Outcome> run =
+        CompletableFuture.supplyAsync(
+            () -> {
+              try {
+                return pipeline.run(
+                    new Request("default", file, "app", false, null),
+                    progress,
+                    new AtomicBoolean());
+              } catch (Exception e) {
+                throw new RuntimeException(e);
+              }
+            });
+
+    awaitPaused(progress);
+    Thread.sleep(100); // let the reader run as far ahead as the queues allow
+    assertEquals(0, progress.segmentsCommitted());
+    // Raw (2) + parsed (4) queues and one batch in each stage: ~8 batches of 10 lines.
+    assertTrue(progress.lines() <= 100, "parsed " + progress.lines() + " lines while paused");
+    assertTrue(progress.bytesRead() < Files.size(file) / 4, "read " + progress.bytesRead());
+    assertTrue(pipeline.walFull());
+
+    wal.full.set(false);
+
+    assertEquals(Outcome.COMPLETED, run.get(10, TimeUnit.SECONDS));
+    assertEquals(2_000, progress.lines());
+    assertTrue(progress.pausedMs() >= 100, "pausedMs " + progress.pausedMs());
+    assertEquals(null, progress.pauseReason());
+  }
+
+  @Test
+  void aRunPausedOnAFullWalCanBeCancelled() throws Exception {
+    Path file = writeLog(500);
+    SwitchableCapacity wal = new SwitchableCapacity();
+    IngestProgress progress = new IngestProgress();
+    AtomicBoolean cancel = new AtomicBoolean();
+    FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
+    IngestPipeline pipeline =
+        new IngestPipeline(PROPS, new ParserRegistry(), localSink(dir.resolve("out")), cps, wal);
+    CompletableFuture<Outcome> run =
+        CompletableFuture.supplyAsync(
+            () -> {
+              try {
+                return pipeline.run(
+                    new Request("default", file, "app", false, null), progress, cancel);
+              } catch (Exception e) {
+                throw new RuntimeException(e);
+              }
+            });
+
+    awaitPaused(progress);
+    cancel.set(true);
+
+    assertEquals(Outcome.CANCELLED, run.get(10, TimeUnit.SECONDS));
+    assertTrue(cps.load("default", "app").isEmpty());
   }
 }
