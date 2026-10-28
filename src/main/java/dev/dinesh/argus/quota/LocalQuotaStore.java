@@ -47,7 +47,8 @@ public final class LocalQuotaStore implements QuotaStore {
 
     synchronized QuotaDecision tryTake(long amount, long rate, long capacity, long now) {
       if (now > refilledAt) {
-        tokens = Math.min(capacity, tokens + (now - refilledAt) * rate / NANOS_PER_SECOND);
+        // In double: elapsed nanos x rate overflows a long within seconds at GB/s rates.
+        tokens = Math.min(capacity, tokens + (now - refilledAt) / NANOS_PER_SECOND * rate);
         refilledAt = now;
       }
       double needed = Math.min(amount, capacity);

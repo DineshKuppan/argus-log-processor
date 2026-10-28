@@ -62,6 +62,17 @@ class LocalQuotaStoreTest {
   }
 
   @Test
+  void aHighRateRefillsCorrectlyAfterAnIdleGap() {
+    long gigabyte = 1L << 30;
+    assertTrue(store.tryTake("a", 2 * gigabyte, gigabyte, 2 * gigabyte).allowed());
+
+    // 10s x 1GB/s is 1e19 nanos-bytes: past Long.MAX_VALUE if computed in a long.
+    advance(Duration.ofSeconds(10));
+
+    assertTrue(store.tryTake("a", 2 * gigabyte, gigabyte, 2 * gigabyte).allowed());
+  }
+
+  @Test
   void bucketsAreIndependentPerKey() {
     take("acme:quota:ingest", 2000);
 
