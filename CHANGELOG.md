@@ -22,6 +22,8 @@ Plan and results: [`P2_PLAN.md`](docs/architecture/P2_PLAN.md) §8, §10.
 #### Changed
 - The 429 for busy job slots and for a full WAL share `IngestBusyException`; their `Retry-After` values are 30s and 60s.
 - The ingest canonical line gains `pausedMs`.
+- The archive canonical line's `compression` is now source bytes / Parquet bytes (it was WAL bytes / Parquet bytes, which a zstd WAL would skew), and it gains `sourceBytes`.
+- zstd WAL segments carry a content checksum, so a corrupt segment fails to decompress rather than decoding to wrong bytes.
 
 #### Measured
 - **T3, scaled to a 30s outage:** the job paused for 49s and then completed; the WAL peaked within one segment of its high watermark; all 5,381,072 lines were archived; heap peak 219MB.

@@ -11,6 +11,9 @@ import java.util.List;
  */
 public interface ObjectStore {
 
+  /** The media type stores that keep one set it on archived objects. */
+  String PARQUET_CONTENT_TYPE = "application/vnd.apache.parquet";
+
   /** Where the store points, for logs (e.g. {@code s3://bucket}); never contains credentials. */
   String describe();
 

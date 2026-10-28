@@ -42,6 +42,9 @@ public final class WalSegments {
 
   private static final int SEGMENT_DEPTH = 5;
 
+  /** Walks of the WAL tried before {@link #pending} settles for one that raced a delete. */
+  static final int SCAN_ATTEMPTS = 3;
+
   private final Path root;
 
   public WalSegments(Path root) {
@@ -93,34 +96,43 @@ public final class WalSegments {
     }
   }
 
-  /** Committed segments not yet archived, oldest first. */
+  /**
+   * Committed segments not yet archived, oldest first. A walk that races the archiver's deletes is
+   * retried, so the list is complete (the WAL watermarks size it); only after {@value
+   * #SCAN_ATTEMPTS} such races is a partial list returned.
+   */
   public List<Segment> pending() throws IOException {
-    List<Segment> segments = new ArrayList<>();
-    try (Stream<Path> files =
-        Files.find(
-            root,
-            SEGMENT_DEPTH,
-            (path, attrs) -> attrs.isRegularFile() && isSegmentName(path.toString()),
-            new FileVisitOption[0])) {
-      files.forEach(
-          file -> {
-            Segment segment = parse(file);
-            if (segment != null && !Files.exists(marker(segment))) {
-              segments.add(segment);
-            }
-          });
-    } catch (NoSuchFileException e) {
-      return List.of();
-    } catch (UncheckedIOException e) {
-      // A segment deleted while the walk ran; the next scan sees a consistent tree.
-      if (e.getCause() instanceof NoSuchFileException) {
-        log.debug("WAL changed during the scan", e);
-      } else {
-        throw e.getCause();
+    for (int attempt = 1; ; attempt++) {
+      List<Segment> segments = new ArrayList<>();
+      try (Stream<Path> files =
+          Files.find(
+              root,
+              SEGMENT_DEPTH,
+              (path, attrs) -> attrs.isRegularFile() && isSegmentName(path.toString()),
+              new FileVisitOption[0])) {
+        files.forEach(
+            file -> {
+              Segment segment = parse(file);
+              if (segment != null && !Files.exists(marker(segment))) {
+                segments.add(segment);
+              }
+            });
+      } catch (NoSuchFileException e) {
+        return List.of();
+      } catch (UncheckedIOException e) {
+        if (!(e.getCause() instanceof NoSuchFileException)) {
+          throw e.getCause();
+        }
+        // A file or directory deleted while the walk ran.
+        log.debug("WAL changed during the scan (attempt {})", attempt, e);
+        if (attempt < SCAN_ATTEMPTS) {
+          continue;
+        }
       }
+      segments.sort(
+          Comparator.comparing(Segment::modified).thenComparing(s -> s.file().toString()));
+      return segments;
     }
-    segments.sort(Comparator.comparing(Segment::modified).thenComparing(s -> s.file().toString()));
-    return segments;
   }
 
   public boolean exists(Segment segment) {

@@ -28,8 +28,6 @@ import software.amazon.awssdk.services.s3.multipart.MultipartConfiguration;
  */
 public final class S3ObjectStore implements ObjectStore {
 
-  static final String PARQUET_CONTENT_TYPE = "application/vnd.apache.parquet";
-
   /** Files above this go multipart, in parts of this size (S3's minimum part is 5MB). */
   static final long PART_BYTES = 16L * 1024 * 1024;
 

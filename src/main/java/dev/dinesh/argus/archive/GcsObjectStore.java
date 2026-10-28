@@ -102,25 +102,30 @@ public final class GcsObjectStore implements ObjectStore {
       long size = channel.size();
       URI session = startSession(key, size);
       long offset = 0;
-      int failures = 0;
+      int failures = 0; // consecutive, reset by progress
+      boolean resync = false; // after a failure, ask the session where it is before resending
       byte[] chunk = new byte[(int) Math.min(chunkBytes, Math.max(size, 1))];
       while (true) {
         Optional<Long> next;
         try {
-          next = sendChunk(session, channel, chunk, offset, size);
+          next = resync ? status(session, size) : sendChunk(session, channel, chunk, offset, size);
         } catch (IOException e) {
+          // A failed chunk or a failed status query: either way, query again after the pause.
           if (++failures >= MAX_ATTEMPTS) {
             throw new IOException("Upload of " + key + " to " + describe() + " failed", e);
           }
           pause(failures);
-          next = status(session, size);
+          resync = true;
+          continue;
         }
+        boolean answeredStatus = resync;
+        resync = false;
         if (next.isEmpty()) {
           return; // the object is complete
         }
         if (next.get() > offset) {
-          failures = 0; // progress
-        } else if (++failures >= MAX_ATTEMPTS) {
+          failures = 0;
+        } else if (!answeredStatus && ++failures >= MAX_ATTEMPTS) {
           // A session that keeps answering without taking bytes would otherwise loop forever.
           throw new IOException(
               "Upload of " + key + " to " + describe() + " made no progress at byte " + offset);
@@ -171,7 +176,7 @@ public final class GcsObjectStore implements ObjectStore {
                 + encode(bucket)
                 + "/o?uploadType=resumable&name="
                 + encode(key));
-    String metadata = "{\"contentType\":\"" + S3ObjectStore.PARQUET_CONTENT_TYPE + "\"}";
+    String metadata = "{\"contentType\":\"" + ObjectStore.PARQUET_CONTENT_TYPE + "\"}";
     HttpResponse<String> response =
         withRetries(
             "start upload of " + key,
@@ -179,7 +184,7 @@ public final class GcsObjectStore implements ObjectStore {
                 send(
                     request(uri)
                         .header("Content-Type", "application/json; charset=UTF-8")
-                        .header("X-Upload-Content-Type", S3ObjectStore.PARQUET_CONTENT_TYPE)
+                        .header("X-Upload-Content-Type", ObjectStore.PARQUET_CONTENT_TYPE)
                         .header("X-Upload-Content-Length", Long.toString(size))
                         .POST(HttpRequest.BodyPublishers.ofString(metadata)),
                     200));

@@ -386,6 +386,10 @@ public class IngestPipeline {
             // Segment boundary: wait here while the WAL is full. The queues behind this thread
             // then fill and stop the parser and reader, so memory stays bounded (guardrail 2).
             if (!walCapacity.awaitRoom(this::stopping, progress::paused)) {
+              if (Thread.currentThread().isInterrupted()) {
+                // Like takeNext / handOff: an interrupt fails the run, it isn't a cancel.
+                fail(new InterruptedException("Interrupted while waiting for WAL room"));
+              }
               return;
             }
             segment =
@@ -433,13 +437,22 @@ public class IngestPipeline {
 
     void stopAndJoin() throws InterruptedException {
       stop.set(true);
-      for (Thread thread : threads) {
-        thread.join();
-      }
+      // An interrupted writer still waits for the stages (each stops at its next poll) and closes
+      // the source; the interrupt is restored afterwards.
+      boolean interrupted = Thread.interrupted();
       try {
-        source.close();
-      } catch (Exception e) {
-        log.debug("Ignoring close failure for source {}", sourceId, e);
+        for (Thread thread : threads) {
+          thread.join();
+        }
+      } finally {
+        try {
+          source.close();
+        } catch (Exception e) {
+          log.debug("Ignoring close failure for source {}", sourceId, e);
+        }
+        if (interrupted) {
+          Thread.currentThread().interrupt();
+        }
       }
     }
 

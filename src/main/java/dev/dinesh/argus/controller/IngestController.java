@@ -29,7 +29,6 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/v2/ingest")
 public class IngestController {
 
-  /** Seconds a client should wait before retrying when all job slots are busy. */
   private final IngestJobService jobs;
 
   public IngestController(IngestJobService jobs) {

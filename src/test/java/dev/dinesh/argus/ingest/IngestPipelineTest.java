@@ -1,6 +1,8 @@
 package dev.dinesh.argus.ingest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,6 +36,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.stream.IntStream;
@@ -665,6 +668,38 @@ class IngestPipelineTest {
     cancel.set(true);
 
     assertEquals(Outcome.CANCELLED, run.get(10, TimeUnit.SECONDS));
+    assertTrue(cps.load("default", "app").isEmpty());
+  }
+
+  @Test
+  void anInterruptWhilePausedFailsTheRunInsteadOfLookingLikeACancel() throws Exception {
+    Path file = writeLog(500);
+    SwitchableCapacity wal = new SwitchableCapacity();
+    IngestProgress progress = new IngestProgress();
+    FileCheckpointStore cps = checkpoints(dir.resolve("cp"));
+    IngestPipeline pipeline =
+        new IngestPipeline(PROPS, new ParserRegistry(), localSink(dir.resolve("out")), cps, wal);
+    AtomicReference<Throwable> thrown = new AtomicReference<>();
+    Thread runner =
+        new Thread(
+            () -> {
+              try {
+                pipeline.run(
+                    new Request("default", file, "app", false, null),
+                    progress,
+                    new AtomicBoolean());
+              } catch (Throwable t) {
+                thrown.set(t);
+              }
+            });
+    runner.start();
+
+    awaitPaused(progress);
+    runner.interrupt();
+    runner.join(10_000);
+
+    assertFalse(runner.isAlive());
+    assertInstanceOf(InterruptedException.class, thrown.get());
     assertTrue(cps.load("default", "app").isEmpty());
   }
 }

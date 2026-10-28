@@ -308,7 +308,7 @@ argus.archive.gcs.endpoint=              # fake-gcs-server etc.; empty = https:/
 After the fixes: 261 tests pass on a clean checkout (Docker up), and the 1GB load test still archives every row at 14.6x.
 
 ## 10. Results (P2b)
-- **Tests:** 288 pass on a clean checkout (`mvn -P ci test`, Docker up), up from 261 after P2a. New: `WatermarkWalCapacityTest`, `GcsObjectStoreTest` (`ObjectStoreContractTest` on fake-gcs-server), `GcsResumableUploadTest`, plus zstd cases in `LocalVolumeSinkTest` / `WalSegmentsTest` / `ArchiverTest`, the pause/cancel cases in `IngestPipelineTest` and the 429 in `IngestControllerTest`.
+- **Tests:** 291 pass on a clean checkout (`mvn -P ci test`, Docker up), up from 261 after P2a. New: `WatermarkWalCapacityTest`, `GcsObjectStoreTest` (`ObjectStoreContractTest` on fake-gcs-server), `GcsResumableUploadTest`, plus zstd cases in `LocalVolumeSinkTest` / `WalSegmentsTest` / `ArchiverTest`, the pause/cancel cases in `IngestPipelineTest` and the 429 in `IngestControllerTest`.
 - **T3** (`WalBackpressureIT`, tag `load`, scaled down): 500MB access log (5,381,072 lines) in one JVM capped at 256MB; zstd WAL; 25MB source segments; WAL capped at 40MB (high 32MiB, low 24MiB); the store failed every upload for the first 30s.
 
   | Measure | Value |

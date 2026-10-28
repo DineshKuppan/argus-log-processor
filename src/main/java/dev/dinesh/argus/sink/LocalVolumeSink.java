@@ -157,9 +157,7 @@ public class LocalVolumeSink implements LogSink {
       // Closing the streams must not close the channel: commit fsyncs it after the zstd frame (if
       // any) is complete.
       OutputStream file = new KeepOpenOutputStream(Channels.newOutputStream(channel));
-      this.out =
-          new BufferedOutputStream(
-              zstd ? new ZstdOutputStream(file, ZSTD_LEVEL) : file, WRITE_BUFFER_BYTES);
+      this.out = new BufferedOutputStream(zstd ? zstd(file) : file, WRITE_BUFFER_BYTES);
       this.json = writer.createGenerator(out);
       json.disable(JsonGenerator.Feature.AUTO_CLOSE_TARGET);
       // NDJSON: records are separated by the newline written below, not the default space.
@@ -210,13 +208,25 @@ public class LocalVolumeSink implements LogSink {
       return target.toString();
     }
 
+    /**
+     * A content checksum per frame, so a corrupt segment fails to decompress, not decodes wrong.
+     */
+    private static OutputStream zstd(OutputStream file) throws IOException {
+      return new ZstdOutputStream(file, ZSTD_LEVEL).setChecksum(true);
+    }
+
     @Override
     public void abort() {
-      try (channel) {
-        json.close();
-        out.close();
+      try {
+        channel.close();
       } catch (IOException e) {
         log.debug("Ignoring close failure while aborting {}", part, e);
+      }
+      // The channel is closed first, so this writes nothing: it only frees the zstd context.
+      try {
+        out.close();
+      } catch (IOException e) {
+        log.trace("Expected: the aborted segment's channel is closed", e);
       }
       try {
         Files.deleteIfExists(part);

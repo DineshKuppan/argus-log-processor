@@ -40,6 +40,7 @@ class GcsResumableUploadTest {
   private final ByteArrayOutputStream received = new ByteArrayOutputStream();
   private final List<String> ranges = new ArrayList<>();
   private final AtomicInteger failNextChunks = new AtomicInteger();
+  private final AtomicInteger failNextStatus = new AtomicInteger();
   private volatile boolean storeFailedChunks;
   private volatile boolean complete;
 
@@ -73,6 +74,10 @@ class GcsResumableUploadTest {
     byte[] body = exchange.getRequestBody().readAllBytes();
     ranges.add(range);
     if (range.startsWith("bytes */")) {
+      if (failNextStatus.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+        respond(exchange, 503);
+        return;
+      }
       // A status query; with every byte received it completes the upload (as for an empty file).
       if (received.size() == Long.parseLong(range.substring("bytes */".length()))) {
         complete = true;
@@ -157,6 +162,27 @@ class GcsResumableUploadTest {
     store().put("k", file);
 
     // The server asserts every chunk starts where it is; the bytes are not duplicated.
+    assertArrayEquals(Files.readAllBytes(file), received.toByteArray());
+  }
+
+  @Test
+  void aChunkIsSentUpToMaxAttemptsTimes() throws Exception {
+    Path file = file(CHUNK);
+    failNextChunks.set(GcsObjectStore.MAX_ATTEMPTS - 1);
+
+    store().put("k", file);
+
+    assertArrayEquals(Files.readAllBytes(file), received.toByteArray());
+  }
+
+  @Test
+  void aFailedStatusQueryIsRetried() throws Exception {
+    Path file = file(2 * CHUNK);
+    failNextChunks.set(1);
+    failNextStatus.set(1);
+
+    store().put("k", file);
+
     assertArrayEquals(Files.readAllBytes(file), received.toByteArray());
   }
 

@@ -73,4 +73,4 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | OpenAPI | Swagger UI at `/swagger-ui.html`, with the API-key scheme declared |
 | Actuator | `/actuator/health` and the other Spring Boot endpoints |
 | Test data | `DataSeeder` streams a reproducible Nginx log of any size to disk |
-| Tests | 288 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3 and GCS, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions) |
+| Tests | 291 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3 and GCS, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions) |

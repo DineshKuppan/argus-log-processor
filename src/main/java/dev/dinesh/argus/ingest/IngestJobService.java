@@ -96,15 +96,21 @@ public class IngestJobService {
 
   /** Thrown when every job slot is busy. */
   public static class JobSlotsBusyException extends IngestBusyException {
+    /** About how long a job slot takes to free up. */
+    static final int RETRY_AFTER_SECONDS = 30;
+
     JobSlotsBusyException(int slots) {
-      super("All " + slots + " ingest job slots are busy; retry later", 30);
+      super("All " + slots + " ingest job slots are busy; retry later", RETRY_AFTER_SECONDS);
     }
   }
 
   /** Thrown while the WAL is above its high watermark: the archive is behind (P2 D7). */
   public static class WalFullException extends IngestBusyException {
+    /** Longer than for busy slots: the archive must drain a fifth of the WAL first. */
+    static final int RETRY_AFTER_SECONDS = 60;
+
     WalFullException() {
-      super("The WAL is full while the archive catches up; retry later", 60);
+      super("The WAL is full while the archive catches up; retry later", RETRY_AFTER_SECONDS);
     }
   }
 

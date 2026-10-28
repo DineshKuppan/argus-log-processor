@@ -279,11 +279,13 @@ public class Archiver implements SmartLifecycle {
         }
       }
       long totalNanos = System.nanoTime() - started;
-      // Canonical line: one per segment, whatever the outcome.
+      // Canonical line: one per segment, whatever the outcome. compression is against the source
+      // bytes the segment covers, so it doesn't depend on whether the WAL is compressed.
+      long sourceBytes = segment.endOffset() - segment.startOffset();
       log.info(
           "Archive segment finished tenant={} source={} generation={} startOffset={}"
-              + " endOffset={} outcome={} objects={} keys={} rows={} walBytes={} parquetBytes={}"
-              + " compression={} convertMs={} uploadMs={} error={}",
+              + " endOffset={} outcome={} objects={} keys={} rows={} sourceBytes={} walBytes={}"
+              + " parquetBytes={} compression={} convertMs={} uploadMs={} error={}",
           segment.tenantId(),
           segment.sourceId(),
           segment.generation(),
@@ -293,9 +295,10 @@ public class Archiver implements SmartLifecycle {
           parts.size(),
           parts.stream().map(p -> p.key).toList(),
           rows,
+          sourceBytes,
           walBytes,
           parquetBytes,
-          parquetBytes > 0 ? String.format("%.1f", (double) walBytes / parquetBytes) : null,
+          parquetBytes > 0 ? String.format("%.1f", (double) sourceBytes / parquetBytes) : null,
           TimeUnit.NANOSECONDS.toMillis(convertNanos),
           convertNanos > 0 ? TimeUnit.NANOSECONDS.toMillis(totalNanos - convertNanos) : 0,
           error == null ? null : error.getClass().getSimpleName() + ": " + error.getMessage());

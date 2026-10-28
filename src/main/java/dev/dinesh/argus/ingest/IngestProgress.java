@@ -22,9 +22,10 @@ public final class IngestProgress {
   private volatile String resumeReason;
   private volatile String format;
   private volatile String formatSource;
-  private final AtomicLong pausedNanos = new AtomicLong();
-  private volatile long pausedSince;
-  private volatile boolean paused;
+  // Guarded by this: the writer resumes while the job API reads, and a wait must count once.
+  private long pausedNanos;
+  private long pausedSince;
+  private boolean paused;
 
   void started(long offset, long total, String reason) {
     startOffset.set(offset);
@@ -52,24 +53,24 @@ public final class IngestProgress {
   }
 
   /** The writer waits for WAL room ({@code true}) or resumes ({@code false}). */
-  void paused(boolean nowPaused) {
+  synchronized void paused(boolean nowPaused) {
     if (nowPaused) {
       pausedSince = System.nanoTime();
       paused = true;
     } else if (paused) {
-      pausedNanos.addAndGet(System.nanoTime() - pausedSince);
+      pausedNanos += System.nanoTime() - pausedSince;
       paused = false;
     }
   }
 
   /** Why the run is waiting right now, or null if it isn't. */
-  public String pauseReason() {
+  public synchronized String pauseReason() {
     return paused ? "WAL_FULL" : null;
   }
 
   /** Time spent waiting for WAL room, including a wait in progress. */
-  public long pausedMs() {
-    long nanos = pausedNanos.get();
+  public synchronized long pausedMs() {
+    long nanos = pausedNanos;
     if (paused) {
       nanos += System.nanoTime() - pausedSince;
     }
