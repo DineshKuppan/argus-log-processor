@@ -114,7 +114,6 @@ Today v2 ingest writes NDJSON segments to a local volume and stops there. The ou
 Parquet schema (snake_case names, which Athena and BigQuery handle without quoting):
 ```
 message log_envelope {
-  required binary event_id (STRING);
   required binary tenant_id (STRING);
   optional int64  timestamp (TIMESTAMP(MICROS,true));          // event time; µs precision
   required int64  observed_timestamp (TIMESTAMP(MICROS,true));
@@ -131,6 +130,7 @@ message log_envelope {
   optional binary source_format (STRING);
 }
 ```
+- **No `event_id` column** (decided while measuring T9, §9): `eventId` is `UUIDv3(tenant, source, generation, offset)`, all four of which are columns. As a 36-character random-looking string it was 20.5 of 27.2 bytes per row. Readers re-derive it with `EnvelopeFactory.eventId(tenant, source, generation, offset)`; the four columns are the row's unique key. A column can be added later if a query engine needs it; removing one later would break queries.
 - Attribute values that aren't strings (numbers, booleans, nested JSON) are stored as their JSON text, so the column type stays a fixed `map<string,string>`.
 - Timestamps are truncated to microseconds: the precision Athena and BigQuery support. CRI timestamps carry nanoseconds; they keep them in the WAL only.
 
@@ -189,4 +189,24 @@ argus.archive.s3.path-style=false
 - **Tests:** T3 as a test: a store that fails for N seconds while a large file ingests. Checks: heap stays bounded, ingest pauses at the watermark, and everything is archived once the store recovers.
 
 ## 9. Results (P2a)
-_Filled in after implementation._
+- **Tests:** 255 pass on a clean checkout (`mvn -P ci test`, Docker up), up from 216 after hardening. New: `EnvelopeParquetWriterTest`, `ObjectStoreContractTest` (filesystem + S3 on S3Mock), `WalSegmentsTest`, `ArchiverTest`, `ArchivePropertiesTest`, `ArchiveConfigTest`; `ArgusWebApplicationTest` checks that no archiver runs by default.
+- **T9 / load** (`LargeFileIngestIT`, 1GB synthetic access log, one JVM capped at 256MB, filesystem store, `row-group-size=64MB`):
+
+  | Measure | Value |
+  |---|---|
+  | Lines ingested = rows archived | 11,020,561 |
+  | Ingest | 25.0s, 440k lines/s, peak heap 200MB |
+  | Archive (convert + upload, one thread) | 51.3s, 215k lines/s (≈52x the 4,150 lines/s peak target), peak heap 200MB |
+  | WAL (NDJSON) | 4.45GB (4.1x the input); 0 bytes left after archiving |
+  | Parquet | 73.4MB: **14.6x smaller than the input**, 60x smaller than the WAL |
+
+  - The first run stored `event_id`: 300MB, only 3.6x. Column sizes showed `event_id` at 20.5 of 27.2 bytes per row, so it was dropped (§3).
+  - `DataSeeder` draws from a small vocabulary (a few paths, IPs and user agents), so real logs compress less. T9 needs re-measuring on a real sample day.
+- **Real app** (one key for tenant `acme`, S3 store on S3Mock, `prefix=argus/dev`):
+  - Ingesting `app.json` (3.5MB, 25,000 lines) gave one object, `argus/dev/tenant=acme/dt=2025-09-19/hour=22/source=app/gen=0/0-3488211.parquet` (286KB), and an empty WAL. One canonical line each for ingest and archive.
+  - **Outage:** with S3 stopped, a second ingest still completed. Its segment stayed in the WAL and the archiver backed off (3.8s, 7.9s, … 44s). S3Mock lost its bucket on restart (it keeps data in memory), so retries failed with `NoSuchBucket` until the bucket was recreated. The next retry then archived the segment and emptied the WAL.
+- **Deviations from §1–§6:**
+  - `ZstdCodecFactory` (D2): without it Parquet needs `hadoop-client-runtime`.
+  - No `event_id` column (§3).
+  - S3Mock instead of MinIO for tests: MinIO's images are no longer on Docker Hub.
+  - `WalSegments` doesn't prune empty directories: that could race ingest creating the same directory.

@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). P2–P5 are design only. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2a implemented** (Parquet + ZSTD archive to a filesystem/PVC or S3, the local segments as WAL; see [`P2_PLAN.md`](P2_PLAN.md)). P2b–P5 are design only. Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents
@@ -401,6 +401,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **A:** Parquet (broadest engine support: Athena, BigQuery, Spark, DuckDB) vs. ORC (good compression, weaker BigQuery and tooling support) vs. compressed NDJSON (simple, but no column pruning).
   **Choice:** Parquet + ZSTD.
 - **R:** Compression ratio ≥8x on a sample day; an Athena query over one column scans ≤15% of the bytes of the equivalent NDJSON.
+  **Measured (P2a, synthetic access logs):** 14.6x vs the raw input and 60x vs the NDJSON WAL, after dropping the derivable `event_id` column (3.6x with it). Real logs have more varied text, so re-measure on a real sample day.
 
 ### ADR-4: Hot-tier tenancy layout
 - **S:** No tenancy.
