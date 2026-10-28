@@ -59,13 +59,17 @@ Today v2 ingest writes NDJSON segments to a local volume and stops there. The ou
 ### D3. Archive layout and naming
 - **Action:** each object's key is derived from the WAL segment's path, following the layout in §3 of the design doc:
   ```
-  <prefix>/tenant=T/dt=YYYY-MM-DD/hour=HH/source=ID/gen=G/START-END.parquet
+  <prefix>/tenant=T/dt=YYYY-MM-DD/hour=HH/source=ID/gen=G/FROM-TO.parquet
   ```
-  - `dt` and `hour` come from the segment's first record with a timestamp. If no record has one, the path is `dt=unknown/hour=unknown`.
-  - A re-upload of the same segment goes to the same key, so it replaces the earlier object.
+  - **One object per hour of data** (changed after review): a 500MB segment covers about 1.2 hours at 10GB/day, so taking `dt`/`hour` from its first record alone would put later rows in the wrong partition, and `WHERE hour='13'` would miss them. The archiver starts a new object whenever a line's UTC hour differs from the current object's.
+    - Lines without an event time stay in the current object. An object of only such lines is `dt=unknown/hour=unknown`.
+    - `FROM-TO` is the object's byte range: from its first line to the next object's first line. The ranges tile the segment's, so names stay deterministic.
+    - Out-of-order data is split into at most 24 objects per segment; the rest of the segment then stays in the last one.
+  - A re-upload of the same segment goes to the same keys, so it replaces the earlier objects.
   - **Superseded segments:** a crashed run can commit a segment that the next run re-commits from the same start offset with a different end, because the file grew in between. `LocalVolumeSink` already replaces such a segment in the WAL. The archiver mirrors that:
-    - After uploading `START-END`, it deletes any other object under `gen=G/START-*` in the same directory.
-    - Before deleting a WAL segment, it checks the segment still exists. If ingest replaced it during the upload, the archiver deletes the object it just uploaded, and the next scan uploads the replacement.
+    - The replacement can land in other partitions (e.g. `dt=unknown` before, a real day after), so the earlier copy's keys can't be found by listing a directory. `ArchiveIndex` records the keys of each source's latest archived segment, before the upload (so a crash mid-upload still leaves them recorded). Archiving the replacement deletes the recorded keys it doesn't overwrite.
+    - Only the latest segment of a source needs recording: ingest checkpoints each segment before writing the next, so only the last committed one can be replayed.
+    - Before deleting a WAL segment, it checks the segment still exists. If ingest replaced it during the upload, it stops; the replacement's upload cleans up through the index.
 - **Result:** at-least-once delivery without duplicate objects. Athena and BigQuery can prune by `tenant`, `dt` and `hour`, using Hive partitioning.
 
 ### D4. Retries: the WAL is the retry queue; no Resilience4j
@@ -107,6 +111,7 @@ Today v2 ingest writes NDJSON segments to a local volume and stops there. The ou
 | `ObjectStore` | `archive` | Port: `put(key, Path file)`, `list(prefix)`, `delete(key)`, `name()`. Keys use `/` and are relative to the store's prefix |
 | `FileSystemObjectStore` | `archive` | A directory (PVC): write to a temp file + fsync + atomic rename (`DurableFiles`) |
 | `S3ObjectStore` | `archive` | AWS SDK v2 `S3AsyncClient` with multipart enabled. Configurable endpoint and path-style access (MinIO; GCS interop untested). Credentials from the SDK's default chain, never from properties |
+| `ArchiveIndex` | `archive` | The keys of each source's latest archived segment (D3), at `root/tenant=T/_archive/source=S/gen=G.json` |
 | `WalSegments` | `archive` | Lists committed segments (`tenant=*/dt=*/source=*/gen=*/*.ndjson`, skipping `_staging` and `.archived` ones), oldest first by modification time; maps a segment path to its archive key. Empty directories are left in place: pruning them could race ingest creating the same directory for its next commit |
 | `Archiver` | `archive` | One worker thread with lifecycle (`SmartLifecycle`): scan every `scan-interval`, convert → upload → delete superseded siblings → delete or mark the WAL segment; backoff (D4); one canonical line per segment |
 | `ArchiveProperties`, `ArchiveConfig` | `config` | `argus.archive.*`; builds the configured `ObjectStore`; refuses a filesystem store inside the WAL root |
@@ -196,7 +201,7 @@ argus.archive.s3.path-style=false
   |---|---|
   | Lines ingested = rows archived | 11,020,561 |
   | Ingest | 25.0s, 440k lines/s, peak heap 200MB |
-  | Archive (convert + upload, one thread) | 51.3s, 215k lines/s (≈52x the 4,150 lines/s peak target), peak heap 200MB |
+  | Archive (convert + upload, one thread) | 51–62s, 177–215k lines/s (≥42x the 4,150 lines/s peak target), peak heap ≤202MB |
   | WAL (NDJSON) | 4.45GB (4.1x the input); 0 bytes left after archiving |
   | Parquet | 73.4MB: **14.6x smaller than the input**, 60x smaller than the WAL |
 
@@ -210,3 +215,20 @@ argus.archive.s3.path-style=false
   - No `event_id` column (§3).
   - S3Mock instead of MinIO for tests: MinIO's images are no longer on Docker Hub.
   - `WalSegments` doesn't prune empty directories: that could race ingest creating the same directory.
+
+### Review fixes (`/code-review high`)
+| # | Finding | Fix |
+|---|---|---|
+| 1 | An `Error` (e.g. zstd's native library failing to load) ended the archive loop silently while `isRunning()` stayed true | The loop catches `Throwable`, logs it and backs off; the canonical line records it |
+| 2 | One event time beyond ±292,000 years overflowed the µs conversion, so its segment failed forever | Archived with a null `timestamp`, the original kept in `argus.timestamp` |
+| 3 | `dt`/`hour` came from a segment's first line, though a segment spans ~1.2h | One object per hour of data, at most 24 per segment (D3) |
+| 4 | A failing staging disk was reported as unreadable data, and every segment was converted and failed in turn | Only invalid NDJSON counts as unreadable; disk, store and code failures stop the pass and back off |
+| 5 | A replay whose partitions changed (e.g. `dt=unknown` → a real day) left the earlier copy's objects in place | `ArchiveIndex` names the earlier copy's keys wherever they landed |
+| 6 | `argus.archive.store=` (blank) failed startup | Blank means `none` |
+| 7 | The WAL's and the archive's day rule were two copies | `sink.EventTimePartition` |
+| 8 | The backoff doc said ±50% jitter | It's 50–100% of the base; doc fixed |
+| — | Truly invalid segments were retried forever | Renamed `.unreadable`, kept, not retried |
+| — | Replays left orphan `.archived` markers | `LocalVolumeSink` removes the replaced copy's markers too |
+| — | Guardrail 4 ("object prefix starts with the tenant") vs `argus.archive.prefix` | Guardrail 4 allows one fixed deployment prefix shared by all tenants |
+
+After the fixes: 261 tests pass on a clean checkout (Docker up), and the 1GB load test still archives every row at 14.6x.

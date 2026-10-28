@@ -166,16 +166,21 @@ class EnvelopeParquetWriterTest {
   }
 
   @Test
-  void reportsTheFirstEventTimeSkippingRecordsWithout() throws IOException {
-    Path file = dir.resolve("t.parquet");
-    Instant first = Instant.parse("2025-10-09T01:11:40Z");
-    try (EnvelopeParquetWriter writer = EnvelopeParquetWriter.open(file, ROW_GROUP, mapper)) {
-      writer.write(envelope(null, null, null));
-      assertNull(writer.firstTimestamp());
-      writer.write(envelope(first, null, null));
-      writer.write(envelope(first.plusSeconds(3600), null, null));
-      assertEquals(first, writer.firstTimestamp());
-    }
+  void anEventTimeMicrosecondsCannotHoldIsArchivedAsNullAndKeptAsAnAttribute() throws IOException {
+    // A JSON line's epoch -10^13 parses, but is ~317,000 years before 1970.
+    Instant extreme = Instant.ofEpochSecond(-10_000_000_000_000L);
+    LogEnvelope envelope = envelope(extreme, Map.of("k", "v"), null);
+
+    assertNull(EnvelopeParquetWriter.archivedTimestamp(envelope));
+    Group row = writeAndRead(envelope).get(0);
+
+    assertEquals(0, row.getFieldRepetitionCount(EnvelopeSchema.TIMESTAMP));
+    assertEquals(
+        Map.of(
+            "k", "v", EnvelopeParquetWriter.UNARCHIVABLE_TIMESTAMP_ATTRIBUTE, extreme.toString()),
+        map(row, EnvelopeSchema.ATTRIBUTES));
+    Instant normal = Instant.parse("2025-10-09T01:11:40Z");
+    assertEquals(normal, EnvelopeParquetWriter.archivedTimestamp(envelope(normal, null, null)));
   }
 
   @Test

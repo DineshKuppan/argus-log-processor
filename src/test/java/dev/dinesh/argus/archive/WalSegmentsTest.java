@@ -49,16 +49,25 @@ class WalSegmentsTest {
   }
 
   @Test
-  void archiveKeysFollowTheFirstEventTimeInUtc() {
+  void archiveKeysFollowTheEventTimeInUtcAndTheObjectsByteRange() {
     Segment segment = new Segment(root, "acme", "app", 3, 100, 250, FileTime.from(T));
 
     assertEquals(
-        "tenant=acme/dt=2025-10-09/hour=03/source=app/gen=3/100-250.parquet",
-        segment.archiveKey(T));
+        "tenant=acme/dt=2025-10-09/hour=03/source=app/gen=3/100-180.parquet",
+        segment.archiveKey(T, 100, 180));
     assertEquals(
-        "tenant=acme/dt=unknown/hour=unknown/source=app/gen=3/100-250.parquet",
-        segment.archiveKey(null));
-    assertEquals(
-        "tenant=acme/dt=2025-10-09/hour=03/source=app/gen=3/100-", segment.supersededPrefix(T));
+        "tenant=acme/dt=unknown/hour=unknown/source=app/gen=3/180-250.parquet",
+        segment.archiveKey(null, 180, 250));
+  }
+
+  @Test
+  void aQuarantinedSegmentIsKeptButNoLongerPending() throws Exception {
+    Path file = new WalFixture(root).segment("acme", "app", 0, 0, 1, T);
+    WalSegments wal = new WalSegments(root);
+
+    Path kept = wal.quarantine(wal.pending().get(0));
+
+    assertEquals(Path.of(file + WalSegments.UNREADABLE_SUFFIX), kept);
+    assertEquals(List.of(), wal.pending());
   }
 }

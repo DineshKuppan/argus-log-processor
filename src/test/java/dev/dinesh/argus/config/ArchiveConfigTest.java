@@ -49,6 +49,17 @@ class ArchiveConfigTest {
   }
 
   @Test
+  void aBlankStoreMeansNoArchiveToo() {
+    runner()
+        .withPropertyValues("argus.archive.store=")
+        .run(
+            context -> {
+              assertThat(context).hasNotFailed();
+              assertThat(context).doesNotHaveBean(Archiver.class);
+            });
+  }
+
+  @Test
   void aFilesystemStoreStartsTheArchiver() {
     runner()
         .withPropertyValues(

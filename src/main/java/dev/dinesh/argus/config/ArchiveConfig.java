@@ -15,11 +15,14 @@ import org.springframework.context.annotation.Configuration;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 
 /**
- * Wires the archive chosen by {@code argus.archive.store}. With {@code none} (the default) nothing
- * here is created, and the local NDJSON segments stay the output, as before P2.
+ * Wires the archive chosen by {@code argus.archive.store}. With {@code none}, a blank value or no
+ * value (the default) nothing here is created, and the local NDJSON segments stay the output, as
+ * before P2. Blank must mean none here because {@link ArchiveProperties} binds it to {@code NONE}.
  */
 @Configuration
-@ConditionalOnExpression("!'${argus.archive.store:none}'.equalsIgnoreCase('none')")
+@ConditionalOnExpression(
+    "!'${argus.archive.store:none}'.trim().isEmpty()"
+        + " && !'${argus.archive.store:none}'.trim().equalsIgnoreCase('none')")
 public class ArchiveConfig {
 
   /** Closed by Spring on shutdown (inferred {@code close()}). */

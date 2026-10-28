@@ -9,6 +9,8 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import org.apache.parquet.conf.ParquetConfiguration;
 import org.apache.parquet.conf.PlainParquetConfiguration;
@@ -34,8 +36,18 @@ public final class EnvelopeParquetWriter implements Closeable {
   private static final ZstdCodecFactory CODECS =
       new ZstdCodecFactory(ZstdCodecFactory.DEFAULT_LEVEL);
 
+  /**
+   * Attribute that keeps an event time the {@code timestamp} column can't hold (beyond ±292,000
+   * years in microseconds), so such a line is archived with a null timestamp instead of failing.
+   */
+  public static final String UNARCHIVABLE_TIMESTAMP_ATTRIBUTE = "argus.timestamp";
+
+  private static final Instant MIN_MICROS =
+      Instant.EPOCH.plus(Long.MIN_VALUE / 1_000_000 + 1, ChronoUnit.SECONDS);
+  private static final Instant MAX_MICROS =
+      Instant.EPOCH.plus(Long.MAX_VALUE / 1_000_000 - 1, ChronoUnit.SECONDS);
+
   private final ParquetWriter<LogEnvelope> writer;
-  private Instant firstTimestamp;
   private long rows;
 
   private EnvelopeParquetWriter(ParquetWriter<LogEnvelope> writer) {
@@ -57,16 +69,18 @@ public final class EnvelopeParquetWriter implements Closeable {
   }
 
   public void write(LogEnvelope envelope) throws IOException {
-    if (firstTimestamp == null) {
-      firstTimestamp = envelope.timestamp();
-    }
     writer.write(envelope);
     rows++;
   }
 
-  /** Event time of the first record that has one; null if none has. */
-  public Instant firstTimestamp() {
-    return firstTimestamp;
+  /**
+   * The event time as the archive stores it: null when there is none or when the {@code timestamp}
+   * column can't hold it. Partitions use this too, so a row's {@code dt}/{@code hour} always
+   * matches its column.
+   */
+  public static Instant archivedTimestamp(LogEnvelope envelope) {
+    Instant t = envelope.timestamp();
+    return t == null || t.isBefore(MIN_MICROS) || t.isAfter(MAX_MICROS) ? null : t;
   }
 
   public long rows() {
@@ -138,10 +152,16 @@ public final class EnvelopeParquetWriter implements Closeable {
     @Override
     public void write(LogEnvelope e) {
       LogEnvelope.Source source = e.source();
+      Instant timestamp = archivedTimestamp(e);
+      Map<String, Object> attributes = e.attributes();
+      if (timestamp == null && e.timestamp() != null) {
+        attributes = new LinkedHashMap<>(attributes != null ? attributes : Map.of());
+        attributes.put(UNARCHIVABLE_TIMESTAMP_ATTRIBUTE, e.timestamp().toString());
+      }
       out.startMessage();
       string(EnvelopeSchema.TENANT_ID, e.tenantId());
-      if (e.timestamp() != null) {
-        int64(EnvelopeSchema.TIMESTAMP, micros(e.timestamp()));
+      if (timestamp != null) {
+        int64(EnvelopeSchema.TIMESTAMP, micros(timestamp));
       }
       int64(EnvelopeSchema.OBSERVED_TIMESTAMP, micros(e.observedTimestamp()));
       string(EnvelopeSchema.SEVERITY_TEXT, e.severityText());
@@ -150,7 +170,7 @@ public final class EnvelopeParquetWriter implements Closeable {
       string(EnvelopeSchema.TRACE_ID, e.traceId());
       string(EnvelopeSchema.SPAN_ID, e.spanId());
       map(EnvelopeSchema.RESOURCE, e.resource());
-      map(EnvelopeSchema.ATTRIBUTES, e.attributes());
+      map(EnvelopeSchema.ATTRIBUTES, attributes);
       string(EnvelopeSchema.SOURCE_ID, source.id());
       int32(EnvelopeSchema.SOURCE_GENERATION, source.generation());
       int64(EnvelopeSchema.SOURCE_OFFSET, source.offset());

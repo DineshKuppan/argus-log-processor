@@ -1,5 +1,8 @@
 package dev.dinesh.argus.archive;
 
+import dev.dinesh.argus.sink.EventTimePartition;
+import dev.dinesh.argus.tenant.TenantIds;
+import dev.dinesh.argus.utils.DurableFiles;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.FileVisitOption;
@@ -8,8 +11,6 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.time.Instant;
-import java.time.ZoneOffset;
-import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -28,12 +29,16 @@ public final class WalSegments {
 
   static final String ARCHIVED_SUFFIX = ".archived";
 
+  /**
+   * A segment that can't be parsed is renamed with this suffix: kept for inspection, not retried.
+   */
+  static final String UNREADABLE_SUFFIX = ".unreadable";
+
   /** {@code tenant=T/dt=D/source=S/gen=G/START-END.ndjson}, as LocalVolumeSink names segments. */
   private static final Pattern SEGMENT =
       Pattern.compile("tenant=([^/]+)/dt=[^/]+/source=([^/]+)/gen=(\\d+)/(\\d+)-(\\d+)\\.ndjson");
 
   private static final int SEGMENT_DEPTH = 5;
-  private static final String UNKNOWN = "unknown";
 
   private final Path root;
 
@@ -56,43 +61,27 @@ public final class WalSegments {
       FileTime modified) {
 
     /**
-     * Where the segment is archived, relative to the store's prefix: {@code
-     * tenant=T/dt=D/hour=H/source=S/gen=G/START-END.parquet}. {@code dt} and {@code hour} come from
-     * the first event time in the segment, as the WAL's {@code dt} does, so a replay lands on the
-     * same key.
+     * Key of the archived object holding this segment's lines from byte {@code from} up to {@code
+     * to}: {@code tenant=T/dt=D/hour=H/source=S/gen=G/FROM-TO.parquet}. A segment whose lines span
+     * several hours becomes several objects whose ranges tile {@code [startOffset, endOffset)}, so
+     * names stay offset-derived and a re-upload replaces, never duplicates.
+     *
+     * @param eventTime decides {@code dt}/{@code hour} ({@link EventTimePartition}); null for
+     *     {@code unknown}
      */
-    public String archiveKey(Instant firstTimestamp) {
-      return archiveDirectory(firstTimestamp) + startOffset + "-" + endOffset + ".parquet";
-    }
-
-    /**
-     * Prefix of every archived object starting at this segment's offset: earlier copies a replay
-     * superseded (same start, a different end). The trailing {@code -} keeps {@code 1-} from
-     * matching {@code 10-}.
-     */
-    public String supersededPrefix(Instant firstTimestamp) {
-      return archiveDirectory(firstTimestamp) + startOffset + "-";
-    }
-
-    private String archiveDirectory(Instant firstTimestamp) {
-      String day = UNKNOWN;
-      String hour = UNKNOWN;
-      if (firstTimestamp != null) {
-        ZonedDateTime utc = firstTimestamp.atZone(ZoneOffset.UTC);
-        day = utc.toLocalDate().toString();
-        hour = String.format("%02d", utc.getHour());
-      }
-      return "tenant="
-          + tenantId
-          + "/dt="
-          + day
-          + "/hour="
-          + hour
+    public String archiveKey(Instant eventTime, long from, long to) {
+      return TenantIds.pathSegment(tenantId)
+          + "/"
+          + EventTimePartition.dayAndHour(eventTime)
           + "/source="
           + sourceId
           + "/gen="
           + generation
-          + "/";
+          + "/"
+          + from
+          + "-"
+          + to
+          + ".parquet";
     }
   }
 
@@ -141,6 +130,13 @@ public final class WalSegments {
     if (!Files.exists(marker)) {
       Files.createFile(marker);
     }
+  }
+
+  /** Takes a segment that can't be parsed out of the WAL's queue, keeping its data on disk. */
+  public Path quarantine(Segment segment) throws IOException {
+    Path target = segment.file().resolveSibling(segment.file().getFileName() + UNREADABLE_SUFFIX);
+    DurableFiles.moveAtomically(segment.file(), target);
+    return target;
   }
 
   private static Path marker(Segment segment) {
