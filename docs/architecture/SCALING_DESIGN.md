@@ -201,10 +201,10 @@ Implementation choice (Reactor vs. bounded queues vs. virtual threads): see ADR-
 | HTTP ingest | client `batchId` + `seq` (used for idempotency on retry) |
 
 **Delivery semantics: at-least-once with idempotent sinks**, which in practice gives effectively-once.
-1. Batch `[start, end)` is processed and appended to the WAL.
-2. Every routed sink acknowledges the batch.
-3. Only then is the checkpoint advanced to `end`, written with tmp-file + `fsync` + atomic rename.
-4. After a crash, processing resumes from the last checkpoint. Replayed records carry the same `eventId = hash(tenantId, sourceId, offset)`, so sinks overwrite rather than duplicate them: OpenSearch by `_id`, object stores by offset-derived names.
+1. Batch `[start, end)` is processed and appended to the WAL; the segment is fsynced and renamed into place.
+2. Only then is the source checkpoint advanced to `end`, written with tmp-file + `fsync` + atomic rename. A slow or failed sink therefore never stalls the source; it only grows the WAL, up to its watermark (§4).
+3. Each sink reads committed WAL segments and acknowledges each one. A WAL segment is deleted only after **every** routed sink has acknowledged it ([P2 D1](P2_PLAN.md#d1-the-local-volumes-committed-segments-are-the-wal-checkpoints-follow-the-wal)).
+4. After a crash, processing resumes from the last checkpoint, and each sink from the oldest segment it hasn't acknowledged. Replayed records carry the same `eventId = hash(tenantId, sourceId, offset)`, so sinks overwrite rather than duplicate them: OpenSearch by `_id`, object stores by offset-derived names.
 
 ### Prefills
 | Kind | What it does | Design |

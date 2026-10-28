@@ -180,7 +180,7 @@ Planned packages: `framing`, `tail`, alongside the existing `source`, `parser`, 
 **Guardrails (every change must follow these):**
 1. **Never load unbounded data.** Stream sources in ≤500MB segments and process ≤10,000-line / ≤8MB micro-batches. No `readAllLines`, no `List` of a whole file.
 2. **Every inter-stage queue is bounded** and declares its overflow policy (block, 429 + `Retry-After`, spill to WAL, or DLQ). Pull sources pause; push sources return 429.
-3. **At-least-once delivery with idempotent sinks:** advance a checkpoint only after every routed sink acks. Writes are keyed by a deterministic `eventId = hash(tenantId, sourceId, offset)` or offset-derived object names.
+3. **At-least-once delivery with idempotent sinks:** advance a source checkpoint only once its data is durable in the WAL (the committed local segments), and delete a WAL segment only after every routed sink acks it. Writes are keyed by a deterministic `eventId = hash(tenantId, sourceId, offset)` or offset-derived object names.
 4. **Tenant isolation:** every record carries `tenantId`, which is resolved from credentials, never from the body. Every cache key, Redis key, index and object prefix starts with it.
 5. **Memory budget (4GB container):** `-XX:MaxRAMPercentage=60` (≈2.4GB heap), `-XX:MaxDirectMemorySize=512m` for Parquet / ZSTD / upload buffers.
 6. **Local SSD is a working area, not the hot tier.** 14 days of raw logs (140GB) doesn't fit, so the WAL is capped at 30GB with high/low watermarks, and segments are deleted only after all sinks ack.
