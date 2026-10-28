@@ -4,7 +4,7 @@
 > Exit criteria: **T3** (a sink stalled for 10 minutes: no OOM, sources paused, WAL under its watermark, full recovery) and **T9** (cold tier ≤3TiB at 7 years, i.e. ≥8x compression).
 > Ships as two PRs, like P1:
 > - **P2a** (§2–§7): Parquet + ZSTD archive, the `ObjectStore` port with filesystem (PVC) and S3 adapters, and the archiver that moves committed segments to it. Measures T9.
-> - **P2b** (§8): GCS adapter, WAL watermarks that pause ingest instead of failing, WAL compression. Measures T3.
+> - **P2b** (§8): WAL watermarks that pause ingest instead of failing, WAL compression, a GCS adapter. Measures T3.
 
 ## 1. Goal and scope
 
@@ -184,14 +184,88 @@ argus.archive.s3.path-style=false
 | Hadoop classes on the classpath | Only the shaded `hadoop-client-api`, nothing that starts a Hadoop `FileSystem`. Checked by the dependency tree in the PR |
 | Two instances archiving one volume | Out of scope; documented. Uploads are idempotent, so the worst case is a duplicate upload, not data loss |
 
-## 8. P2b: GCS, watermarks, WAL compression (second PR)
-- **D7. GCS native adapter:** `google-cloud-storage` with resumable uploads and Application Default Credentials / Workload Identity. Tested against `fake-gcs-server` (Testcontainers). The S3 interop API is the fallback.
-- **D8. Watermarks:** the WAL is capped at `argus.wal.max-bytes` (30GB).
-  - Above the high watermark (80%), `LocalVolumeSink.open` **blocks** the writer thread, so the bounded queues pause the reader (guardrail 2). Today it fails instead.
-  - Below the low watermark (60%), it resumes.
-  - Job status shows `PAUSED_WAL_FULL`. P3's push ingest returns 429 in the same state.
-- **D9. WAL compression:** `argus.wal.compression=zstd` writes `.ndjson.zst` segments, about 10x smaller, so the 30GB WAL holds days of backlog rather than hours. `zstd-jni` is already on the classpath through Parquet.
-- **Tests:** T3 as a test: a store that fails for N seconds while a large file ingests. Checks: heap stays bounded, ingest pauses at the watermark, and everything is archived once the store recovers.
+## 8. P2b: WAL watermarks, WAL compression, GCS (second PR)
+
+Exit criterion: **T3**. A sink stalled for 10 minutes means no OOM, ingest pauses (never fails), the WAL stays under its watermark, and everything is archived once the sink recovers.
+
+### 8.1 Decisions (STAR)
+
+#### D7. Watermarks pause ingest; they don't fail it
+- **Situation:** with an archive configured, the WAL drains only as fast as uploads succeed. Today a long outage fills the disk until `min-free-bytes` makes new segments **fail**, which fails the ingest job.
+- **Task:** bound the WAL, and turn "sink is down" into backpressure (guardrail 2), not errors.
+- **Action:** options were:
+  - (a) block inside `LocalVolumeSink.open`;
+  - (b) **a `WalCapacity` gate the pipeline's writer thread waits on before opening each segment;**
+  - (c) reject new jobs with 429 while the WAL is full.
+
+  Chosen (b), plus (c) for new jobs.
+  - The pending (not yet archived) WAL bytes are measured from `WalSegments.pending()`. Above `high-watermark` (80% of `argus.wal.max-bytes`, 30GB), new segments wait. They resume once usage drops below `low-watermark` (60%). The gap stops the gate flapping.
+  - The wait sits at a segment boundary in the writer thread, so the bounded queues stop the parser and then the reader. Memory stays at the queues' capacity. The wait polls every second and gives up when the job is cancelled.
+  - Job status gains `paused` (`WAL_FULL`) and `pausedMs`. `POST /api/v2/ingest/file` returns 429 + `Retry-After` while the WAL is above the high watermark, rather than accepting a job that will only wait.
+  - The gate is active only when an archive store is configured. With `store=none` nothing drains the WAL, so pausing would never end, and `min-free-bytes` stays the only limit, as before.
+  - Archived segments kept with `delete-after-upload=false` don't count: they are no longer backlog. Their disk use is still limited by `min-free-bytes`.
+- (a) was rejected because the sink has no way to see a job's cancel flag, so a blocked `open` could hang shutdown. (c) alone doesn't stop a job that is already running.
+- **Result:** an outage pauses ingest at about 24GB of backlog, and ingest resumes by itself. The file source waits rather than skipping data. P3's push ingest will return 429 in the same state.
+
+#### D8. WAL compression with zstd
+- **Situation:** NDJSON envelopes are about 4.1x the raw input (P2a: 1GB of input became 4.45GB of WAL). So a 30GB WAL holds only about 7GB of source, which is 17 hours at 10GB/day.
+- **Action:** `argus.sink.local.compression=zstd` writes `START-END.ndjson.zst`, streamed through `ZstdOutputStream` (level 1, the fastest). The archiver reads `.ndjson` and `.ndjson.zst` alike. The zstd frame is closed before the fsync, so a committed file is always complete. Default `none`: the NDJSON output keeps its format for anyone reading it directly. Setting `zstd` is recommended whenever an archive store is set.
+- **Result:** the measured ratio and its ingest cost are in §9. On the P2a test data, zstd should make the WAL ≥10x smaller, so 30GB holds days of backlog.
+
+#### D9. GCS: a small JSON-API client, not `google-cloud-storage`
+- **Situation:** GCS works today only through its S3 interop API, which needs HMAC keys rather than Workload Identity.
+- **Action:** options were:
+
+  | Option | Jars | Notes |
+  |---|---|---|
+  | `google-cloud-storage` 2.50 | 77 jars, **43.5MB** (gRPC, Guava, Conscrypt, protobuf) | Official; more dependencies than the rest of the archive put together |
+  | **`GcsObjectStore` on the JSON API** (`java.net.http`) + `google-auth-library-oauth2-http` for credentials | 19 jars, **6MB** | We own about 200 lines of protocol code: resumable uploads, list, delete |
+  | S3 interop only | none | HMAC keys; no Workload Identity |
+
+  Chosen: the JSON-API client.
+  - **Upload:** resumable, in 16MB chunks (multiples of 256KB, as GCS requires). A failed chunk asks the session how far it got (`Content-Range: bytes */N` → 308 + `Range`) and resumes from there, up to 3 times. After that the upload fails and the archiver backs off (D4).
+  - **Credentials:** Application Default Credentials (Workload Identity, a service account, or `gcloud` locally), scope `devstorage.read_write`.
+  - **Testing:** an endpoint override, used for `fake-gcs-server` in tests.
+- **Result:** native GCS with Workload Identity for 6MB of jars. The store passes the same `ObjectStoreContractTest` as the filesystem and S3 stores.
+
+### 8.2 Components
+| Class | Package | Responsibility |
+|---|---|---|
+| `WalCapacity` | `archive` | The gate: `awaitRoom(cancel, onPause)`, `isFull()`; refreshes pending bytes at most once a second |
+| `WalProperties` | `config` | `argus.wal.max-bytes` (30GB), `high-watermark` (0.8), `low-watermark` (0.6) |
+| `LocalVolumeSink` | `sink` | `compression=none|zstd`; `.ndjson.zst` output |
+| `WalSegments`, `Archiver` | `archive` | Read both `.ndjson` and `.ndjson.zst` |
+| `GcsObjectStore` | `archive` | D9 |
+| `IngestPipeline`, `IngestProgress`, `IngestJobService`, `IngestController` | `ingest`, `controller` | Wait on the gate per segment; `paused` / `pausedMs`; 429 for new jobs while the WAL is full |
+
+### 8.3 Configuration
+```properties
+argus.sink.local.compression=none        # none | zstd (recommended with an archive store)
+argus.wal.max-bytes=30GB                 # pending (not yet archived) WAL bytes; only with an archive store
+argus.wal.high-watermark=0.8             # above: new segments wait, new jobs get 429
+argus.wal.low-watermark=0.6              # below: ingest resumes
+argus.archive.store=gcs                  # new value
+argus.archive.gcs.bucket=
+argus.archive.gcs.endpoint=              # fake-gcs-server etc.; empty = https://storage.googleapis.com
+```
+
+### 8.4 Tests
+| Test | Covers |
+|---|---|
+| `WalCapacityTest` | Hysteresis (pause above high, resume only below low), cancel ends the wait, inactive without an archive store |
+| `LocalVolumeSinkTest` | zstd segments decompress to the same NDJSON; a replay replaces `.ndjson.zst` too |
+| `ArchiverTest`, `WalSegmentsTest` | `.ndjson.zst` segments archived like `.ndjson` |
+| `GcsObjectStoreTest` | `ObjectStoreContractTest` against `fake-gcs-server` (Testcontainers; skipped without Docker); chunked resumable upload of a multi-chunk file |
+| `IngestPipelineTest`, `IngestControllerTest` | A full WAL pauses a running job (status `paused`), cancel works while paused, and a new job gets 429 |
+| **T3** (`WalBackpressureIT`, tag `load`) | A large ingest while the store fails for a while: heap bounded, the job pauses at the watermark instead of failing, pending WAL never above the cap, then everything is archived and the job completes |
+| Load | `LargeFileIngestIT` with `compression=zstd`: WAL ratio and ingest throughput against P2a |
+
+### 8.5 Implementation order (one commit per step)
+1. This section.
+2. WAL compression (`LocalVolumeSink`, `WalSegments`, `Archiver`).
+3. `WalCapacity` + `WalProperties`; the pipeline waits; job status; 429 for new jobs.
+4. `GcsObjectStore` + `fake-gcs-server` contract test; `store=gcs`.
+5. T3 test, load numbers, docs (CLAUDE.md, README/FEATURES/ROADMAP/CHANGELOG, §10 here).
 
 ## 9. Results (P2a)
 - **Tests:** 255 pass on a clean checkout (`mvn -P ci test`, Docker up), up from 216 after hardening. New: `EnvelopeParquetWriterTest`, `ObjectStoreContractTest` (filesystem + S3 on S3Mock), `WalSegmentsTest`, `ArchiverTest`, `ArchivePropertiesTest`, `ArchiveConfigTest`; `ArgusWebApplicationTest` checks that no archiver runs by default.
