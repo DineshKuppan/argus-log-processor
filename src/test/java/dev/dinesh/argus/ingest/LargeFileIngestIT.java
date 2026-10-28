@@ -59,6 +59,11 @@ class LargeFileIngestIT {
     assertEquals("0", result.get("rejected"));
     assertEquals(result.get("inputBytes"), result.get("committedOffset"));
     assertTrue(Long.parseLong(result.get("inputBytes")) > 256L * 1024 * 1024);
+    // P2: every segment archived, every line in the archive, nothing left in the WAL.
+    assertEquals(result.get("segments"), result.get("archived"));
+    assertEquals("0", result.get("archiveFailed"));
+    assertEquals(result.get("lines"), result.get("archivedRows"));
+    assertEquals("0", result.get("walLeftBytes"));
   }
 
   private static Map<String, String> parseResult(String log) throws IOException {

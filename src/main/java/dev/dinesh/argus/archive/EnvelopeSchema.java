@@ -7,10 +7,15 @@ import org.apache.parquet.schema.MessageTypeParser;
  * Parquet schema of the archive: one row per {@link dev.dinesh.argus.model.LogEnvelope}. Column
  * names are snake_case, which Athena and BigQuery accept without quoting. Changing a column is a
  * schema migration for every query engine reading the archive, so add columns, never rename them.
+ *
+ * <p>There is no {@code event_id} column: the id is a hash of {@code tenant_id}, {@code source_id},
+ * {@code source_generation} and {@code source_offset} ({@link
+ * dev.dinesh.argus.pipeline.EnvelopeFactory#eventId(String, String, int, long)}), which the row
+ * already holds, and a random-looking 36-character string would be three quarters of the archive
+ * (measured: 20.5 of 27.2 bytes per row). Those four columns are the row's unique key.
  */
 public final class EnvelopeSchema {
 
-  public static final String EVENT_ID = "event_id";
   public static final String TENANT_ID = "tenant_id";
   public static final String TIMESTAMP = "timestamp";
   public static final String OBSERVED_TIMESTAMP = "observed_timestamp";
@@ -39,7 +44,6 @@ public final class EnvelopeSchema {
   public static final MessageType SCHEMA =
       MessageTypeParser.parseMessageType(
           "message log_envelope {"
-              + " required binary event_id (STRING);"
               + " required binary tenant_id (STRING);"
               + " optional int64 timestamp (TIMESTAMP(MICROS,true));"
               + " required int64 observed_timestamp (TIMESTAMP(MICROS,true));"

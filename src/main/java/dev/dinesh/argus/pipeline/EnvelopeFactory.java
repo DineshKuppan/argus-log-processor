@@ -58,6 +58,15 @@ public final class EnvelopeFactory {
 
   /** Same tenant, source, generation and offset always give the same id (guardrail 3). */
   String eventId(long lineOffset) {
+    return eventId(tenantId, sourceId, generation, lineOffset);
+  }
+
+  /**
+   * The one definition of {@code eventId}. The Parquet archive stores only these four inputs (its
+   * {@code tenant_id}, {@code source_id}, {@code source_generation} and {@code source_offset}
+   * columns), so a reader re-derives the id with this.
+   */
+  public static String eventId(String tenantId, String sourceId, int generation, long lineOffset) {
     String key = tenantId + '\n' + sourceId + '\n' + generation + '\n' + lineOffset;
     return UUID.nameUUIDFromBytes(key.getBytes(StandardCharsets.UTF_8)).toString();
   }

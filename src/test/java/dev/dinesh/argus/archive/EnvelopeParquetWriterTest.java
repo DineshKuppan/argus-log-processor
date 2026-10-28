@@ -1,11 +1,13 @@
 package dev.dinesh.argus.archive;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.model.LogEnvelope;
+import dev.dinesh.argus.pipeline.EnvelopeFactory;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -75,7 +77,6 @@ class EnvelopeParquetWriterTest {
                     Map.of("service.name", "checkout")))
             .get(0);
 
-    assertEquals("id-1", row.getString(EnvelopeSchema.EVENT_ID, 0));
     assertEquals("acme", row.getString(EnvelopeSchema.TENANT_ID, 0));
     // Truncated to microseconds.
     assertEquals(1_759_972_300_123_456L, row.getLong(EnvelopeSchema.TIMESTAMP, 0));
@@ -97,6 +98,37 @@ class EnvelopeParquetWriterTest {
     assertEquals(2, row.getInteger(EnvelopeSchema.SOURCE_GENERATION, 0));
     assertEquals(4096, row.getLong(EnvelopeSchema.SOURCE_OFFSET, 0));
     assertEquals("nginx_access", row.getString(EnvelopeSchema.SOURCE_FORMAT, 0));
+  }
+
+  @Test
+  void theEventIdIsNotStoredButCanBeDerivedFromTheRow() throws IOException {
+    LogEnvelope e = envelope(Instant.EPOCH, null, null);
+    String eventId = EnvelopeFactory.eventId("acme", "app", 2, 4096);
+    LogEnvelope stored =
+        new LogEnvelope(
+            eventId,
+            e.tenantId(),
+            e.timestamp(),
+            e.observedTimestamp(),
+            e.severityText(),
+            e.severityNumber(),
+            e.body(),
+            e.traceId(),
+            e.spanId(),
+            e.resource(),
+            e.attributes(),
+            e.source());
+
+    Group row = writeAndRead(stored).get(0);
+
+    assertFalse(EnvelopeSchema.SCHEMA.containsField("event_id"));
+    assertEquals(
+        eventId,
+        EnvelopeFactory.eventId(
+            row.getString(EnvelopeSchema.TENANT_ID, 0),
+            row.getString(EnvelopeSchema.SOURCE_ID, 0),
+            row.getInteger(EnvelopeSchema.SOURCE_GENERATION, 0),
+            row.getLong(EnvelopeSchema.SOURCE_OFFSET, 0)));
   }
 
   @Test

@@ -84,8 +84,8 @@ class ArchiverTest {
         ParquetTestFiles.rows(
             archived("tenant=acme/dt=2025-10-09/hour=13/source=app/gen=0/0-30.parquet"));
     assertEquals(
-        List.of("acme-app-0-0", "acme-app-0-10", "acme-app-0-20"),
-        acme.stream().map(r -> r.getString(EnvelopeSchema.EVENT_ID, 0)).toList());
+        List.of(0L, 10L, 20L),
+        acme.stream().map(r -> r.getLong(EnvelopeSchema.SOURCE_OFFSET, 0)).toList());
     assertEquals(
         2,
         ParquetTestFiles.rows(

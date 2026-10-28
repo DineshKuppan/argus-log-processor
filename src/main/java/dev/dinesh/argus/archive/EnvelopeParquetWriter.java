@@ -139,7 +139,6 @@ public final class EnvelopeParquetWriter implements Closeable {
     public void write(LogEnvelope e) {
       LogEnvelope.Source source = e.source();
       out.startMessage();
-      string(EnvelopeSchema.EVENT_ID, e.eventId());
       string(EnvelopeSchema.TENANT_ID, e.tenantId());
       if (e.timestamp() != null) {
         int64(EnvelopeSchema.TIMESTAMP, micros(e.timestamp()));
