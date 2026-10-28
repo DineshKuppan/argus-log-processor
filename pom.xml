@@ -22,6 +22,11 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <!-- Boot 3.3.3 manages 1.19.8, whose Docker API 1.32 is rejected by Docker Engine 29+ (minimum 1.40) -->
     <testcontainers.version>1.21.4</testcontainers.version>
+    <parquet.version>1.15.2</parquet.version>
+    <hadoop.version>3.4.1</hadoop.version>
+    <!-- The version parquet-hadoop ${parquet.version} is built against -->
+    <zstd-jni.version>1.5.6-6</zstd-jni.version>
+    <awssdk.version>2.31.6</awssdk.version>
   </properties>
 
   <licenses>
@@ -91,7 +96,7 @@
       <scope>test</scope>
     </dependency>
 
-    <!-- Real Redis for RedisSuppressionStoreTest; the test is skipped without Docker -->
+    <!-- Real Redis and S3 (S3Mock) for the store tests; they are skipped without Docker -->
     <dependency>
       <groupId>org.testcontainers</groupId>
       <artifactId>junit-jupiter</artifactId>
@@ -125,6 +130,39 @@
     <dependency>
       <groupId>com.github.ben-manes.caffeine</groupId>
       <artifactId>caffeine</artifactId>
+    </dependency>
+
+    <!-- Parquet archive (P2). parquet-hadoop needs Hadoop's API classes on the class path, but not
+         its runtime (hadoop-client-api is shaded and has no transitive dependencies), as long as
+         compression goes through ZstdCodecFactory rather than Parquet's Hadoop codec factory. -->
+    <dependency>
+      <groupId>org.apache.parquet</groupId>
+      <artifactId>parquet-hadoop</artifactId>
+      <version>${parquet.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client-api</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.github.luben</groupId>
+      <artifactId>zstd-jni</artifactId>
+      <version>${zstd-jni.version}</version>
+    </dependency>
+
+    <!-- S3 archive store (P2): the async client with multipart uploads (Netty); the sync Apache
+         client is never used -->
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>s3</artifactId>
+      <version>${awssdk.version}</version>
+      <exclusions>
+        <exclusion>
+          <groupId>software.amazon.awssdk</groupId>
+          <artifactId>apache-client</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
 
     <dependency>

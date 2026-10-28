@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). P2–P5 are design only. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2a implemented** (Parquet + ZSTD archive to a filesystem/PVC or S3, the local segments as WAL; see [`P2_PLAN.md`](P2_PLAN.md)). P2b–P5 are design only. Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents
@@ -201,10 +201,10 @@ Implementation choice (Reactor vs. bounded queues vs. virtual threads): see ADR-
 | HTTP ingest | client `batchId` + `seq` (used for idempotency on retry) |
 
 **Delivery semantics: at-least-once with idempotent sinks**, which in practice gives effectively-once.
-1. Batch `[start, end)` is processed and appended to the WAL.
-2. Every routed sink acknowledges the batch.
-3. Only then is the checkpoint advanced to `end`, written with tmp-file + `fsync` + atomic rename.
-4. After a crash, processing resumes from the last checkpoint. Replayed records carry the same `eventId = hash(tenantId, sourceId, offset)`, so sinks overwrite rather than duplicate them: OpenSearch by `_id`, object stores by offset-derived names.
+1. Batch `[start, end)` is processed and appended to the WAL; the segment is fsynced and renamed into place.
+2. Only then is the source checkpoint advanced to `end`, written with tmp-file + `fsync` + atomic rename. A slow or failed sink therefore never stalls the source; it only grows the WAL, up to its watermark (§4).
+3. Each sink reads committed WAL segments and acknowledges each one. A WAL segment is deleted only after **every** routed sink has acknowledged it ([P2 D1](P2_PLAN.md#d1-the-local-volumes-committed-segments-are-the-wal-checkpoints-follow-the-wal)).
+4. After a crash, processing resumes from the last checkpoint, and each sink from the oldest segment it hasn't acknowledged. Replayed records carry the same `eventId = hash(tenantId, sourceId, offset)`, so sinks overwrite rather than duplicate them: OpenSearch by `_id`, object stores by offset-derived names.
 
 ### Prefills
 | Kind | What it does | Design |
@@ -401,6 +401,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **A:** Parquet (broadest engine support: Athena, BigQuery, Spark, DuckDB) vs. ORC (good compression, weaker BigQuery and tooling support) vs. compressed NDJSON (simple, but no column pruning).
   **Choice:** Parquet + ZSTD.
 - **R:** Compression ratio ≥8x on a sample day; an Athena query over one column scans ≤15% of the bytes of the equivalent NDJSON.
+  **Measured (P2a, synthetic access logs):** 14.6x vs the raw input and 60x vs the NDJSON WAL, after dropping the derivable `event_id` column (3.6x with it). Real logs have more varied text, so re-measure on a real sample day.
 
 ### ADR-4: Hot-tier tenancy layout
 - **S:** No tenancy.

@@ -19,7 +19,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
-import java.time.ZoneOffset;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
@@ -156,14 +155,15 @@ public class LocalVolumeSink implements LogSink {
       Path segmentDir =
           DurableFiles.createDirectories(
               tenantRoot
-                  .resolve("dt=" + day(firstTimestamp))
+                  .resolve("dt=" + EventTimePartition.day(firstTimestamp))
                   .resolve("source=" + sourceId)
                   .resolve("gen=" + generation));
       String prefix = startOffset + "-";
       // A segment committed by a crashed run may have ended at a different offset (the file grew
-      // since); replace it rather than leaving two overlapping copies.
+      // since); replace it rather than leaving two overlapping copies. The trailing * also takes
+      // the archiver's markers (.archived, .unreadable) for the replaced copy.
       try (DirectoryStream<Path> earlier =
-          Files.newDirectoryStream(segmentDir, prefix + "*.ndjson")) {
+          Files.newDirectoryStream(segmentDir, prefix + "*.ndjson*")) {
         for (Path p : earlier) {
           Files.deleteIfExists(p);
         }
@@ -186,12 +186,6 @@ public class LocalVolumeSink implements LogSink {
       } catch (IOException e) {
         log.warn("Could not delete aborted segment {}; it is discarded on the next run", part, e);
       }
-    }
-
-    private String day(Instant timestamp) {
-      return timestamp == null
-          ? "unknown"
-          : timestamp.atZone(ZoneOffset.UTC).toLocalDate().toString();
     }
   }
 }

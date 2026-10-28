@@ -99,7 +99,9 @@ class LocalVolumeSinkTest {
     LocalVolumeSink sink = sink();
     SegmentWriter first = sink.open("default", "app", 0, 0);
     first.write(batch(0, 40, "one"));
-    first.commit(40);
+    Path earlier = Path.of(first.commit(40));
+    // The archiver had marked the earlier copy (delete-after-upload=false).
+    Files.createFile(Path.of(earlier + ".archived"));
 
     // Rerun after a crash: same start offset, file has grown so the segment ends later.
     SegmentWriter replay = sink.open("default", "app", 0, 0);
@@ -109,6 +111,7 @@ class LocalVolumeSinkTest {
     List<Path> files = committedFiles();
     assertEquals(1, files.size());
     assertTrue(files.get(0).endsWith("0-60.ndjson"));
+    assertFalse(Files.exists(Path.of(earlier + ".archived")), "marker of the replaced copy");
   }
 
   @Test
