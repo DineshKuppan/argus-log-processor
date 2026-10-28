@@ -8,6 +8,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import dev.dinesh.argus.archive.Archiver;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.controller.IngestController;
 import dev.dinesh.argus.ingest.IngestJobService;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.ApplicationContext;
 import org.springframework.test.web.servlet.MockMvc;
 
 /** Starts the full application context so wiring and property binding errors fail the build. */
@@ -26,12 +28,19 @@ class ArgusWebApplicationTest {
   @Autowired IngestJobService ingestJobService;
   @Autowired IngestProperties ingestProperties;
   @Autowired MockMvc mvc;
+  @Autowired ApplicationContext context;
 
   @Test
   void contextLoadsAndBindsIngestProperties() {
     assertEquals(10_000, ingestProperties.batchMaxLines());
     assertEquals(500L * 1024 * 1024, ingestProperties.segmentBytes().toBytes());
     assertEquals(2, ingestProperties.maxConcurrentJobs());
+  }
+
+  /** The shipped config archives nothing: the NDJSON output stays, as before P2. */
+  @Test
+  void noArchiverRunsByDefault() {
+    assertEquals(0, context.getBeanNamesForType(Archiver.class).length);
   }
 
   /** The shipped config has no keys: every API (v1 included) answers 401, nothing is open. */

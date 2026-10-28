@@ -94,7 +94,7 @@ Today v2 ingest writes NDJSON segments to a local volume and stops there. The ou
 - **Result:** bounded heap and disk however far behind the archive is, as guardrails 1 and 5 require. `archive.max-concurrent` is fixed at 1 in P2a; that's enough for 10GB/day.
 
 ### D6. Opt-in, with today's behaviour by default
-- **Action:** `argus.archive.store=none` (the default) keeps the NDJSON output as the result, as it is today. `filesystem` (a PVC or a local directory) or `s3` turns the local volume into a WAL. `delete-after-upload=true` (the default) then removes each segment once it is uploaded. With `false`, the archiver writes a `START-END.archived` marker next to the segment instead, so the NDJSON stays as a local copy and is not uploaded twice.
+- **Action:** `argus.archive.store=none` (the default) keeps the NDJSON output as the result, as it is today. `filesystem` (a PVC or a local directory) or `s3` turns the local volume into a WAL. `delete-after-upload=true` (the default) then removes each segment once it is uploaded. With `false`, the archiver writes a `START-END.ndjson.archived` marker next to the segment instead, so the NDJSON stays as a local copy and is not uploaded twice.
 - **Result:** nothing changes for current users until they configure a store. Running locally needs no cloud credentials.
 
 ## 3. Components (P2a)
@@ -107,7 +107,7 @@ Today v2 ingest writes NDJSON segments to a local volume and stops there. The ou
 | `ObjectStore` | `archive` | Port: `put(key, Path file)`, `list(prefix)`, `delete(key)`, `name()`. Keys use `/` and are relative to the store's prefix |
 | `FileSystemObjectStore` | `archive` | A directory (PVC): write to a temp file + fsync + atomic rename (`DurableFiles`) |
 | `S3ObjectStore` | `archive` | AWS SDK v2 `S3AsyncClient` with multipart enabled. Configurable endpoint and path-style access (MinIO; GCS interop untested). Credentials from the SDK's default chain, never from properties |
-| `WalSegments` | `archive` | Lists committed segments (`tenant=*/dt=*/source=*/gen=*/*.ndjson`, skipping `_staging` and `.archived` ones), oldest first by modification time; maps a segment path to its archive key; prunes empty directories |
+| `WalSegments` | `archive` | Lists committed segments (`tenant=*/dt=*/source=*/gen=*/*.ndjson`, skipping `_staging` and `.archived` ones), oldest first by modification time; maps a segment path to its archive key. Empty directories are left in place: pruning them could race ingest creating the same directory for its next commit |
 | `Archiver` | `archive` | One worker thread with lifecycle (`SmartLifecycle`): scan every `scan-interval`, convert → upload → delete superseded siblings → delete or mark the WAL segment; backoff (D4); one canonical line per segment |
 | `ArchiveProperties`, `ArchiveConfig` | `config` | `argus.archive.*`; builds the configured `ObjectStore`; refuses a filesystem store inside the WAL root |
 
