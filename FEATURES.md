@@ -14,6 +14,19 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Job control | `GET` / `DELETE /api/v2/ingest/jobs/{id}`: progress, format, line counts, outputs. Jobs run on `max-concurrent-jobs` slots, with no queue (429 when busy) and one job per source at a time |
 | Long lines | Lines over `max-line-bytes` (1MB) are truncated and counted |
 
+## Push ingest (v2)
+| Feature | Details |
+|---|---|
+| HTTP push | `POST /api/v2/ingest/streams/{id}`: NDJSON or plain lines, optionally `Content-Encoding: gzip`, from agents (Fluent Bit, Vector) or any HTTP client. Up to 32 streams per tenant |
+| Acknowledged once durable | A request's lines are fsynced in the stream's spool, with an index entry, before the 202. The ordinary pipeline then ingests the spool like a file (same parsers, checkpoints, WAL and archive), batching up to `flush-interval` (1 minute) of pushes into one segment |
+| Retries without duplicates | `Idempotency-Key`: a repeated key is answered 200 with the original offsets and writes nothing, even after a restart. Tested with `kill -9` mid-load: no acknowledged line lost, none ingested as two events |
+| Every limit has a status | 429 + `Retry-After` for busy request slots (1s), a request with the same `Idempotency-Key` still in progress (1s), the tenant's quota (exact wait), a full WAL (60s) or a full spool (30s); 413 over 8MB decompressed (gzip bombs stop there) or 10,000 lines; 409 for too many streams or a stream id that is a file job's source id; 415 for an unknown encoding |
+| Per-tenant quotas | A token bucket per tenant on decompressed bytes (default 2MB/s, 2s burst, per-tenant overrides), in memory or in Redis (one Lua call, fails open). One tenant flooding doesn't get another refused |
+| Suppression on push | Repeated messages within 10s are dropped as they arrive (receive time), comparing the parsed message rather than the whole line; the response counts them |
+| Crash-safe spool | Bytes that were never acknowledged are truncated at startup; spool files rotate at 64MB and are deleted once ingested; each spool file is its own output generation |
+| Status | `GET /api/v2/ingest/streams/{id}` (and the list): spool bytes, bytes not yet ingested, request and line counters, the last run |
+| Speed | 132k lines/s end to end (8 clients, 1,000-line gzip batches) at a 256MB heap; request p99 93ms |
+
 ## Formats and parsing
 | Feature | Details |
 |---|---|
@@ -45,6 +58,7 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Message key | `<tenant>:supp:` + SHA-256/128 of the trimmed message. `template-fingerprint` also treats messages differing only in numbers, UUIDs or hex ids as the same |
 | Stores | In memory (Caffeine; bounded; one summary line per window that denied copies) or Redis (one atomic Lua call; shared by every instance) |
 | Fails open | When Redis is unavailable, messages are allowed after a 100ms timeout, with one warning per window |
+| On push ingest | Applied to every pushed line at receive time; file ingest bypasses it by design |
 | Speed | p99 8.8µs per decision with the local store |
 
 ## Analysis (v1, synchronous)
@@ -61,16 +75,17 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 |---|---|
 | API keys | Every `/api/**` call needs `X-Argus-Api-Key` or `Authorization: Bearer`. Configuration stores only SHA-256 hashes |
 | Fails closed | The tenant is resolved before dispatch, so a new endpoint is authenticated by default. Missing or unknown key → 401 + `WWW-Authenticate` |
-| Tenant isolation | Checkpoints, output, archive keys, suppression keys, event ids and jobs are all per tenant. Another tenant's job is a 404 |
+| Tenant isolation | Checkpoints, output, archive keys, suppression and quota keys, event ids, jobs and push streams are all per tenant. Another tenant's job or stream is a 404 |
+| Ingest quotas | Per-tenant pushed bytes per second (token bucket); over it, that tenant alone gets 429 with the exact `Retry-After` |
 | Path restriction | v1 and v2 read only under the tenant's allowed roots. The check runs before existence and again after resolving symlinks, so a 404 never reveals a path outside them |
 | Input validation | Tenant and source ids are limited to safe characters, because they become directory names and keys |
 
 ## Operations
 | Feature | Details |
 |---|---|
-| Canonical log lines | One wide line per ingest run, v1 scan, suppression check and archived segment, with offsets, counts and timings |
+| Canonical log lines | One wide line per ingest run, push request, v1 scan, suppression check and archived segment, with offsets, counts and timings |
 | Memory sizing | Runs in 4GB with `-XX:MaxRAMPercentage=60 -XX:MaxDirectMemorySize=512m` |
 | OpenAPI | Swagger UI at `/swagger-ui.html`, with the API-key scheme declared |
 | Actuator | `/actuator/health` and the other Spring Boot endpoints |
 | Test data | `DataSeeder` streams a reproducible Nginx log of any size to disk |
-| Tests | 291 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3 and GCS, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions) |
+| Tests | 348 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3 and GCS, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions; push throughput and tenant isolation, push during an archive outage, `kill -9` during push) |

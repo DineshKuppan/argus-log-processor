@@ -6,7 +6,35 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
-### P2b: WAL watermarks, WAL compression and GCS (unmerged)
+### P3a: HTTP push ingest, quotas and suppression on push (unmerged)
+Plan and results: [`P3_PLAN.md`](docs/architecture/P3_PLAN.md).
+
+#### Added
+- **HTTP push ingest:** `POST /api/v2/ingest/streams/{id}` takes NDJSON or plain lines, optionally gzipped, and answers 202 once they are durable in the stream's spool.
+  - `StreamSpool` keeps numbered spool files plus an `index.log` of acknowledged requests. Bytes that were never acknowledged are truncated at startup.
+  - `StreamRunner` ingests each spool with the ordinary pipeline once a line has waited `argus.push.flush-interval` (1 minute), a segment's worth is waiting, or a spool file was sealed. Each spool file is its own output generation.
+  - `GET /api/v2/ingest/streams/{id}` and `GET /api/v2/ingest/streams` report spools, counters and the last run.
+- **`Idempotency-Key`:** a repeated key is answered 200 with the original offsets and writes nothing, even across a restart.
+- **Per-tenant ingest quotas** (`argus.quota.*`): a token bucket on decompressed pushed bytes (2MB/s, 2s burst, per-tenant overrides), in memory or in Redis (fails open). Over it, 429 with the exact `Retry-After`.
+- **Every push limit has a status:** 429 + `Retry-After` for busy request slots, the quota, a full WAL or a full spool; 413 for the body (8MB decompressed, which stops gzip bombs) or 10,000 lines; 409 for more than 32 streams per tenant; 415 for an unknown `Content-Encoding`.
+- **Suppression on push:** repeated messages are dropped at receive time; only allowed lines reach the spool, so a replay never suppresses again.
+- One `Push request finished …` canonical line per request.
+- `SuppressionStore.release`: a pushed request whose spool write fails gives back its suppression windows, so its retry isn't suppressed.
+- Load tests (tag `load`), with the application in its own 256MB JVM: `PushIngestIT` (T1 and tenant isolation), `PushBackpressureIT` (T3 for push), `PushCrashIT` (T4 for push).
+
+#### Changed
+- File jobs and stream runs share `SourceLeases`, so a source has one run at a time whichever started it. A 409 for a busy source now names its owner. A file job can't use a push stream's id (409), nor a stream a file source's id.
+- `IngestPipeline.Request` gains `endOffset` and `pathIsIdentity`; `ResumePoint` gains `PATH_CHANGED`.
+- `JsonLogParser`: fractional epoch seconds keep their fraction (Fluent Bit's `json_date_format double`).
+- ADR-6 now recommends Java 21 before P4 rather than P3.
+
+#### Measured
+- **T1 (push):** 2M lines from 8 clients: 132k lines/s end to end, request p99 93ms, peak heap 243MB of 256MB.
+- **Tenant isolation:** a tenant flooding past its quota got 5,539 429s; another tenant was never refused, and its p99 went from 25ms to 40ms.
+- **T3 (push):** a 20s archive outage turned into 222 429s; all 1,000,000 acknowledged lines were archived afterwards.
+- **T4 (push):** `kill -9` at a random point, 5 runs: no acknowledged line lost, none ingested as two events.
+
+### P2b: WAL watermarks, WAL compression and GCS: [#7](https://github.com/DineshKuppan/argus-log-processor/pull/7) (2026-10-28)
 Plan and results: [`P2_PLAN.md`](docs/architecture/P2_PLAN.md) §8, §10.
 
 #### Added

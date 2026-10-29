@@ -203,7 +203,7 @@ public final class WalBackpressureRunner {
     return max;
   }
 
-  private static long parquetRows(Path dir) throws IOException {
+  static long parquetRows(Path dir) throws IOException {
     ParquetReadOptions options =
         ParquetReadOptions.builder(new PlainParquetConfiguration())
             .withCodecFactory(new ZstdCodecFactory(ZstdCodecFactory.DEFAULT_LEVEL))

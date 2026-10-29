@@ -63,6 +63,25 @@ class ResumePointTest {
   }
 
   @Test
+  void aPathThatIsTheIdentityStartsTheNextGenerationWhenItChanges() throws IOException {
+    write("spool one\n");
+    Optional<SourceOffset> cp = checkpointAt(10, 4);
+    Path next = Files.writeString(dir.resolve("000002.log"), "spool one\nmore\n");
+
+    try (FileSource source = FileSource.open(next, "app", PROPS)) {
+      // Same content, and possibly a reused inode: only the path says it's a new file.
+      assertEquals(
+          new ResumePoint(0, 5, Reason.PATH_CHANGED),
+          ResumePoint.resolve(cp, source, next.toString(), false));
+    }
+    try (FileSource source = FileSource.open(file, "app", PROPS)) {
+      assertEquals(
+          new ResumePoint(10, 4, Reason.CHECKPOINT),
+          ResumePoint.resolve(cp, source, file.toString(), false));
+    }
+  }
+
+  @Test
   void replacedFileStartsANewGeneration() throws IOException {
     write("old file\n");
     Optional<SourceOffset> cp = checkpointAt(9, 0);

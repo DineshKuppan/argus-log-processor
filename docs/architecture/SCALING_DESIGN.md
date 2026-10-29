@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). P3–P5 are design only. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). P3b–P5 are design only. Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents
@@ -81,6 +81,7 @@ Assumptions: 10GiB/day, ~300 bytes per line on average, a 10x peak-to-average bu
 | Use | Cap | Notes |
 |---|---|---|
 | Spool / WAL | 30GB (≈3 days of backlog) | Absorbs sink outages; high watermark 80% → pause pull sources and return 429 on push sources |
+| Push spool | ≤2GB not yet ingested | Raw lines of acknowledged push requests until a stream run ingests them ([P3 D1](P3_PLAN.md)); full → 429 |
 | Parquet staging | ≤2GB | Rolled files waiting to upload |
 | Checkpoints | <100MB | One small file per source |
 | Headroom | rest | Logs, heap dumps, OS |
@@ -170,7 +171,7 @@ flowchart LR
 | Source type | Mechanism |
 |---|---|
 | Pull (file, tail, Kafka, ES export) | Stop reading when the first queue is full. Kafka: `consumer.pause(partitions)` / `resume`. Files: the reader thread blocks on `queue.put`. |
-| Push (HTTP ingest) | Above the high watermark, return **429 Too Many Requests** with `Retry-After`. Agents (Fluent Bit, Vector) buffer locally and retry with backoff. Never accept data that can't be buffered durably. |
+| Push (HTTP ingest) | Above the high watermark, return **429 Too Many Requests** with `Retry-After`. Agents (Fluent Bit, Vector) buffer locally and retry with backoff. Never accept data that can't be buffered durably. Implemented in P3a: a request is acknowledged only once fsynced in its stream's spool, and every push bound (request slots, quota, WAL, spool, body size, stream count) has its own status ([P3 D4](P3_PLAN.md)). |
 
 Each queue between stages is **bounded**, and each has a declared overflow policy:
 
@@ -198,7 +199,7 @@ Implementation choice (Reactor vs. bounded queues vs. virtual threads): see ADR-
 | Kafka | `topic`, `partition`, `offset` |
 | Elasticsearch export | PIT id + `search_after` sort values |
 | Coralogix export | query window `[from, to)` + page cursor |
-| HTTP ingest | client `batchId` + `seq` (used for idempotency on retry) |
+| HTTP ingest | the stream's spool file + byte offset, like a file (P3a); retries are recognised by `Idempotency-Key` |
 
 **Delivery semantics: at-least-once with idempotent sinks**, which in practice gives effectively-once.
 1. Batch `[start, end)` is processed and appended to the WAL; the segment is fsynced and renamed into place.
@@ -255,7 +256,7 @@ flowchart TD
 | Concern | Design |
 |---|---|
 | Identity | `TenantResolver` derives `tenantId` from the API key or JWT claim at the edge. The client body can never set or override it. |
-| Quotas | Per tenant: ingest rate (Redis token bucket), max tail connections, storage retention class. Exceeding the ingest quota returns 429 to that tenant only. |
+| Quotas | Per tenant: ingest rate (token bucket, local or Redis; P3a, push only), max tail connections, storage retention class. Exceeding the ingest quota returns 429 to that tenant only. |
 | Hot-tier isolation | Large tenants: **index per tenant** (`logs-<tenant>-YYYY.MM.DD`). Small tenants: a shared index with `routing=tenantId` and filtered aliases, to avoid shard explosion (ADR-4). |
 | Cold-tier isolation | Per-tenant prefix `tenant=<id>/`, IAM policies scoped by prefix, optional per-tenant KMS key. |
 | Cache/key isolation | Every cache key, Redis key and object prefix starts with `tenantId`. |
@@ -421,7 +422,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **S:** Java 17 (pom).
 - **T:** Throughput and simplicity for I/O-heavy stages.
 - **A:** Stay on 17 (no change) vs. move to 21 LTS (virtual threads, generational ZGC, Spring Boot 3.2+ support).
-  **Choice:** Recommend 21 before P3 (HTTP ingest + many concurrent tail connections). Not required for P0–P2.
+  **Choice:** Recommend 21 before P4 (many concurrent tail connections). Not required for P0–P3: push ingest is ~10 requests/s at the target, far within Tomcat's platform threads, and on 21 virtual threads still pin inside `synchronized`, which the pipeline uses ([`P3_PLAN.md`](P3_PLAN.md) D6).
 - **R:** A tail test with 1,000 concurrent SSE clients stays within the heap budget.
 
 ---
@@ -447,7 +448,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 | **P0** | `FileSource` (streamed chunks), `RecordFramer`, `CheckpointStore`, `LocalVolumeSink`, bounded queues | Phase 1 | T2, T4 on local disk |
 | **P1** | `ParserRegistry` + `FormatDetector` (wire existing parsers, remove `parseLineSafely` duplication, drop `parseLine(line, pattern)` from the interface), `LogEnvelope`, `Suppressor`, `StreamingAggregator` | Phase 1 | T1, T6 |
 | **P2** | `ParquetArchiveWriter`, `S3Sink`, `GcsSink`, WAL + watermarks, Resilience4j | Phase 1 / 3 | T3, T9 |
-| **P3** | `HttpIngestSource` (429 backpressure), `TenantResolver`, `QuotaService`, ES / Coralogix export sources, replay lane | Phase 2 | T8, tenant isolation tests |
+| **P3** | P3a: HTTP push ingest via a durable spool (429 backpressure), `QuotaService`, suppression on push. P3b: ES / Coralogix export sources, replay lane | Phase 2 | T8, tenant isolation tests |
 | **P4** | Live tail (SSE), canonical log lines (Argus's own + ingesting producers'), Micrometer metrics | Phase 3 | T7 |
 | **P5** | `OpenSearchSink` hot tier with ILM and mappings; optional Kafka buffer + partition-by-key suppression; HPA on consumer lag | Phase 2 / 3, Deployment | T5 |
 

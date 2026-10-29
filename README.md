@@ -10,12 +10,18 @@ A Spring Boot service that ingests, parses, filters, aggregates and archives log
 |---|---|
 | [FEATURES.md](FEATURES.md) | Everything Argus does today, by area |
 | [CHANGELOG.md](CHANGELOG.md) | What changed, merged PR by merged PR |
-| [ROADMAP.md](ROADMAP.md) | What's next (P2b → P5) and the open items |
+| [ROADMAP.md](ROADMAP.md) | What's next (P3b → P5) and the open items |
 | [docs/architecture/SCALING_DESIGN.md](docs/architecture/SCALING_DESIGN.md) | Target architecture, capacity maths, ADRs |
 | [CLAUDE.md](CLAUDE.md) | Code map, guardrails and conventions for contributors |
 
 ## What's new
 
+- **HTTP push ingest, quotas and suppression on push (P3a).**
+  - `POST /api/v2/ingest/streams/{id}` takes NDJSON or plain lines, optionally gzipped, from agents such as Fluent Bit and Vector. A request is acknowledged only once it is fsynced in the stream's spool, and the ordinary pipeline ingests the spool shortly after.
+  - `Idempotency-Key` makes a retried request a no-op, even across a restart. Tested with `kill -9` mid-load: nothing acknowledged was lost or duplicated.
+  - Per-tenant ingest quotas (token bucket, local or Redis), and every limit answers with its own status: 429 + `Retry-After`, 413, 409 or 415.
+  - Repeated messages are suppressed as they arrive (10s window).
+  - 132k lines/s end to end at a 256MB heap, 32x the target.
 - **Backpressure, a compressed WAL and GCS (P2b).**
   - When the archive falls behind (e.g. S3 or GCS is down), ingest **pauses** at the WAL's high watermark instead of failing, then resumes. Tested with a 30s outage during a 500MB ingest at a 256MB heap.
   - `argus.sink.local.compression=zstd` makes the local WAL 10x smaller, so 30GB holds about a week of backlog.
@@ -114,7 +120,48 @@ curl -X POST localhost:9000/api/v2/suppression/check \
 # → {"decision":"ALLOW",…}; the same message again within 10s → {"decision":"DENY","suppressedCount":1,…}
 ```
 
-### 5. Archive to Parquet (optional)
+### 5. Push lines from an agent
+```bash
+printf '{"ts":"2026-10-28T12:00:00Z","level":"ERROR","msg":"disk full"}\n' | gzip | \
+  curl -X POST localhost:9000/api/v2/ingest/streams/web --data-binary @- \
+  -H 'X-Argus-Api-Key: my-secret-key' -H 'Content-Type: application/x-ndjson' \
+  -H 'Content-Encoding: gzip' -H 'Idempotency-Key: batch-0001'
+# → 202 {"streamId":"web","accepted":1,"suppressed":0,"spool":1,"startOffset":0,"endOffset":64,…}
+# The same Idempotency-Key again → 200 with the original offsets; nothing is written twice
+
+curl localhost:9000/api/v2/ingest/streams/web -H 'X-Argus-Api-Key: my-secret-key'   # spool and run status
+```
+- **When it's ingested:** a stream run starts once a line has waited `argus.push.flush-interval` (1 minute) or a segment's worth is waiting. Output lands next to file output, under `source=web`.
+- **Retries:** send a unique `Idempotency-Key` per batch for exactly-once. Without one, a retried batch may be ingested twice.
+- **Limits:** 429 + `Retry-After` when the tenant is over its quota (`argus.quota.ingest-bytes-per-second`, 2MB/s), the WAL or spool is full, or 16 requests are already in progress; 413 over 8MB decompressed or 10,000 lines.
+
+Fluent Bit (`json_date_key timestamp`: its default key, `date`, isn't read as the event time):
+```ini
+[OUTPUT]
+    Name      http
+    Match     *
+    Host      argus.example
+    Port      9000
+    URI       /api/v2/ingest/streams/web
+    Format    json_lines
+    Compress  gzip
+    json_date_key timestamp
+    Header    X-Argus-Api-Key my-secret-key
+```
+Vector:
+```toml
+[sinks.argus]
+type = "http"
+inputs = ["app_logs"]
+uri = "http://argus.example:9000/api/v2/ingest/streams/web"
+compression = "gzip"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+request.headers.X-Argus-Api-Key = "my-secret-key"
+```
+Both send only static headers, so their retries are at-least-once.
+
+### 6. Archive to Parquet (optional)
 ```properties
 # A directory or Kubernetes PersistentVolume…
 argus.archive.store=filesystem
@@ -145,6 +192,8 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 | Method | Endpoint | What it does |
 |---|---|---|
 | POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`. 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (job slots busy, or the WAL full while the archive catches up) |
+| POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, same key in progress, quota, WAL or spool full), 413, 409 (too many streams, or the id is a file job's source id), 415 |
+| GET | `/api/v2/ingest/streams/{id}`, `/api/v2/ingest/streams` | A stream's (or every stream's) spool, counters and last run. Another tenant's stream is 404 |
 | GET | `/api/v2/ingest/jobs/{id}` | Job progress: bytes, lines, format, segments, outputs, `paused` / `pausedMs`. Another tenant's job is 404 |
 | DELETE | `/api/v2/ingest/jobs/{id}` | Cancel a job at its next batch; committed segments stay |
 | POST | `/api/v2/suppression/check` | `{"message"}` → `ALLOW` / `DENY`, `windowEndsAt`, `suppressedCount` |
@@ -171,9 +220,10 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 291 tests; Redis, S3 and GCS tests need Docker
+mvn test                                         # 348 tests; Redis, S3 and GCS tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
-mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression decisions
+mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
+                                                 # decisions, push throughput / isolation, push backpressure, kill -9 during push
 ```
 
 ## License
