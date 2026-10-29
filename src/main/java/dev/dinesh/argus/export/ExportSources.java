@@ -56,11 +56,7 @@ public class ExportSources {
               ExportSource source =
                   switch (s.type()) {
                     case ELASTICSEARCH -> new ElasticsearchExportSource(s, http, mapper);
-                    case CORALOGIX ->
-                        throw new IllegalArgumentException(
-                            "argus.export.sources "
-                                + s.name()
-                                + ": coralogix is not supported yet");
+                    case CORALOGIX -> new CoralogixExportSource(s, http, mapper);
                   };
               log.info("Export source configured {}", s);
               return new Named(s.name(), s.tenant(), source);
