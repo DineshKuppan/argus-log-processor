@@ -9,6 +9,8 @@ public class PushRejectedException extends RuntimeException {
   public enum Reason {
     /** Every push request slot is busy (HTTP 429). */
     BUSY,
+    /** A request with the same {@code Idempotency-Key} is still in progress (HTTP 429). */
+    KEY_IN_FLIGHT,
     /** The tenant is over its ingest quota (HTTP 429). */
     QUOTA,
     /** The WAL is above its high watermark (HTTP 429). */
@@ -19,6 +21,8 @@ public class PushRejectedException extends RuntimeException {
     TOO_LARGE,
     /** The tenant already has {@code max-streams-per-tenant} streams (HTTP 409). */
     TOO_MANY_STREAMS,
+    /** The stream id is a file ingest source's id (HTTP 409). */
+    SOURCE_IN_USE,
     /** A {@code Content-Encoding} other than gzip (HTTP 415). */
     UNSUPPORTED_ENCODING
   }

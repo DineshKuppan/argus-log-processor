@@ -231,4 +231,30 @@ class StreamSpoolTest {
 
     assertEquals(0, pendingTotal.get());
   }
+
+  @Test
+  void spoolNumbersGrowPastSixDigits() throws IOException {
+    open(16, 1, Optional.of(new ReadPosition(999_998, 0)));
+
+    append("a\n", null);
+    assertEquals("a\n", spoolFile(999_999));
+    append("b\n", null);
+
+    assertEquals(1_000_000, spool.status().activeSpool());
+    assertEquals("b\n", Files.readString(dir.resolve("1000000.log")));
+    assertEquals(1_000_000, StreamSpool.spoolNumber(dir.resolve("1000000.log")));
+  }
+
+  @Test
+  void aCheckpointCountsOnlyForASpoolFileOfThisStream() {
+    SourceOffset own =
+        new SourceOffset("app", dir.resolve("000003.log").toString(), null, 0, 7, 0, null);
+    SourceOffset relative =
+        new SourceOffset("app", dir.resolve("x/../000003.log").toString(), null, 0, 7, 0, null);
+    SourceOffset fileJob = new SourceOffset("app", "/var/log/000050.log", null, 0, 7, 0, null);
+
+    assertEquals(Optional.of(new ReadPosition(3, 7)), ReadPosition.of(own, dir));
+    assertEquals(Optional.of(new ReadPosition(3, 7)), ReadPosition.of(relative, dir));
+    assertEquals(Optional.empty(), ReadPosition.of(fileJob, dir));
+  }
 }

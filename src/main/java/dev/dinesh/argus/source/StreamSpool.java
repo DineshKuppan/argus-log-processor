@@ -9,6 +9,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -59,8 +60,10 @@ public final class StreamSpool implements Closeable {
    */
   static final long IDLE_ROTATE_BYTES = 1L << 20;
 
-  private static final Pattern SPOOL_NAME = Pattern.compile("(\\d{6})\\.log");
-  private static final int MAX_SPOOL_NUMBER = 999_999;
+  /** Six digits, more once past 999999 (a busy stream seals a file a minute: ~2 years). */
+  private static final Pattern SPOOL_NAME = Pattern.compile("(\\d{6,9})\\.log");
+
+  private static final int MAX_SPOOL_NUMBER = 999_999_999;
   private static final ObjectMapper JSON = new ObjectMapper();
 
   /**
@@ -72,10 +75,14 @@ public final class StreamSpool implements Closeable {
   /** The first byte not yet ingested: spool file {@code spool}, offset {@code offset}. */
   public record ReadPosition(int spool, long offset) {
 
-    /** Where a stream's checkpoint says reading stopped, or empty for a checkpoint of no spool. */
-    public static Optional<ReadPosition> of(SourceOffset checkpoint) {
-      int spool = spoolNumber(Path.of(checkpoint.path()));
-      return spool < 0
+    /**
+     * Where a stream's checkpoint says reading stopped, or empty for a checkpoint of no spool file
+     * in {@code spoolDir}.
+     */
+    public static Optional<ReadPosition> of(SourceOffset checkpoint, Path spoolDir) {
+      Path path = Path.of(checkpoint.path()).toAbsolutePath().normalize();
+      int spool = spoolNumber(path);
+      return spool < 0 || !spoolDir.toAbsolutePath().normalize().equals(path.getParent())
           ? Optional.empty()
           : Optional.of(new ReadPosition(spool, checkpoint.byteOffset()));
     }
@@ -183,6 +190,10 @@ public final class StreamSpool implements Closeable {
     }
   }
 
+  public Path dir() {
+    return dir;
+  }
+
   /** The spool number of a spool file's path ({@code 000042.log} → 42), or -1. */
   public static int spoolNumber(Path path) {
     Path name = path.getFileName();
@@ -236,7 +247,12 @@ public final class StreamSpool implements Closeable {
     }
     pendingTotal.addAndGet(pending() - pendingBefore);
     if (indexEntries > 2 * settings.idempotencyWindow() + files.size()) {
-      compactIndex();
+      try {
+        compactIndex();
+      } catch (IOException | RuntimeException e) {
+        // The append is already durable and acknowledged; the index only grows until next time.
+        log.warn("Spool {}: index compaction failed, retried later: {}", dir, e.toString());
+      }
     }
     return toAppend(entry, false);
   }
@@ -441,27 +457,43 @@ public final class StreamSpool implements Closeable {
             .toList();
     Path tmp = dir.resolve(INDEX_FILE + ".tmp");
     long size = 0;
-    try (FileChannel out =
+    // The new channel stays open across the rename, so it is then the index's channel. A failure
+    // before the rename leaves the current index and its channel in use; after it, the swap is
+    // already done (an old channel would write to the replaced, unlinked file).
+    FileChannel out =
         FileChannel.open(
             tmp,
             StandardOpenOption.CREATE,
             StandardOpenOption.TRUNCATE_EXISTING,
-            StandardOpenOption.WRITE)) {
+            StandardOpenOption.WRITE);
+    try {
       for (IndexEntry e : kept) {
         byte[] line = indexLine(e);
         write(out, ByteBuffer.wrap(line), size);
         size += line.length;
       }
       out.force(true);
+      Files.move(
+          tmp,
+          dir.resolve(INDEX_FILE),
+          StandardCopyOption.ATOMIC_MOVE,
+          StandardCopyOption.REPLACE_EXISTING);
+    } catch (IOException | RuntimeException e) {
+      out.close();
+      Files.deleteIfExists(tmp);
+      throw e;
     }
-    Path indexPath = dir.resolve(INDEX_FILE);
-    DurableFiles.moveAtomically(tmp, indexPath);
-    // The open channel still points at the replaced file, so later entries go through a new one.
-    index.close();
-    index = FileChannel.open(indexPath, StandardOpenOption.WRITE);
+    FileChannel replaced = index;
+    index = out;
+    try {
+      replaced.close();
+    } catch (IOException e) {
+      log.warn("Spool {}: closing the replaced index failed: {}", dir, e.toString());
+    }
     indexSize = size;
     indexEntries = kept.size();
     lastEntryBySpool.keySet().retainAll(files.keySet());
+    DurableFiles.fsyncDirectory(dir);
   }
 
   private SpoolFile activeFile() throws IOException {

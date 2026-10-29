@@ -109,6 +109,12 @@ public final class LocalSuppressionStore implements SuppressionStore {
     return decision[0];
   }
 
+  @Override
+  public void release(String key) {
+    // An explicit removal, not an eviction: no summary.
+    windows.invalidate(key);
+  }
+
   /**
    * A window lasts {@code window} from its first message; counting a denied copy (an update) must
    * not extend it, as {@code expireAfterWrite} would.

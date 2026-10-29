@@ -135,7 +135,7 @@ curl localhost:9000/api/v2/ingest/streams/web -H 'X-Argus-Api-Key: my-secret-key
 - **Retries:** send a unique `Idempotency-Key` per batch for exactly-once. Without one, a retried batch may be ingested twice.
 - **Limits:** 429 + `Retry-After` when the tenant is over its quota (`argus.quota.ingest-bytes-per-second`, 2MB/s), the WAL or spool is full, or 16 requests are already in progress; 413 over 8MB decompressed or 10,000 lines.
 
-Fluent Bit (its HTTP output's defaults put the time in `date`, which Argus reads):
+Fluent Bit (`json_date_key timestamp`: its default key, `date`, isn't read as the event time):
 ```ini
 [OUTPUT]
     Name      http
@@ -145,6 +145,7 @@ Fluent Bit (its HTTP output's defaults put the time in `date`, which Argus reads
     URI       /api/v2/ingest/streams/web
     Format    json_lines
     Compress  gzip
+    json_date_key timestamp
     Header    X-Argus-Api-Key my-secret-key
 ```
 Vector:
@@ -191,7 +192,7 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 | Method | Endpoint | What it does |
 |---|---|---|
 | POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`. 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (job slots busy, or the WAL full while the archive catches up) |
-| POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, quota, WAL or spool full), 413, 409 (too many streams), 415 |
+| POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, same key in progress, quota, WAL or spool full), 413, 409 (too many streams, or the id is a file job's source id), 415 |
 | GET | `/api/v2/ingest/streams/{id}`, `/api/v2/ingest/streams` | A stream's (or every stream's) spool, counters and last run. Another tenant's stream is 404 |
 | GET | `/api/v2/ingest/jobs/{id}` | Job progress: bytes, lines, format, segments, outputs, `paused` / `pausedMs`. Another tenant's job is 404 |
 | DELETE | `/api/v2/ingest/jobs/{id}` | Cancel a job at its next batch; committed segments stay |
@@ -219,7 +220,7 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 340 tests; Redis, S3 and GCS tests need Docker
+mvn test                                         # 348 tests; Redis, S3 and GCS tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
 mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
                                                  # decisions, push throughput / isolation, push backpressure, kill -9 during push

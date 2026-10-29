@@ -18,6 +18,7 @@ import dev.dinesh.argus.ingest.PushRejectedException.Reason;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.quota.LocalQuotaStore;
 import dev.dinesh.argus.quota.QuotaService;
+import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.suppression.LocalSuppressionStore;
 import dev.dinesh.argus.suppression.MessageFingerprint;
 import dev.dinesh.argus.suppression.Suppressor;
@@ -47,7 +48,9 @@ class PushIngestServiceTest {
 
   private final IngestPipeline pipeline = mock(IngestPipeline.class);
   private final CheckpointStore checkpoints = mock(CheckpointStore.class);
+  private final SourceLeases leases = new SourceLeases();
   private StreamRegistry registry;
+  private Suppressor suppressor;
 
   @AfterEach
   void closeSpools() {
@@ -79,14 +82,14 @@ class PushIngestServiceTest {
   private PushIngestService service(PushProperties props, long quotaBytesPerSecond)
       throws IOException {
     when(checkpoints.load(any(), any())).thenReturn(Optional.empty());
-    registry = new StreamRegistry(props, checkpoints);
+    registry = new StreamRegistry(props, checkpoints, leases);
     IngestProperties ingest =
         new IngestProperties(0, null, null, 0, 0, DataSize.ofBytes(64), 0, List.of(), null, null);
     QuotaService quotas =
         new QuotaService(
             new LocalQuotaStore(),
             new QuotaProperties(null, DataSize.ofBytes(quotaBytesPerSecond), 1.0, Map.of()));
-    Suppressor suppressor =
+    suppressor =
         new Suppressor(
             new LocalSuppressionStore(Duration.ofSeconds(10), 1000), new MessageFingerprint(false));
     return new PushIngestService(
@@ -95,6 +98,34 @@ class PushIngestServiceTest {
 
   private static PushRequest request(String tenant, String body) {
     return request(tenant, body.getBytes(StandardCharsets.UTF_8), null, null);
+  }
+
+  /** A body that blocks its reader until {@code release}, after counting down {@code reading}. */
+  private static InputStream blocking(CountDownLatch reading, CountDownLatch release) {
+    return new InputStream() {
+      @Override
+      public int read() throws IOException {
+        reading.countDown();
+        try {
+          release.await(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+          throw new IOException(e);
+        }
+        return -1;
+      }
+    };
+  }
+
+  private static CompletableFuture<PushResult> pushAsync(
+      PushIngestService service, PushRequest request) {
+    return CompletableFuture.supplyAsync(
+        () -> {
+          try {
+            return service.push(request);
+          } catch (IOException e) {
+            throw new RuntimeException(e);
+          }
+        });
   }
 
   private static PushRequest request(String tenant, byte[] body, String encoding, String key) {
@@ -315,5 +346,91 @@ class PushIngestServiceTest {
     release.countDown();
     assertEquals(0, first.get(10, TimeUnit.SECONDS).accepted());
     assertEquals(1, service.push(request("globex", "a\n")).accepted(), "the slot is free again");
+  }
+
+  @Test
+  void aSpoolWriteThatFailsGivesBackItsSuppressionWindowsSoTheRetryIsKept() throws IOException {
+    PushIngestService service = service();
+    service.push(request("acme", "{\"msg\":\"warm up\"}\n"));
+    registry.find("acme", "app").orElseThrow().spool().close();
+
+    assertThrows(
+        IllegalStateException.class,
+        () -> service.push(request("acme", "{\"msg\":\"disk full\"}\n")));
+
+    assertTrue(
+        suppressor.check("acme", "disk full").allowed(),
+        "the lost line's window was released, so its retry is not suppressed");
+  }
+
+  @Test
+  void aRetryWhileItsOriginalIsInProgressGets429() throws Exception {
+    PushIngestService service = service();
+    CountDownLatch reading = new CountDownLatch(1);
+    CountDownLatch release = new CountDownLatch(1);
+    CompletableFuture<PushResult> original =
+        pushAsync(
+            service,
+            new PushRequest(
+                "acme", "app", blocking(reading, release), null, -1, "batch-1", null, null));
+    assertTrue(reading.await(10, TimeUnit.SECONDS));
+
+    PushRejectedException inFlight =
+        assertThrows(
+            PushRejectedException.class,
+            () -> service.push(request("acme", "a\n".getBytes(), null, "batch-1")));
+
+    assertEquals(Reason.KEY_IN_FLIGHT, inFlight.reason());
+    assertEquals(1, inFlight.retryAfterSeconds());
+    release.countDown();
+    assertFalse(original.get(10, TimeUnit.SECONDS).duplicate());
+    assertTrue(
+        service.push(request("acme", "a\n".getBytes(), null, "batch-1")).duplicate(),
+        "once the original is done, the retry is answered from it");
+  }
+
+  @Test
+  void aRejectedRequestDoesNotCreateItsStream() throws IOException {
+    PushIngestService service = service(push(8, 2, 4, 1L << 30, 3), 1L << 20);
+
+    assertEquals(Reason.TOO_LARGE, rejection(() -> service.push(request("acme", "123456789"))));
+    assertEquals(Reason.TOO_LARGE, rejection(() -> service.push(request("acme", "a\nb\nc\n"))));
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> service.push(request("acme", "x".getBytes(), "gzip", null)));
+
+    assertEquals(Optional.empty(), registry.find("acme", "app"));
+  }
+
+  @Test
+  void suppressedLinesAreNotCountedAsTruncated() throws IOException {
+    PushIngestService service = service();
+    String longLine = "x".repeat(100);
+
+    PushResult result = service.push(request("acme", longLine + "\n" + longLine + "\n"));
+
+    assertEquals(1, result.accepted());
+    assertEquals(1, result.suppressed());
+    assertEquals(1, result.truncated());
+  }
+
+  @Test
+  void aStreamIdUsedByFileIngestIsRefused() throws IOException {
+    PushIngestService service = service();
+    when(checkpoints.load("acme", "app"))
+        .thenReturn(Optional.of(new SourceOffset("app", "/var/log/app.log", null, 0, 10, 0, null)));
+    leases.tryAcquireForFile("globex", "app", "job-1");
+
+    assertEquals(Reason.SOURCE_IN_USE, rejection(() -> service.push(request("acme", "a\n"))));
+    assertEquals(
+        Reason.SOURCE_IN_USE,
+        rejection(() -> service.push(request("globex", "a\n"))),
+        "a running file job holds it");
+    leases.release("globex", "app", "job-1");
+    service.push(request("globex", "a\n"));
+    assertEquals(
+        Optional.of("push stream app"),
+        leases.tryAcquireForFile("globex", "app", "job-2"),
+        "a file job can't take a stream's id");
   }
 }

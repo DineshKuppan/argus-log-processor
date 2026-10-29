@@ -41,7 +41,10 @@ public record PushProperties(
   private static final DataSize MAX_REQUEST_BYTES_LIMIT = DataSize.ofMegabytes(512);
 
   public PushProperties {
-    spoolDir = spoolDir != null ? spoolDir : Path.of("data", "spool");
+    // Absolute and normalized: spool paths are part of each stream checkpoint's identity, so
+    // another spelling of the same directory must not look like new spool files.
+    spoolDir =
+        (spoolDir != null ? spoolDir : Path.of("data", "spool")).toAbsolutePath().normalize();
     maxRequestBytes = maxRequestBytes != null ? maxRequestBytes : DataSize.ofMegabytes(8);
     maxRequestLines = maxRequestLines > 0 ? maxRequestLines : 10_000;
     maxConcurrentRequests = maxConcurrentRequests > 0 ? maxConcurrentRequests : 16;

@@ -13,4 +13,10 @@ public interface SuppressionStore {
    * @param message the original message, for summaries of suppressed windows
    */
   SuppressionDecision acquire(String key, String message);
+
+  /**
+   * Ends the key's window, so the next call for it is allowed: for a message that was allowed but
+   * then not kept (its write failed), so a retry isn't suppressed as its copy. Best effort.
+   */
+  void release(String key);
 }

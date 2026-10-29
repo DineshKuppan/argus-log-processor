@@ -20,8 +20,7 @@ public class JsonLogParser implements LogParser {
   private static final ObjectMapper MAPPER = new ObjectMapper();
   private static final TypeReference<LinkedHashMap<String, Object>> MAP = new TypeReference<>() {};
   private static final List<String> TIMESTAMP_KEYS =
-      // date: Fluent Bit's json_date_key (epoch seconds with a fraction)
-      List.of("timestamp", "@timestamp", "time", "ts", "date");
+      List.of("timestamp", "@timestamp", "time", "ts");
   private static final List<String> LEVEL_KEYS =
       List.of("level", "severity", "log.level", "levelname", "lvl");
   private static final List<String> MESSAGE_KEYS = List.of("message", "msg", "body", "log");

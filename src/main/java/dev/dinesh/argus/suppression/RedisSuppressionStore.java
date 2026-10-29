@@ -74,6 +74,17 @@ public final class RedisSuppressionStore implements SuppressionStore {
         : SuppressionDecision.deny(endsAt, ((Number) reply.get(2)).longValue());
   }
 
+  @Override
+  public void release(String key) {
+    try {
+      redis.delete(key);
+    } catch (RuntimeException e) {
+      // The window then ends at its TTL: a retry within it is suppressed, as without release.
+      log.warn(
+          "Suppression store unavailable, window not released key={} error={}", key, e.toString());
+    }
+  }
+
   /** Decisions answered ALLOW because Redis failed. */
   public long failOpenCount() {
     return failOpens.get();

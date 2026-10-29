@@ -105,22 +105,32 @@ class FormatParsersTest {
   }
 
   @Test
-  void fluentBitRecordsUseTheirDateKeyAsEpochSecondsWithAFraction() {
+  void fractionalEpochSecondsKeepTheirFraction() {
+    // Fluent Bit's HTTP output with json_date_key timestamp (json_date_format double).
     LogRecord r =
         new JsonLogParser()
-            .parse("{\"date\":1700000000.25,\"log\":\"GET /health 200\",\"stream\":\"stdout\"}");
+            .parse(
+                "{\"timestamp\":1700000000.25,\"log\":\"GET /health 200\",\"stream\":\"stdout\"}");
 
     assertEquals(Instant.ofEpochSecond(1_700_000_000L, 250_000_000), r.getTimestamp());
     assertEquals("GET /health 200", r.getMessage());
     assertEquals("stdout", r.getMeta().get("stream"));
     assertEquals(
         Instant.ofEpochSecond(-2, 500_000_000),
-        new JsonLogParser().parse("{\"date\":-1.5,\"msg\":\"x\"}").getTimestamp());
+        new JsonLogParser().parse("{\"ts\":-1.5,\"msg\":\"x\"}").getTimestamp());
     // Too large for seconds: read like an integer epoch (milliseconds here).
     assertEquals(
         Instant.ofEpochMilli(1_700_000_000_123L),
-        new JsonLogParser().parse("{\"date\":1700000000123.0,\"msg\":\"x\"}").getTimestamp());
-    assertNull(new JsonLogParser().parse("{\"date\":1e300,\"msg\":\"x\"}").getTimestamp());
+        new JsonLogParser().parse("{\"ts\":1700000000123.0,\"msg\":\"x\"}").getTimestamp());
+    assertNull(new JsonLogParser().parse("{\"ts\":1e300,\"msg\":\"x\"}").getTimestamp());
+  }
+
+  @Test
+  void aDateFieldIsAnAttributeNotTheEventTime() {
+    LogRecord r = new JsonLogParser().parse("{\"msg\":\"invoice sent\",\"date\":\"2020-01-01\"}");
+
+    assertNull(r.getTimestamp());
+    assertEquals("2020-01-01", r.getMeta().get("date"));
   }
 
   @Test

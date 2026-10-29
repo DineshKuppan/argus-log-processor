@@ -126,7 +126,10 @@ public class IngestJobService {
     }
   }
 
-  /** Thrown when the source already has a running job or stream run; maps to HTTP 409. */
+  /**
+   * Thrown when the source already has a running job or stream run, or is a push stream's; maps to
+   * HTTP 409.
+   */
   public static class SourceBusyException extends RuntimeException {
     SourceBusyException(String sourceId, String owner) {
       super("Source " + sourceId + " is busy with " + owner);
@@ -164,7 +167,7 @@ public class IngestJobService {
     IngestJob job =
         new IngestJob(
             UUID.randomUUID().toString(), tenantId, sourceId, realPath, fromBeginning, parser);
-    Optional<String> owner = leases.tryAcquire(tenantId, sourceId, job.id());
+    Optional<String> owner = leases.tryAcquireForFile(tenantId, sourceId, job.id());
     if (owner.isPresent()) {
       throw new SourceBusyException(sourceId, owner.get());
     }

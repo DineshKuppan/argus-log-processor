@@ -18,6 +18,7 @@ import dev.dinesh.argus.config.SuppressionProperties;
 import dev.dinesh.argus.config.TenancyConfig;
 import dev.dinesh.argus.ingest.IngestPipeline;
 import dev.dinesh.argus.ingest.PushIngestService;
+import dev.dinesh.argus.ingest.SourceLeases;
 import dev.dinesh.argus.ingest.StreamRegistry;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.tenant.ApiKeyTenantResolver;
@@ -54,6 +55,7 @@ import org.springframework.util.unit.DataSize;
 @Import({
   PushIngestService.class,
   StreamRegistry.class,
+  SourceLeases.class,
   ParserRegistry.class,
   TenancyConfig.class,
   QuotaConfig.class,

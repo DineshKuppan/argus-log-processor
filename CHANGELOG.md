@@ -19,12 +19,13 @@ Plan and results: [`P3_PLAN.md`](docs/architecture/P3_PLAN.md).
 - **Every push limit has a status:** 429 + `Retry-After` for busy request slots, the quota, a full WAL or a full spool; 413 for the body (8MB decompressed, which stops gzip bombs) or 10,000 lines; 409 for more than 32 streams per tenant; 415 for an unknown `Content-Encoding`.
 - **Suppression on push:** repeated messages are dropped at receive time; only allowed lines reach the spool, so a replay never suppresses again.
 - One `Push request finished …` canonical line per request.
+- `SuppressionStore.release`: a pushed request whose spool write fails gives back its suppression windows, so its retry isn't suppressed.
 - Load tests (tag `load`), with the application in its own 256MB JVM: `PushIngestIT` (T1 and tenant isolation), `PushBackpressureIT` (T3 for push), `PushCrashIT` (T4 for push).
 
 #### Changed
-- File jobs and stream runs share `SourceLeases`, so a source has one run at a time whichever started it. A 409 for a busy source now names its owner.
+- File jobs and stream runs share `SourceLeases`, so a source has one run at a time whichever started it. A 409 for a busy source now names its owner. A file job can't use a push stream's id (409), nor a stream a file source's id.
 - `IngestPipeline.Request` gains `endOffset` and `pathIsIdentity`; `ResumePoint` gains `PATH_CHANGED`.
-- `JsonLogParser` reads Fluent Bit's `date` key, and fractional epoch seconds keep their fraction.
+- `JsonLogParser`: fractional epoch seconds keep their fraction (Fluent Bit's `json_date_format double`).
 - ADR-6 now recommends Java 21 before P4 rather than P3.
 
 #### Measured

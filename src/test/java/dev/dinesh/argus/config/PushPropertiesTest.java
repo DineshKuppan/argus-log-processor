@@ -15,7 +15,7 @@ class PushPropertiesTest {
   void defaultsMatchThePlan() {
     PushProperties p = new PushProperties(null, null, 0, 0, null, null, null, 0, 0, 0, null);
 
-    assertEquals(Path.of("data", "spool"), p.spoolDir());
+    assertEquals(Path.of("data", "spool").toAbsolutePath(), p.spoolDir());
     assertEquals(DataSize.ofMegabytes(8), p.maxRequestBytes());
     assertEquals(10_000, p.maxRequestLines());
     assertEquals(16, p.maxConcurrentRequests());

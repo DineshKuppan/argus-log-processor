@@ -9,7 +9,7 @@ import java.time.Instant;
  *
  * @param format the stream's requested format, or null when each spool file's is detected
  * @param pendingBytes acknowledged bytes not yet ingested
- * @param lastRun the latest run of the spool, or null if none has run since startup
+ * @param lastRun the running or latest run of the spool, or null if none has run since startup
  */
 public record StreamStatus(
     String streamId,
@@ -30,7 +30,7 @@ public record StreamStatus(
     RunStatus lastRun) {
 
   /**
-   * @param outcome {@code COMPLETED}, {@code CANCELLED} or {@code FAILED}
+   * @param outcome {@code RUNNING}, {@code COMPLETED}, {@code CANCELLED} or {@code FAILED}
    * @param paused why the run is waiting right now ({@code WAL_FULL}), or null
    */
   public record RunStatus(

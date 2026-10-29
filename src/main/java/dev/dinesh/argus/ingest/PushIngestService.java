@@ -21,6 +21,9 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
@@ -94,6 +97,7 @@ public class PushIngestService {
   private final PushProperties props;
   private final int maxLineBytes;
   private final Semaphore requestSlots;
+  private final Set<String> keysInFlight = ConcurrentHashMap.newKeySet();
 
   public PushIngestService(
       StreamRegistry streams,
@@ -179,44 +183,76 @@ public class PushIngestService {
             SPOOL_FULL_RETRY_AFTER_SECONDS,
             "The spool holds argus.push.max-spool-bytes not yet ingested; retry later");
       }
-      PushStream stream = streams.getOrCreate(tenantId, streamId);
-      stream.requests.incrementAndGet();
-      stream.lastRequestAt = receivedAt;
-      if (key != null) {
-        var earlier = stream.spool().find(key);
+      if (key == null) {
+        return readAndSpool(request, tenantId, streamId, requested, null, receivedAt, counts);
+      }
+      // One request per key at a time: a retry racing its original would otherwise miss the key,
+      // have its lines suppressed as the original's copies, and could be stored under the key.
+      String inFlight = tenantId + "/" + streamId + "/" + key;
+      if (!keysInFlight.add(inFlight)) {
+        throw new PushRejectedException(
+            Reason.KEY_IN_FLIGHT,
+            BUSY_RETRY_AFTER_SECONDS,
+            "A request with this Idempotency-Key is still in progress; retry later");
+      }
+      try {
+        // Not creating the stream: a request that is then rejected must not take a stream slot.
+        Optional<PushStream> existing = streams.find(tenantId, streamId);
+        Optional<StreamSpool.Append> earlier = existing.flatMap(s -> s.spool().find(key));
         if (earlier.isPresent()) {
+          PushStream stream = existing.get();
+          stream.requests.incrementAndGet();
+          stream.lastRequestAt = receivedAt;
           return duplicate(stream, earlier.get());
         }
+        return readAndSpool(request, tenantId, streamId, requested, key, receivedAt, counts);
+      } finally {
+        keysInFlight.remove(inFlight);
       }
-      byte[] body = readBody(request);
-      counts.bodyBytes = body.length;
-      counts.lines = countLines(body);
-      if (counts.lines > props.maxRequestLines()) {
-        throw new PushRejectedException(
-            Reason.TOO_LARGE,
-            "Request has more than "
-                + props.maxRequestLines()
-                + " lines (argus.push.max-request-lines)");
-      }
-      QuotaDecision quota = quotas.takeIngestBytes(tenantId, body.length);
-      if (!quota.allowed()) {
-        throw new PushRejectedException(
-            Reason.QUOTA,
-            quota.retryAfterSeconds(),
-            "Tenant is over its ingest quota (argus.quota.ingest-bytes-per-second); retry later");
-      }
-      if (requested != null) {
-        stream.useParser(requested);
-      }
-      return spool(stream, body, key, receivedAt);
     } finally {
       requestSlots.release();
     }
   }
 
+  private PushResult readAndSpool(
+      PushRequest request,
+      String tenantId,
+      String streamId,
+      LogParser requested,
+      String key,
+      Instant receivedAt,
+      Counts counts)
+      throws IOException {
+    byte[] body = readBody(request);
+    counts.bodyBytes = body.length;
+    counts.lines = countLines(body);
+    if (counts.lines > props.maxRequestLines()) {
+      throw new PushRejectedException(
+          Reason.TOO_LARGE,
+          "Request has more than "
+              + props.maxRequestLines()
+              + " lines (argus.push.max-request-lines)");
+    }
+    QuotaDecision quota = quotas.takeIngestBytes(tenantId, body.length);
+    if (!quota.allowed()) {
+      throw new PushRejectedException(
+          Reason.QUOTA,
+          quota.retryAfterSeconds(),
+          "Tenant is over its ingest quota (argus.quota.ingest-bytes-per-second); retry later");
+    }
+    PushStream stream = streams.getOrCreate(tenantId, streamId);
+    stream.requests.incrementAndGet();
+    stream.lastRequestAt = receivedAt;
+    if (requested != null) {
+      stream.useParser(requested);
+    }
+    return spool(stream, body, key, receivedAt);
+  }
+
   private PushResult spool(PushStream stream, byte[] body, String key, Instant receivedAt)
       throws IOException {
     ParserChain chain = props.suppress() ? messageChain(stream, body) : null;
+    List<String> allowedKeys = new ArrayList<>();
     byte[] out = body;
     int written = 0;
     int accepted = 0;
@@ -232,13 +268,14 @@ public class PushIngestService {
         continue;
       }
       int length = Math.min(end - start, maxLineBytes);
-      if (length < end - start) {
-        truncated++;
-      }
-      if (chain != null && isSuppressed(stream.tenantId(), chain, body, start, length)) {
+      if (chain != null
+          && isSuppressed(stream.tenantId(), chain, body, start, length, allowedKeys)) {
         suppressed++;
         start = next;
         continue;
+      }
+      if (length < end - start) {
+        truncated++;
       }
       if (written + length + 1 > out.length) {
         // Only the last line can lack its newline, and only it can need one more byte.
@@ -250,8 +287,16 @@ public class PushIngestService {
       accepted++;
       start = next;
     }
-    StreamSpool.Append append = stream.spool().append(out, written, key, receivedAt);
+    StreamSpool.Append append;
+    try {
+      append = stream.spool().append(out, written, key, receivedAt);
+    } catch (IOException | RuntimeException e) {
+      // Nothing was spooled: the client retries, and its lines must not be suppressed as copies.
+      suppressor.release(allowedKeys);
+      throw e;
+    }
     if (append.duplicate()) {
+      suppressor.release(allowedKeys);
       return duplicate(stream, append);
     }
     stream.acceptedLines.addAndGet(accepted);
@@ -294,7 +339,12 @@ public class PushIngestService {
   }
 
   private boolean isSuppressed(
-      String tenantId, ParserChain chain, byte[] body, int start, int length) {
+      String tenantId,
+      ParserChain chain,
+      byte[] body,
+      int start,
+      int length,
+      List<String> allowedKeys) {
     int textLength = length > 0 && body[start + length - 1] == '\r' ? length - 1 : length;
     String line = new String(body, start, textLength, StandardCharsets.UTF_8);
     ParserChain.Parsed parsed = chain.parse(line);
@@ -305,7 +355,7 @@ public class PushIngestService {
     if (message.length() > Suppressor.MAX_MESSAGE_CHARS) {
       return false; // too long to fingerprint cheaply: kept, like any line suppression can't judge
     }
-    return !suppressor.check(tenantId, message).allowed();
+    return !suppressor.check(tenantId, message, allowedKeys).allowed();
   }
 
   private byte[] readBody(PushRequest request) throws IOException {

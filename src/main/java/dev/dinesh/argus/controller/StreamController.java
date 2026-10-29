@@ -92,9 +92,9 @@ public class StreamController {
   ResponseEntity<Map<String, String>> rejected(PushRejectedException e) {
     HttpStatus status =
         switch (e.reason()) {
-          case BUSY, QUOTA, WAL_FULL, SPOOL_FULL -> HttpStatus.TOO_MANY_REQUESTS;
+          case BUSY, KEY_IN_FLIGHT, QUOTA, WAL_FULL, SPOOL_FULL -> HttpStatus.TOO_MANY_REQUESTS;
           case TOO_LARGE -> HttpStatus.PAYLOAD_TOO_LARGE;
-          case TOO_MANY_STREAMS -> HttpStatus.CONFLICT;
+          case TOO_MANY_STREAMS, SOURCE_IN_USE -> HttpStatus.CONFLICT;
           case UNSUPPORTED_ENCODING -> HttpStatus.UNSUPPORTED_MEDIA_TYPE;
         };
     ResponseEntity.BodyBuilder response = ResponseEntity.status(status);

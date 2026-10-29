@@ -204,7 +204,7 @@ public class StreamRunner implements SmartLifecycle {
       try {
         // Whatever the outcome, the checkpoint says how far the stream got.
         Optional<ReadPosition> read =
-            checkpoints.load(tenantId, streamId).flatMap(ReadPosition::of);
+            checkpoints.load(tenantId, streamId).flatMap(cp -> ReadPosition.of(cp, spool.dir()));
         if (read.isPresent()) {
           spool.markRead(read.get());
         }
@@ -221,6 +221,8 @@ public class StreamRunner implements SmartLifecycle {
     IngestProgress progress = new IngestProgress();
     Instant startedAt = Instant.now();
     stream.runs.incrementAndGet();
+    // Visible while it runs, so a run waiting on a full WAL shows as paused.
+    stream.lastRun = new PushStream.Run("RUNNING", null, claim.spool(), startedAt, null, progress);
     Outcome outcome = null;
     String error = null;
     try {

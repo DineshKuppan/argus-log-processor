@@ -10,9 +10,10 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class PushStream {
 
   /**
-   * A finished stream run.
+   * A stream run, finished or running.
    *
-   * @param outcome {@code COMPLETED}, {@code CANCELLED} or {@code FAILED}
+   * @param outcome {@code RUNNING}, {@code COMPLETED}, {@code CANCELLED} or {@code FAILED}
+   * @param finishedAt null while running
    */
   public record Run(
       String outcome,

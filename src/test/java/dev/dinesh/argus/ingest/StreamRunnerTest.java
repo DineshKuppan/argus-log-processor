@@ -93,7 +93,7 @@ class StreamRunnerTest {
     if (registry != null) {
       registry.close();
     }
-    registry = new StreamRegistry(push, checkpoints, nanos::get);
+    registry = new StreamRegistry(push, checkpoints, leases, nanos::get);
     IngestPipeline pipeline =
         new IngestPipeline(
             ingest,

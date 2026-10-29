@@ -66,7 +66,8 @@ Today Argus only pulls: a caller names a file and a job reads it. The target wor
 | Tenant quota | token bucket (D5) | 429, `Retry-After` = seconds until the request fits |
 | WAL (P2b) | high watermark | 429, `Retry-After: 60` |
 | Spool | `max-spool-bytes` (2GB) of acknowledged, not yet ingested bytes across all streams | 429, `Retry-After: 30` |
-| Streams | `max-streams-per-tenant` (32) | 409 for a new stream id |
+| Streams | `max-streams-per-tenant` (32) | 409 for a new stream id (checked after every other bound, so a rejected request doesn't create its stream) |
+| One request per `Idempotency-Key` | a retry racing its original | 429, `Retry-After: 1`; then 200 from the original |
 | Stream runs | `max-concurrent-runs` (2) | Runs wait; their spool absorbs it |
 
 The checks run cheapest first and before the body is read, except the ones that need its size, so a rejected request costs almost nothing.
@@ -97,7 +98,7 @@ The checks run cheapest first and before the body is read, except the ones that 
 | `IngestPipeline.Request` | `ingest` | Gains `limit` and "path is part of the identity" (D1 rotation) |
 | `QuotaStore`, `LocalQuotaStore`, `RedisQuotaStore`, `QuotaService` | `quota` (new) | D5 |
 | `PushProperties`, `QuotaProperties`, `PushConfig`, `QuotaConfig` | `config` | Binding and wiring |
-| `JsonLogParser` | `parser` | Adds `date` (Fluent Bit's `json_date_key`, epoch seconds) to the timestamp keys |
+| `JsonLogParser` | `parser` | Fractional epoch seconds keep their fraction (Fluent Bit's `json_date_format double`; its `json_date_key` is set to `timestamp`, since a generic `date` key would turn business fields into event times) |
 
 ## 4. Configuration
 
@@ -139,7 +140,7 @@ Disk budget (§2 of the design): WAL 30GB + Parquet staging ≤2GB + spool ≤2G
 
 ## 6. Implementation order (P3a, one commit per step)
 1. The plan (this file) and an ADR-6 update.
-2. `FileSource` limit, `Request` identity option, `JsonLogParser` `date`.
+2. `FileSource` limit, `Request` identity option, `JsonLogParser` fractional epoch seconds.
 3. `StreamSpool` + tests.
 4. `quota` package (local + Redis) + tests.
 5. `PushIngestService`, `StreamRunner`, `StreamController`, configuration + tests.
@@ -182,3 +183,12 @@ Measured on an Apple M1 Pro (10 cores, SSD), JDK 17, with the application in its
 Found while building:
 - **The local quota's refill overflowed at high rates.** Elapsed nanoseconds × bytes/s was computed in a `long` before dividing, which overflows after about 9s at 1GB/s and then denied requests. `PushBackpressureIT` showed it as unexplained 429s; fixed, with a regression test.
 - **`max-spool-bytes` must count unread bytes, not bytes on disk.** A stream's active spool file holds already-ingested bytes until it rotates, so a disk-size cap would have refused pushes while nothing was waiting.
+
+Found in review (fixed, each with a test):
+- **A failed spool write lost the retry to suppression.** The lines' suppression windows were already open, so the client's retry within 10s was suppressed and acknowledged with nothing spooled. The windows are now released when the write fails (`SuppressionStore.release`).
+- **A retry racing its original** could miss the key, be suppressed as the original's copy, and store an empty append under the key. One request per key is in progress at a time; the other gets 429 and then 200 from the original.
+- **Stream ids and file source ids shared checkpoints.** A file job named like a stream replaced its checkpoint, so the stream re-read its spool, and a file named like a spool file (`000050.log`) could have made the spool delete files not yet read. They are now kept apart (409 either way), and a checkpoint counts only if it names a spool file in the stream's own directory.
+- **Index compaction ran inside an acknowledged append.** A failure answered 500 for durable lines, and a failed reopen left a closed channel behind. Compaction is now best effort, and the new index's channel is opened before the rename.
+- **Rejected requests created their stream**, using up `max-streams-per-tenant` slots that can't be freed. The stream is now created after every other bound.
+- **Spool numbers had six digits**, about two years of one-a-minute rotations; they now grow to nine.
+- Also: `date` is no longer a JSON timestamp key (it turned business fields into event times; the Fluent Bit example sets `json_date_key timestamp`), suppressed lines aren't counted as truncated, a running stream run shows in status (`RUNNING`, with `paused: WAL_FULL`), and `spool-dir` is made absolute so another spelling of it doesn't re-ingest every spool.
