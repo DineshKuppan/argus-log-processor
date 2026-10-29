@@ -18,6 +18,8 @@ import dev.dinesh.argus.source.FileSource;
 import dev.dinesh.argus.source.LogBatch;
 import dev.dinesh.argus.source.RawBatch;
 import dev.dinesh.argus.source.SourceOffset;
+import dev.dinesh.argus.tail.TailEvent;
+import dev.dinesh.argus.tail.TailHub;
 import dev.dinesh.argus.tenant.TenantIds;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -103,6 +105,14 @@ public class IngestPipeline {
       return new Request(
           tenantId, path, sourceId, fromBeginning, parser, endOffset, pathIsIdentity, limit, true);
     }
+
+    /**
+     * Whether the run's lines go to the live tail ({@code P4_PLAN.md} D1): a live file job's do. A
+     * stream run's lines were tailed when they were pushed, and the replay lane's are history.
+     */
+    public boolean tailed() {
+      return !pathIsIdentity && !lowPriority;
+    }
   }
 
   static final String THREAD_PREFIX = "ingest-";
@@ -122,6 +132,7 @@ public class IngestPipeline {
   private final CheckpointStore checkpoints;
   private final WalCapacity walCapacity;
   private final ArgusMetrics metrics;
+  private final TailHub tail;
 
   /** Without an archive store nothing drains the WAL, so there is no WAL limit to wait for. */
   @Autowired
@@ -131,14 +142,16 @@ public class IngestPipeline {
       LogSink sink,
       CheckpointStore checkpoints,
       ObjectProvider<WalCapacity> walCapacity,
-      ObjectProvider<ArgusMetrics> metrics) {
+      ObjectProvider<ArgusMetrics> metrics,
+      ObjectProvider<TailHub> tail) {
     this(
         props,
         parsers,
         sink,
         checkpoints,
         walCapacity.getIfAvailable(() -> WalCapacity.UNBOUNDED),
-        metrics.getIfAvailable(ArgusMetrics::noop));
+        metrics.getIfAvailable(ArgusMetrics::noop),
+        tail.getIfAvailable());
   }
 
   public IngestPipeline(
@@ -162,12 +175,27 @@ public class IngestPipeline {
       CheckpointStore checkpoints,
       WalCapacity walCapacity,
       ArgusMetrics metrics) {
+    this(props, parsers, sink, checkpoints, walCapacity, metrics, null);
+  }
+
+  /**
+   * @param tail where live file jobs publish their lines, or null for none
+   */
+  public IngestPipeline(
+      IngestProperties props,
+      ParserRegistry parsers,
+      LogSink sink,
+      CheckpointStore checkpoints,
+      WalCapacity walCapacity,
+      ArgusMetrics metrics,
+      TailHub tail) {
     this.props = props;
     this.parsers = parsers;
     this.sink = sink;
     this.checkpoints = checkpoints;
     this.walCapacity = walCapacity;
     this.metrics = metrics;
+    this.tail = tail;
   }
 
   /** True while the WAL is above its high watermark: new jobs would only wait. */
@@ -289,7 +317,8 @@ public class IngestPipeline {
               progress,
               cancel,
               request.readLimit(),
-              request.lowPriority());
+              request.lowPriority(),
+              tail != null && request.tailed());
     } catch (Exception e) {
       source.close();
       throw e;
@@ -326,6 +355,7 @@ public class IngestPipeline {
     private final ByteRateLimiter readLimit;
     private final boolean lowPriority;
     private final String lane;
+    private final boolean tailed;
     private final BlockingQueue<RawBatch> raw;
     private final BlockingQueue<LogBatch> parsed;
     private final AtomicBoolean stop = new AtomicBoolean();
@@ -345,7 +375,9 @@ public class IngestPipeline {
         IngestProgress progress,
         AtomicBoolean cancel,
         ByteRateLimiter readLimit,
-        boolean lowPriority) {
+        boolean lowPriority,
+        boolean tailed) {
+      this.tailed = tailed;
       this.source = source;
       this.tenantId = tenantId;
       this.chain = chain;
@@ -427,6 +459,9 @@ public class IngestPipeline {
         int unparsed = 0;
         int fallback = 0;
         Instant observedAt = Instant.now();
+        // Checked once per batch: while nobody tails the tenant, nothing is built.
+        List<TailEvent> tailEvents =
+            tailed && tail.isWatched(tenantId) ? new ArrayList<>(batch.lines().size()) : null;
         for (int i = 0; i < batch.lines().size(); i++) {
           String line = batch.lines().get(i);
           ParserChain.Parsed result = chain.parse(line);
@@ -443,7 +478,14 @@ public class IngestPipeline {
             case FALLBACK -> fallback++;
             case PRIMARY -> {}
           }
-          records.add(envelopes.create(result, batch.lineOffsets()[i], observedAt));
+          LogEnvelope envelope = envelopes.create(result, batch.lineOffsets()[i], observedAt);
+          records.add(envelope);
+          if (tailEvents != null) {
+            tailEvents.add(TailEvent.ofFile(envelope, line.length()));
+          }
+        }
+        if (tailEvents != null) {
+          tail.publish(tenantId, tailEvents);
         }
         progress.parsed(records.size(), rejected, unparsed, fallback);
         metrics.ingestBatch(

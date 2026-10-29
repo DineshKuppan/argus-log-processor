@@ -119,6 +119,47 @@ class IngestPipelineTest {
     return new IngestPipeline(PROPS, new ParserRegistry(), sink, checkpoints);
   }
 
+  /** Live file jobs are tailed with the ids the archive holds; stream runs and replays are not. */
+  @Test
+  void onlyLiveFileJobsPublishToTheTail() throws Exception {
+    Path file = writeLog(25);
+    RecordingTail tail = new RecordingTail();
+    IngestPipeline pipeline =
+        new IngestPipeline(
+            PROPS,
+            new ParserRegistry(),
+            localSink(dir.resolve("out")),
+            checkpoints(dir.resolve("cp")),
+            WalCapacity.UNBOUNDED,
+            ArgusMetrics.noop(),
+            tail);
+
+    pipeline.run(
+        new Request("acme", file, "app", false, null), new IngestProgress(), new AtomicBoolean());
+
+    assertEquals(25, tail.published.size());
+    List<JsonNode> written = records(dir.resolve("out"));
+    assertEquals(written.get(3).get("eventId").asText(), tail.published.get(3).eventId());
+    assertEquals(
+        written.get(3).get("source").get("offset").asLong(), tail.published.get(3).offset());
+    assertEquals("nginx_access", tail.published.get(0).format());
+
+    pipeline.run(
+        new Request("acme", file, "app", true, null).onReplayLane(new ByteRateLimiter(1L << 30)),
+        new IngestProgress(),
+        new AtomicBoolean());
+    pipeline.run(
+        new Request("acme", file, "spool", true, null, Files.size(file), true),
+        new IngestProgress(),
+        new AtomicBoolean());
+    assertEquals(25, tail.published.size(), "replays and stream runs are not tailed");
+
+    tail.watched = false;
+    pipeline.run(
+        new Request("acme", file, "other", true, null), new IngestProgress(), new AtomicBoolean());
+    assertEquals(25, tail.published.size());
+  }
+
   /** The meters count what the run's canonical line reports. */
   @Test
   void metricsMatchTheRunsCounts() throws Exception {

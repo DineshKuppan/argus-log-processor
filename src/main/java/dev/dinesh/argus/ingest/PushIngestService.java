@@ -8,11 +8,14 @@ import dev.dinesh.argus.parser.FormatDetector;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserChain;
 import dev.dinesh.argus.parser.ParserRegistry;
+import dev.dinesh.argus.pipeline.EnvelopeFactory;
 import dev.dinesh.argus.quota.QuotaDecision;
 import dev.dinesh.argus.quota.QuotaService;
 import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.source.StreamSpool;
 import dev.dinesh.argus.suppression.Suppressor;
+import dev.dinesh.argus.tail.TailEvent;
+import dev.dinesh.argus.tail.TailHub;
 import dev.dinesh.argus.tenant.TenantIds;
 import java.io.EOFException;
 import java.io.IOException;
@@ -103,6 +106,9 @@ public class PushIngestService {
   private final Set<String> keysInFlight = ConcurrentHashMap.newKeySet();
   private final ArgusMetrics metrics;
 
+  /** Where accepted lines are published, or null for none. */
+  private final TailHub tail;
+
   public PushIngestService(
       StreamRegistry streams,
       IngestPipeline pipeline,
@@ -111,7 +117,7 @@ public class PushIngestService {
       ParserRegistry parsers,
       PushProperties props,
       IngestProperties ingest) {
-    this(streams, pipeline, quotas, suppressor, parsers, props, ingest, ArgusMetrics.noop());
+    this(streams, pipeline, quotas, suppressor, parsers, props, ingest, ArgusMetrics.noop(), null);
   }
 
   @Autowired
@@ -123,7 +129,8 @@ public class PushIngestService {
       ParserRegistry parsers,
       PushProperties props,
       IngestProperties ingest,
-      ObjectProvider<ArgusMetrics> metrics) {
+      ObjectProvider<ArgusMetrics> metrics,
+      ObjectProvider<TailHub> tail) {
     this(
         streams,
         pipeline,
@@ -132,7 +139,8 @@ public class PushIngestService {
         parsers,
         props,
         ingest,
-        metrics.getIfAvailable(ArgusMetrics::noop));
+        metrics.getIfAvailable(ArgusMetrics::noop),
+        tail.getIfAvailable());
   }
 
   public PushIngestService(
@@ -143,8 +151,10 @@ public class PushIngestService {
       ParserRegistry parsers,
       PushProperties props,
       IngestProperties ingest,
-      ArgusMetrics metrics) {
+      ArgusMetrics metrics,
+      TailHub tail) {
     this.metrics = metrics;
+    this.tail = tail;
     this.streams = streams;
     this.pipeline = pipeline;
     this.quotas = quotas;
@@ -298,7 +308,12 @@ public class PushIngestService {
 
   private PushResult spool(PushStream stream, byte[] body, String key, Instant receivedAt)
       throws IOException {
-    ParserChain chain = props.suppress() ? messageChain(stream, body) : null;
+    // Lines are parsed to find their messages (suppression) and, while the tenant has a tail open,
+    // to publish them; otherwise not at all.
+    boolean tailed = tail != null && tail.isWatched(stream.tenantId());
+    ParserChain chain = props.suppress() || tailed ? messageChain(stream, body) : null;
+    List<ParserChain.Parsed> tailLines = tailed ? new ArrayList<>() : null;
+    List<Integer> tailLengths = tailed ? new ArrayList<>() : null;
     List<String> allowedKeys = new ArrayList<>();
     byte[] out = body;
     int written = 0;
@@ -315,11 +330,21 @@ public class PushIngestService {
         continue;
       }
       int length = Math.min(end - start, maxLineBytes);
-      if (chain != null
-          && isSuppressed(stream.tenantId(), chain, body, start, length, allowedKeys)) {
+      String line = null;
+      ParserChain.Parsed parsed = null;
+      if (chain != null) {
+        int textLength = length > 0 && body[start + length - 1] == '\r' ? length - 1 : length;
+        line = new String(body, start, textLength, StandardCharsets.UTF_8);
+        parsed = chain.parse(line);
+      }
+      if (props.suppress() && isSuppressed(stream.tenantId(), parsed, line, allowedKeys)) {
         suppressed++;
         start = next;
         continue;
+      }
+      if (tailLines != null && parsed != null) {
+        tailLines.add(parsed);
+        tailLengths.add(line.length());
       }
       if (length < end - start) {
         truncated++;
@@ -349,6 +374,9 @@ public class PushIngestService {
     stream.acceptedLines.addAndGet(accepted);
     stream.suppressedLines.addAndGet(suppressed);
     stream.truncatedLines.addAndGet(truncated);
+    if (tailLines != null && !tailLines.isEmpty()) {
+      publish(stream, tailLines, tailLengths, receivedAt);
+    }
     return new PushResult(
         stream.streamId(),
         accepted,
@@ -385,16 +413,24 @@ public class PushIngestService {
     return parsers.chain(parser, true);
   }
 
+  /** Durable in the spool now: shown on the tail at once, not when the stream runner ingests it. */
+  private void publish(
+      PushStream stream,
+      List<ParserChain.Parsed> lines,
+      List<Integer> lengths,
+      Instant receivedAt) {
+    // Generation and offset are assigned when the spool is ingested, so these envelopes' ids are
+    // never shown (TailEvent.ofPush).
+    EnvelopeFactory envelopes = new EnvelopeFactory(stream.tenantId(), stream.streamId(), 0);
+    List<TailEvent> events = new ArrayList<>(lines.size());
+    for (int i = 0; i < lines.size(); i++) {
+      events.add(TailEvent.ofPush(envelopes.create(lines.get(i), 0, receivedAt), lengths.get(i)));
+    }
+    tail.publish(stream.tenantId(), events);
+  }
+
   private boolean isSuppressed(
-      String tenantId,
-      ParserChain chain,
-      byte[] body,
-      int start,
-      int length,
-      List<String> allowedKeys) {
-    int textLength = length > 0 && body[start + length - 1] == '\r' ? length - 1 : length;
-    String line = new String(body, start, textLength, StandardCharsets.UTF_8);
-    ParserChain.Parsed parsed = chain.parse(line);
+      String tenantId, ParserChain.Parsed parsed, String line, List<String> allowedKeys) {
     String message =
         parsed == null || parsed.record().getMessage() == null
             ? line
