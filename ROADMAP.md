@@ -15,8 +15,8 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | **P2a** | Parquet + ZSTD archive to a PVC or S3; local segments become the WAL | ✅ Done (#5) |
 | **P2b** | GCS, WAL watermarks, WAL compression | ✅ Done (#7) |
 | **P3a** | HTTP push ingest, quotas, suppression on push | ✅ Done (#8) |
-| **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ✅ Done |
-| **P4** | Live tail, metrics | ⏭ Next |
+| **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ✅ Done (#9) |
+| **P4** | Live tail, metrics, producers' canonical lines | 🚧 In progress ([plan](docs/architecture/P4_PLAN.md)) |
 | **P5** | OpenSearch hot tier, optional Kafka | Planned |
 
 ## Acceptance criteria
@@ -61,4 +61,3 @@ Visibility.
 - **Exactly-once Elasticsearch exports across an expired point in time:** hits sharing the last exported timestamp can be exported twice. A stable unique sort field (when the index has one) would make it exact.
 - **Byte-range replay:** a replay re-reads a whole file (`fromBeginning`) or an export's time range; there is no "re-ingest offsets X–Y of this file".
 - **Replay budget per node size:** 8MB/s is measured on 2 CPUs; derive it from the CPU count, or pace by lines rather than bytes.
-- **Java 21** before P4, for virtual threads and many concurrent tail connections (ADR-6; P3 stays on 17, [`P3_PLAN.md`](docs/architecture/P3_PLAN.md) D6).
