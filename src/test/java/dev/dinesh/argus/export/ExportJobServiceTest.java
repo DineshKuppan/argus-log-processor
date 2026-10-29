@@ -291,6 +291,7 @@ class ExportJobServiceTest {
     assertThrows(
         JobSlotsBusyException.class,
         () -> service.submit("acme", new ExportRequest("fake", "other", null, FROM, TO, false)));
+    assertTrue(registry.find("acme", "other").isEmpty(), "a refused export creates no stream");
 
     source.release.countDown();
     assertEquals(State.COMPLETED, awaitFinished(first).state());

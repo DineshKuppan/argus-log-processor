@@ -173,6 +173,10 @@ public class ExportJobService {
     }
     ExportJob job = null;
     try {
+      // Before the stream is created: a refused export must not take a stream slot.
+      if (!lane.hasFreeSlot()) {
+        throw new RejectedExecutionException("replay lane busy");
+      }
       PushStream stream = streams.getOrCreate(tenantId, streamId);
       stream.useParser(parsers.resolve("json", null).orElseThrow());
       Optional<Saved> saved =
@@ -211,7 +215,9 @@ public class ExportJobService {
         lane.execute(() -> run(submitted, source, stream, start));
       }
     } catch (RejectedExecutionException e) {
-      jobs.remove(job.id());
+      if (job != null) {
+        jobs.remove(job.id());
+      }
       running.remove(streamKey);
       throw new JobSlotsBusyException(Lane.REPLAY, lane.maxConcurrentJobs());
     } catch (IOException | RuntimeException e) {

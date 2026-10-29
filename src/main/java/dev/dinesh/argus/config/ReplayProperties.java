@@ -16,7 +16,7 @@ public record ReplayProperties(
 
   public ReplayProperties {
     maxConcurrentJobs = maxConcurrentJobs > 0 ? maxConcurrentJobs : 1;
-    bytesPerSecond = bytesPerSecond != null ? bytesPerSecond : DataSize.ofMegabytes(16);
+    bytesPerSecond = bytesPerSecond != null ? bytesPerSecond : DataSize.ofMegabytes(8);
     maxPendingBytes = maxPendingBytes != null ? maxPendingBytes : DataSize.ofMegabytes(256);
     if (bytesPerSecond.toBytes() <= 0) {
       throw new IllegalArgumentException("argus.replay.bytes-per-second must be positive");

@@ -56,6 +56,11 @@ public class ReplayLane {
     return executor.getMaximumPoolSize();
   }
 
+  /** A cheap check before work that a busy lane would waste; {@link #execute} still decides. */
+  public boolean hasFreeSlot() {
+    return executor.getActiveCount() < executor.getMaximumPoolSize();
+  }
+
   /**
    * Starts {@code job} on a free slot.
    *
