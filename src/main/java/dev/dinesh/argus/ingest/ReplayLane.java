@@ -66,7 +66,7 @@ public class ReplayLane {
   }
 
   @PreDestroy
-  void shutdown() throws InterruptedException {
+  public void shutdown() throws InterruptedException {
     executor.shutdown();
     if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
       log.warn("Replay jobs did not stop within 30s; checkpoints remain at the last commit");

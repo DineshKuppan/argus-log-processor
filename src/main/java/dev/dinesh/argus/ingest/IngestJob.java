@@ -15,7 +15,7 @@ public final class IngestJob {
     FAILED,
     CANCELLED;
 
-    boolean isFinished() {
+    public boolean isFinished() {
       return this == COMPLETED || this == FAILED || this == CANCELLED;
     }
   }
