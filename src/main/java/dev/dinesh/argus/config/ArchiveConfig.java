@@ -8,7 +8,7 @@ import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
 import dev.dinesh.argus.archive.WalSegments;
 import dev.dinesh.argus.archive.WatermarkWalCapacity;
-import dev.dinesh.argus.sink.WalCapacity;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import java.io.IOException;
 import java.nio.file.Path;
 import org.springframework.beans.factory.ObjectProvider;
@@ -78,7 +78,7 @@ public class ArchiveConfig {
 
   /** Ingest waits on this before each segment (P2 D7): the archive is what drains the WAL. */
   @Bean
-  WalCapacity walCapacity(LocalSinkProperties wal, WalProperties limits) {
+  WatermarkWalCapacity walCapacity(LocalSinkProperties wal, WalProperties limits) {
     return new WatermarkWalCapacity(new WalSegments(wal.root()), limits);
   }
 
@@ -87,7 +87,13 @@ public class ArchiveConfig {
       ObjectStore archiveStore,
       ArchiveProperties props,
       LocalSinkProperties wal,
-      ObjectMapper mapper) {
-    return new Archiver(archiveStore, new WalSegments(wal.root()), props, mapper);
+      ObjectMapper mapper,
+      ObjectProvider<ArgusMetrics> metrics) {
+    return new Archiver(
+        archiveStore,
+        new WalSegments(wal.root()),
+        props,
+        mapper,
+        metrics.getIfAvailable(ArgusMetrics::noop));
   }
 }

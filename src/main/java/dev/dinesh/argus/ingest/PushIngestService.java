@@ -3,6 +3,7 @@ package dev.dinesh.argus.ingest;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.PushProperties;
 import dev.dinesh.argus.ingest.PushRejectedException.Reason;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.parser.FormatDetector;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserChain;
@@ -29,6 +30,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipException;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
@@ -98,6 +101,7 @@ public class PushIngestService {
   private final int maxLineBytes;
   private final Semaphore requestSlots;
   private final Set<String> keysInFlight = ConcurrentHashMap.newKeySet();
+  private final ArgusMetrics metrics;
 
   public PushIngestService(
       StreamRegistry streams,
@@ -107,6 +111,40 @@ public class PushIngestService {
       ParserRegistry parsers,
       PushProperties props,
       IngestProperties ingest) {
+    this(streams, pipeline, quotas, suppressor, parsers, props, ingest, ArgusMetrics.noop());
+  }
+
+  @Autowired
+  public PushIngestService(
+      StreamRegistry streams,
+      IngestPipeline pipeline,
+      QuotaService quotas,
+      Suppressor suppressor,
+      ParserRegistry parsers,
+      PushProperties props,
+      IngestProperties ingest,
+      ObjectProvider<ArgusMetrics> metrics) {
+    this(
+        streams,
+        pipeline,
+        quotas,
+        suppressor,
+        parsers,
+        props,
+        ingest,
+        metrics.getIfAvailable(ArgusMetrics::noop));
+  }
+
+  public PushIngestService(
+      StreamRegistry streams,
+      IngestPipeline pipeline,
+      QuotaService quotas,
+      Suppressor suppressor,
+      ParserRegistry parsers,
+      PushProperties props,
+      IngestProperties ingest,
+      ArgusMetrics metrics) {
+    this.metrics = metrics;
     this.streams = streams;
     this.pipeline = pipeline;
     this.quotas = quotas;
@@ -136,6 +174,8 @@ public class PushIngestService {
       error = t;
       throw t;
     } finally {
+      long nanos = System.nanoTime() - startNanos;
+      String outcome = outcome(result, error);
       // Canonical line: one per push request, accepted or not.
       log.info(
           "Push request finished tenant={} stream={} outcome={} error={} bodyBytes={} lines={}"
@@ -143,7 +183,7 @@ public class PushIngestService {
               + " durationMs={}",
           request.tenantId(),
           request.streamId(),
-          outcome(result, error),
+          outcome,
           error == null ? null : error.getClass().getSimpleName() + ": " + error.getMessage(),
           counts.bodyBytes,
           counts.lines,
@@ -153,7 +193,14 @@ public class PushIngestService {
           result == null ? null : result.spool(),
           result == null ? null : result.startOffset(),
           result == null ? null : result.endOffset(),
-          TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+          TimeUnit.NANOSECONDS.toMillis(nanos));
+      metrics.pushRequest(
+          request.tenantId() == null ? "unknown" : request.tenantId(),
+          outcome,
+          nanos,
+          result == null ? 0 : result.accepted(),
+          result == null ? 0 : result.suppressed(),
+          result == null ? 0 : result.truncated());
     }
   }
 

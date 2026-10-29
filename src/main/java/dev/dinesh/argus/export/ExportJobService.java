@@ -15,6 +15,7 @@ import dev.dinesh.argus.ingest.Lane;
 import dev.dinesh.argus.ingest.PushStream;
 import dev.dinesh.argus.ingest.ReplayLane;
 import dev.dinesh.argus.ingest.StreamRegistry;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.source.StreamSpool;
@@ -38,6 +39,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
@@ -100,6 +102,7 @@ public class ExportJobService {
   private final long maxStreamPendingBytes;
   private final long maxSpoolPendingBytes;
   private final Duration retryInitial;
+  private final ArgusMetrics metrics;
   private final Map<String, ExportJob> jobs = new ConcurrentHashMap<>();
 
   /** {@code tenant/stream} → the export job running on it. */
@@ -114,8 +117,19 @@ public class ExportJobService {
       ExportCursorStore cursors,
       ParserRegistry parsers,
       ObjectMapper mapper,
-      PushProperties push) {
-    this(sources, streams, lane, pipeline, cursors, parsers, mapper, push, Duration.ofSeconds(1));
+      PushProperties push,
+      ObjectProvider<ArgusMetrics> metrics) {
+    this(
+        sources,
+        streams,
+        lane,
+        pipeline,
+        cursors,
+        parsers,
+        mapper,
+        push,
+        Duration.ofSeconds(1),
+        metrics.getIfAvailable(ArgusMetrics::noop));
   }
 
   ExportJobService(
@@ -127,7 +141,9 @@ public class ExportJobService {
       ParserRegistry parsers,
       ObjectMapper mapper,
       PushProperties push,
-      Duration retryInitial) {
+      Duration retryInitial,
+      ArgusMetrics metrics) {
+    this.metrics = metrics;
     this.sources = sources;
     this.streams = streams;
     this.lane = lane;
@@ -325,7 +341,10 @@ public class ExportJobService {
       throws IOException, InterruptedException {
     long startNanos = System.nanoTime();
     byte[] body = toLines(page.lines());
-    if (!lane.readLimit().acquire(body.length, job.cancelFlag()::get)) {
+    long waitStart = System.nanoTime();
+    boolean passed = lane.readLimit().acquire(body.length, job.cancelFlag()::get);
+    metrics.replayWait(System.nanoTime() - waitStart);
+    if (!passed) {
       return false;
     }
     String key = pageKey(job, page.pageId());
@@ -375,6 +394,7 @@ public class ExportJobService {
         append == null ? null : append.endOffset(),
         page.last(),
         TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
+    metrics.exportPage(job.tenantId(), job.source(), page.lines().size());
     return true;
   }
 
@@ -391,6 +411,7 @@ public class ExportJobService {
         if (attempt >= RETRIES) {
           throw e;
         }
+        metrics.exportRetry(job.tenantId(), job.source());
         log.warn(
             "Export job {}: fetch failed, retry {} of {} in {}ms: {}",
             job.id(),

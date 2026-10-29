@@ -15,6 +15,7 @@ import dev.dinesh.argus.config.QuotaProperties;
 import dev.dinesh.argus.ingest.PushIngestService.PushRequest;
 import dev.dinesh.argus.ingest.PushIngestService.PushResult;
 import dev.dinesh.argus.ingest.PushRejectedException.Reason;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.quota.LocalQuotaStore;
 import dev.dinesh.argus.quota.QuotaService;
@@ -22,6 +23,7 @@ import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.suppression.LocalSuppressionStore;
 import dev.dinesh.argus.suppression.MessageFingerprint;
 import dev.dinesh.argus.suppression.Suppressor;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -51,6 +53,7 @@ class PushIngestServiceTest {
   private final SourceLeases leases = new SourceLeases();
   private StreamRegistry registry;
   private Suppressor suppressor;
+  private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
 
   @AfterEach
   void closeSpools() {
@@ -91,9 +94,18 @@ class PushIngestServiceTest {
             new QuotaProperties(null, DataSize.ofBytes(quotaBytesPerSecond), 1.0, Map.of()));
     suppressor =
         new Suppressor(
-            new LocalSuppressionStore(Duration.ofSeconds(10), 1000), new MessageFingerprint(false));
+            new LocalSuppressionStore(Duration.ofSeconds(10), 1000),
+            new MessageFingerprint(false),
+            new ArgusMetrics(meters));
     return new PushIngestService(
-        registry, pipeline, quotas, suppressor, new ParserRegistry(), props, ingest);
+        registry,
+        pipeline,
+        quotas,
+        suppressor,
+        new ParserRegistry(),
+        props,
+        ingest,
+        new ArgusMetrics(meters));
   }
 
   private static PushRequest request(String tenant, String body) {
@@ -234,6 +246,30 @@ class PushIngestServiceTest {
     assertEquals(1, otherTenant.accepted(), "suppression is per tenant");
     assertEquals(
         "{\"ts\":1,\"msg\":\"disk full\"}\n{\"ts\":3,\"msg\":\"other\"}\n", spooled("acme"));
+  }
+
+  @Test
+  void metricsCountRequestsLinesAndDecisionsPerTenant() throws IOException {
+    PushIngestService service = service(push(1 << 20, 100, 4, 1L << 30, 3), 64);
+    service.push(request("acme", "{\"msg\":\"a\"}\n{\"msg\":\"a\"}\n{\"msg\":\"b\"}\n"));
+    rejection(() -> service.push(request("acme", "{\"msg\":\"c\"}\n".repeat(20))));
+
+    assertEquals(1, requests("accepted"));
+    assertEquals(1, requests("rejected_quota"));
+    assertEquals(2, meters.get("argus.push.lines").tags("result", "accepted").counter().count());
+    assertEquals(1, meters.get("argus.push.lines").tags("result", "suppressed").counter().count());
+    assertEquals(
+        1, meters.get("argus.suppression.decisions").tags("decision", "deny").counter().count());
+    assertEquals(
+        1, meters.get("argus.push.request").tag("outcome", "rejected_quota").timer().count());
+  }
+
+  private double requests(String outcome) {
+    return meters
+        .get("argus.push.requests")
+        .tags("tenant", "acme", "outcome", outcome)
+        .counter()
+        .count();
   }
 
   @Test

@@ -1,5 +1,6 @@
 package dev.dinesh.argus.config;
 
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.suppression.LocalSuppressionStore;
 import dev.dinesh.argus.suppression.MessageFingerprint;
 import dev.dinesh.argus.suppression.RedisSuppressionStore;
@@ -24,7 +25,11 @@ public class SuppressionConfig {
   }
 
   @Bean
-  Suppressor suppressor(SuppressionStore store, SuppressionProperties props) {
-    return new Suppressor(store, new MessageFingerprint(props.templateFingerprint()));
+  Suppressor suppressor(
+      SuppressionStore store, SuppressionProperties props, ObjectProvider<ArgusMetrics> metrics) {
+    return new Suppressor(
+        store,
+        new MessageFingerprint(props.templateFingerprint()),
+        metrics.getIfAvailable(ArgusMetrics::noop));
   }
 }

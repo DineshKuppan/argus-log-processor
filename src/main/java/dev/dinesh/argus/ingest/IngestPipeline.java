@@ -4,6 +4,7 @@ import dev.dinesh.argus.checkpoint.CheckpointStore;
 import dev.dinesh.argus.checkpoint.ResumePoint;
 import dev.dinesh.argus.checkpoint.ResumePoint.Reason;
 import dev.dinesh.argus.config.IngestProperties;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.parser.FormatDetector;
 import dev.dinesh.argus.parser.LogParser;
@@ -23,6 +24,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
@@ -119,6 +121,7 @@ public class IngestPipeline {
   private final LogSink sink;
   private final CheckpointStore checkpoints;
   private final WalCapacity walCapacity;
+  private final ArgusMetrics metrics;
 
   /** Without an archive store nothing drains the WAL, so there is no WAL limit to wait for. */
   @Autowired
@@ -127,9 +130,15 @@ public class IngestPipeline {
       ParserRegistry parsers,
       LogSink sink,
       CheckpointStore checkpoints,
-      ObjectProvider<WalCapacity> walCapacity) {
+      ObjectProvider<WalCapacity> walCapacity,
+      ObjectProvider<ArgusMetrics> metrics) {
     this(
-        props, parsers, sink, checkpoints, walCapacity.getIfAvailable(() -> WalCapacity.UNBOUNDED));
+        props,
+        parsers,
+        sink,
+        checkpoints,
+        walCapacity.getIfAvailable(() -> WalCapacity.UNBOUNDED),
+        metrics.getIfAvailable(ArgusMetrics::noop));
   }
 
   public IngestPipeline(
@@ -143,11 +152,22 @@ public class IngestPipeline {
       LogSink sink,
       CheckpointStore checkpoints,
       WalCapacity walCapacity) {
+    this(props, parsers, sink, checkpoints, walCapacity, ArgusMetrics.noop());
+  }
+
+  public IngestPipeline(
+      IngestProperties props,
+      ParserRegistry parsers,
+      LogSink sink,
+      CheckpointStore checkpoints,
+      WalCapacity walCapacity,
+      ArgusMetrics metrics) {
     this.props = props;
     this.parsers = parsers;
     this.sink = sink;
     this.checkpoints = checkpoints;
     this.walCapacity = walCapacity;
+    this.metrics = metrics;
   }
 
   /** True while the WAL is above its high watermark: new jobs would only wait. */
@@ -305,6 +325,7 @@ public class IngestPipeline {
     private final AtomicBoolean cancel;
     private final ByteRateLimiter readLimit;
     private final boolean lowPriority;
+    private final String lane;
     private final BlockingQueue<RawBatch> raw;
     private final BlockingQueue<LogBatch> parsed;
     private final AtomicBoolean stop = new AtomicBoolean();
@@ -336,6 +357,7 @@ public class IngestPipeline {
       this.cancel = cancel;
       this.readLimit = readLimit;
       this.lowPriority = lowPriority;
+      this.lane = (lowPriority ? Lane.REPLAY : Lane.LIVE).name().toLowerCase(Locale.ROOT);
       this.raw = new ArrayBlockingQueue<>(props.rawQueueCapacity());
       this.parsed = new ArrayBlockingQueue<>(props.parsedQueueCapacity());
     }
@@ -367,9 +389,14 @@ public class IngestPipeline {
     private void read() {
       try {
         for (RawBatch batch = source.nextBatch(); batch != null; batch = source.nextBatch()) {
-          if (readLimit != null
-              && !readLimit.acquire(batch.endOffset() - batch.startOffset(), this::stopping)) {
-            return;
+          if (readLimit != null) {
+            long waitStart = System.nanoTime();
+            boolean passed =
+                readLimit.acquire(batch.endOffset() - batch.startOffset(), this::stopping);
+            metrics.replayWait(System.nanoTime() - waitStart);
+            if (!passed) {
+              return;
+            }
           }
           if (!handOff(raw, batch)) {
             return;
@@ -419,6 +446,14 @@ public class IngestPipeline {
           records.add(envelopes.create(result, batch.lineOffsets()[i], observedAt));
         }
         progress.parsed(records.size(), rejected, unparsed, fallback);
+        metrics.ingestBatch(
+            tenantId,
+            lane,
+            records.size() - unparsed - fallback,
+            fallback,
+            unparsed,
+            rejected,
+            batch.endOffset() - batch.startOffset());
         LogBatch out =
             new LogBatch(
                 batch.sourceId(),
@@ -461,9 +496,11 @@ public class IngestPipeline {
           }
           segment.write(batch);
           if (batch.lastInSegment()) {
+            long commitStart = System.nanoTime();
             String location = segment.commit(batch.endOffset());
             segment = null;
             checkpoints.save(tenantId, checkpointAt(batch.endOffset()));
+            metrics.segmentCommitted(tenantId, System.nanoTime() - commitStart);
             committedOffset = batch.endOffset();
             progress.committed(batch.endOffset(), location);
             log.info(

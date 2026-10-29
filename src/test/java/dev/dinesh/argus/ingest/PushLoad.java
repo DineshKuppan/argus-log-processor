@@ -57,6 +57,7 @@ final class PushLoad {
         new ArrayList<>(
             List.of(
                 "--server.port=" + port,
+                "--management.server.port=0",
                 "--spring.devtools.restart.enabled=false",
                 "--spring.devtools.livereload.enabled=false",
                 "--argus.ingest.allowed-roots=" + work,
