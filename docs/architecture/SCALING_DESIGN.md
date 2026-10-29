@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). P3b–P5 are design only. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). P4–P5 are design only. Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents
@@ -197,8 +197,8 @@ Implementation choice (Reactor vs. bounded queues vs. virtual threads): see ADR-
 |---|---|
 | File / tail | `path`, `inode` (detects rotation), SHA-256 of the first 1KB (detects `copytruncate`), `generation`, `byteOffset` |
 | Kafka | `topic`, `partition`, `offset` |
-| Elasticsearch export | PIT id + `search_after` sort values |
-| Coralogix export | query window `[from, to)` + page cursor |
+| Elasticsearch export | PIT id + `search_after` sort values (P3b: saved after each page is in a stream spool; the page's key makes a re-fetch a no-op) |
+| Coralogix export | the next query window's start and size (P3b: the window is the page) |
 | HTTP ingest | the stream's spool file + byte offset, like a file (P3a); retries are recognised by `Idempotency-Key` |
 
 **Delivery semantics: at-least-once with idempotent sinks**, which in practice gives effectively-once.
@@ -210,7 +210,7 @@ Implementation choice (Reactor vs. bounded queues vs. virtual threads): see ADR-
 ### Prefills
 | Kind | What it does | Design |
 |---|---|---|
-| **Backfill / replay** | Re-process history: a past offset, a time range, or a bulk ELK / Coralogix export | Runs as a separate **replay lane** with its own bounded queues and a lower-priority quota (e.g. ≤30% of worker threads), so live ingest is never starved. Writes are idempotent because of `eventId`. Suppression is **bypassed** for replay, since it is a live-traffic concern. |
+| **Backfill / replay** | Re-process history: a past offset, a time range, or a bulk ELK / Coralogix export | Runs as a separate **replay lane** with its own bounded queues and a lower-priority quota (e.g. ≤30% of worker threads), so live ingest is never starved. Writes are idempotent because of `eventId`. Suppression is **bypassed** for replay, since it is a live-traffic concern. Implemented in P3b ([D8](P3_PLAN.md#d8-the-replay-lane)): own job slots, one shared read budget (bytes/s), low-priority threads; a replay is a whole file (`fromBeginning`) or an export's time range. |
 | **Warm-up** | Correct behaviour right after a restart | The dedup window is rebuilt by replaying the last 10s of the WAL. The live-tail ring is pre-filled from the WAL tail. For a re-index, build the new OpenSearch index behind an alias and swap the alias only once it has caught up. |
 | **Read-ahead / prefetch** | Keep the parser busy | One chunk of prefetch per source, using async I/O for compressed or remote sources. It counts against the same queue capacity, so read-ahead can never exceed the memory budget. |
 

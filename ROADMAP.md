@@ -14,9 +14,9 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | **Hardening** | API-key tenancy, v1 path restriction | ✅ Done (#4) |
 | **P2a** | Parquet + ZSTD archive to a PVC or S3; local segments become the WAL | ✅ Done (#5) |
 | **P2b** | GCS, WAL watermarks, WAL compression | ✅ Done (#7) |
-| **P3a** | HTTP push ingest, quotas, suppression on push | ✅ Done |
-| **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ⏭ Next |
-| **P4** | Live tail, metrics | Planned |
+| **P3a** | HTTP push ingest, quotas, suppression on push | ✅ Done (#8) |
+| **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ✅ Done |
+| **P4** | Live tail, metrics | ⏭ Next |
 | **P5** | OpenSearch hot tier, optional Kafka | Planned |
 
 ## Acceptance criteria
@@ -30,19 +30,16 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | T5 | Freshness | p99 ingest-to-searchable ≤30s | P5 |
 | T6 | Suppression | Correct at the 10s boundary; p99 <1ms | ✅ 8.8µs |
 | T7 | Live tail | Visible ≤2s after ingest; a slow client can't slow ingest | P4 |
-| T8 | Replay | Replay any range without starving live ingest | P3 |
+| T8 | Replay | Replay any range without starving live ingest | ✅ 2 CPUs: live push p99 unchanged within noise during a 1GB replay at 8MB/s (3–8x worse without the lane) |
 | T9 | Cost | Cold tier ≤3TiB at 7 years (≥8x compression) | ✅ 14.6x on synthetic data; re-measure on real logs |
 
-## Next: P3b
-Exports and replay. Plan: [`P3_PLAN.md`](docs/architecture/P3_PLAN.md) §8.
-- **Export sources:** Elasticsearch (PIT + `search_after`) and Coralogix (DataPrime, time windows). Each page goes into a stream spool with `hash(query, cursor)` as its `Idempotency-Key`, so a crash re-fetches at most one page and never ingests it twice.
-- **Replay lane** (T8): `fromBeginning` file jobs and exports run on their own slots, rate-limited, on lower-priority threads and without suppression, so live push p99 degrades ≤20%.
+## Next: P4
+Visibility.
+- Server-Sent Events live tail with per-connection bounded buffers that drop the oldest lines (T7).
+- Micrometer metrics.
+- Canonical lines for the applications Argus ingests.
 
 ## Later
-- **P4: visibility.**
-  - Server-Sent Events live tail with per-connection bounded buffers that drop the oldest lines (T7).
-  - Micrometer metrics.
-  - Canonical lines for the applications Argus ingests.
 - **P5: hot search tier.**
   - `OpenSearchSink` with ILM and tuned mappings, under a multi-sink router that acknowledges each WAL segment per sink (T5).
   - Optional Kafka buffer, with suppression partitioned by key.
@@ -60,4 +57,8 @@ Exports and replay. Plan: [`P3_PLAN.md`](docs/architecture/P3_PLAN.md) §8.
 - **Push from real agents:** the push tests use an HTTP client; run Fluent Bit and Vector against Argus, including how they react to 429 and `Retry-After`.
 - **Exactly-once for agents:** Fluent Bit's and Vector's HTTP outputs send only static headers, so they can't send a per-batch `Idempotency-Key`; their retries are at-least-once.
 - **Push freshness:** pushed lines wait up to `argus.push.flush-interval` (1 minute) before a run; P5's hot tier (T5, ≤30s) needs a shorter interval. `observedTimestamp` is the run's time, not the receive time.
+- **Exports against the real services:** Coralogix is tested against a protocol stub only; run an export against a Coralogix account, and against a production-sized Elasticsearch / OpenSearch index.
+- **Exactly-once Elasticsearch exports across an expired point in time:** hits sharing the last exported timestamp can be exported twice. A stable unique sort field (when the index has one) would make it exact.
+- **Byte-range replay:** a replay re-reads a whole file (`fromBeginning`) or an export's time range; there is no "re-ingest offsets X–Y of this file".
+- **Replay budget per node size:** 8MB/s is measured on 2 CPUs; derive it from the CPU count, or pace by lines rather than bytes.
 - **Java 21** before P4, for virtual threads and many concurrent tail connections (ADR-6; P3 stays on 17, [`P3_PLAN.md`](docs/architecture/P3_PLAN.md) D6).

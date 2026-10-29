@@ -16,7 +16,12 @@ A Spring Boot service that ingests, parses, filters, aggregates and archives log
 
 ## What's new
 
-- **HTTP push ingest, quotas and suppression on push (P3a).**
+- **Exports from Elasticsearch, OpenSearch and Coralogix, and a replay lane (P3b).**
+  - `POST /api/v2/ingest/exports` copies a time range from a configured source into a stream: Elasticsearch or OpenSearch with a point in time and `search_after`, Coralogix with its DataPrime query API in adaptive time windows. Each page is durable in the spool before its cursor is saved, so an interrupted export resumes where it stopped, without duplicating a page.
+  - Re-reads (`fromBeginning`) and exports run on a **replay lane**: their own job slots and a shared read budget (8MB/s), so a backfill never takes live ingest's slots or bandwidth. Suppression and the push quota don't apply to replays.
+  - Sources, URLs and credentials are configured per tenant; a request only names a source.
+  - On 2 CPUs, a 1GB replay left live push latency unchanged within noise; the same re-read without the lane made it 3–8x slower.
+- **HTTP push ingest, quotas and suppression on push (P3a, PR #8).**
   - `POST /api/v2/ingest/streams/{id}` takes NDJSON or plain lines, optionally gzipped, from agents such as Fluent Bit and Vector. A request is acknowledged only once it is fsynced in the stream's spool, and the ordinary pipeline ingests the spool shortly after.
   - `Idempotency-Key` makes a retried request a no-op, even across a restart. Tested with `kill -9` mid-load: nothing acknowledged was lost or duplicated.
   - Per-tenant ingest quotas (token bucket, local or Redis), and every limit answers with its own status: 429 + `Retry-After`, 413, 409 or 415.
@@ -161,7 +166,32 @@ request.headers.X-Argus-Api-Key = "my-secret-key"
 ```
 Both send only static headers, so their retries are at-least-once.
 
-### 6. Archive to Parquet (optional)
+### 6. Export from Elasticsearch, OpenSearch or Coralogix
+```properties
+argus.export.sources[0].name=elk
+argus.export.sources[0].tenant=acme
+argus.export.sources[0].type=elasticsearch          # OpenSearch too; told apart by GET /
+argus.export.sources[0].url=https://es.internal:9200
+argus.export.sources[0].index=logs-*
+argus.export.sources[0].api-key=${ELK_API_KEY}       # or username / password
+argus.export.sources[1].name=cx
+argus.export.sources[1].tenant=acme
+argus.export.sources[1].type=coralogix
+argus.export.sources[1].url=https://api.eu2.coralogix.com
+argus.export.sources[1].api-key=${CX_API_KEY}
+```
+```bash
+curl -X POST localhost:9000/api/v2/ingest/exports -H "X-Argus-Api-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"source":"elk","streamId":"elk-2026-10","query":{"term":{"service":"checkout"}},
+       "from":"2026-10-01T00:00:00Z","to":"2026-10-02T00:00:00Z"}'
+# → 202 {"jobId":"…","lane":"REPLAY","state":"QUEUED",…}; poll GET /api/v2/ingest/exports/{jobId}
+# Coralogix takes DataPrime text: "query":"source logs | filter $l.subsystemname == 'checkout'"
+```
+- **Resuming:** posting the same export again (same source, query and range, same stream) continues from its saved cursor; `"fromBeginning":true` exports it again.
+- **Pace:** exports and `fromBeginning` file jobs share `argus.replay.bytes-per-second` (8MB/s) and `argus.replay.max-concurrent-jobs` (1). An export pauses while its stream has 256MB not yet ingested.
+- **Delivery:** every page once, with one exception: if an Elasticsearch point in time expires mid-export (`keep-alive`, 10m without a page), hits sharing the last exported timestamp can be exported twice.
+
+### 7. Archive to Parquet (optional)
 ```properties
 # A directory or Kubernetes PersistentVolume…
 argus.archive.store=filesystem
@@ -191,7 +221,9 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 
 | Method | Endpoint | What it does |
 |---|---|---|
-| POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`. 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (job slots busy, or the WAL full while the archive catches up) |
+| POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`, `lane` (`live` / `replay`; `replay` by default with `fromBeginning`). 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (the lane's job slots busy, or the WAL full while the archive catches up) |
+| POST | `/api/v2/ingest/exports` | Export `[from, to)` from a configured source into a stream: `source`, `streamId`, `query`, `from`, `to`, `fromBeginning`. 202, or 400 / 404 (no such source for the tenant) / 409 (an export already running on the stream) / 429 + `Retry-After` (replay slots busy, WAL full) |
+| GET, DELETE | `/api/v2/ingest/exports/{id}` | Export progress (pages, lines, `paused`, cursor position) / cancel before the next page |
 | POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, same key in progress, quota, WAL or spool full), 413, 409 (too many streams, or the id is a file job's source id), 415 |
 | GET | `/api/v2/ingest/streams/{id}`, `/api/v2/ingest/streams` | A stream's (or every stream's) spool, counters and last run. Another tenant's stream is 404 |
 | GET | `/api/v2/ingest/jobs/{id}` | Job progress: bytes, lines, format, segments, outputs, `paused` / `pausedMs`. Another tenant's job is 404 |
@@ -220,10 +252,11 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 348 tests; Redis, S3 and GCS tests need Docker
+mvn test                                         # 398 tests; Redis, S3, GCS and Elasticsearch tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
 mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
-                                                 # decisions, push throughput / isolation, push backpressure, kill -9 during push
+                                                 # decisions, push throughput / isolation, push backpressure, kill -9 during push,
+                                                 # T8 replay isolation (-Dargus.load.docker-cpus=2 runs the server in a 2-CPU container)
 ```
 
 ## License

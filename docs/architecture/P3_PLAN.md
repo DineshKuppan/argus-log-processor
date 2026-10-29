@@ -179,7 +179,7 @@ Disk budget (§2 of the design): WAL 30GB + Parquet staging ≤2GB + spool ≤2G
 - **Situation:** T8: a backfill or replay must not starve live ingest. Today every file job shares `max-concurrent-jobs`, and a re-ingest runs as fast as the disk allows.
 - **Action:** jobs carry a `lane` (`live` | `replay`). `fromBeginning` file jobs and every export job default to `replay`; `lane` overrides it for file jobs. The replay lane (`ReplayLane`) has:
   - its own slots (`argus.replay.max-concurrent-jobs`, 1; a full lane is 429), so live file jobs never wait for a replay and a replay never waits for live jobs;
-  - one shared read budget (`argus.replay.bytes-per-second`, 16MB/s, ≈130x the 10GB/day average): the reader of a replay file job, and each export page, waits for its bytes. A 1GB replay takes about a minute;
+  - one shared read budget (`argus.replay.bytes-per-second`, 8MB/s, ≈70x the 10GB/day average; first planned at 16MB/s, lowered after T8 on 2 CPUs, §10): the reader of a replay file job, and each export page, waits for its bytes. A 1GB replay takes about two minutes, a day of the 10GB target about 21;
   - minimum-priority threads (advisory: Linux ignores Java priorities without `-XX:ThreadPriorityPolicy=1`, so the read budget is what isolates);
   - for exports, room for live pushes in the spool: an export pauses (status `paused: SPOOL_FULL`) while its stream holds `argus.replay.max-pending-bytes` (256MB) not yet ingested, or the spool as a whole holds half of `max-spool-bytes`; and like every job it waits while the WAL is full.
   - Suppression is bypassed (guardrail 8): replay file jobs never had it, and export pages go to the spool directly, not through the push path. The push quota doesn't apply either; the read budget does.
@@ -206,7 +206,7 @@ Disk budget (§2 of the design): WAL 30GB + Parquet staging ≤2GB + spool ≤2G
 
 ```properties
 argus.replay.max-concurrent-jobs=1
-argus.replay.bytes-per-second=16MB
+argus.replay.bytes-per-second=8MB
 argus.replay.max-pending-bytes=256MB       # an export pauses while its stream has this much to ingest
 
 argus.export.sources[0].name=elk
@@ -269,3 +269,25 @@ Found in review (fixed, each with a test):
 - **Rejected requests created their stream**, using up `max-streams-per-tenant` slots that can't be freed. The stream is now created after every other bound.
 - **Spool numbers had six digits**, about two years of one-a-minute rotations; they now grow to nine.
 - Also: `date` is no longer a JSON timestamp key (it turned business fields into event times; the Fluent Bit example sets `json_date_key timestamp`), suppressed lines aren't counted as truncated, a running stream run shows in status (`RUNNING`, with `paused: WAL_FULL`), and `spool-dir` is made absolute so another spelling of it doesn't re-ingest every spool.
+
+## 10. Results (P3b)
+`ReplayIsolationIT` (T8): one client pushes 200-line gzip batches with a 10ms pause, for 30s windows: before a replay, during a 1GB `fromBeginning` re-read on the replay lane, and after it is cancelled; then during the same re-read on the live lane (unthrottled), for contrast. The baseline is the mean of the before and after p99s. The application runs in its own 256MB JVM.
+
+| Where the application ran | Replay budget | Live p99 before / after | During the replay | During the unthrottled re-read |
+|---|---|---|---|---|
+| Host (Apple M1 Pro, 10 cores) | 16MB/s | 31.4 / 38.6ms | 25.0ms (16.0MB/s) | 33.0ms (64MB/s) |
+| Container, 2 CPUs, 4GB (`-Dargus.load.docker-cpus=2`) | 16MB/s | 21.3 / 20.8ms | **30.2ms, +44%: fails T8** | 64.8ms (34MB/s) |
+| Container, 2 CPUs, 4GB | 8MB/s | 27.9 / 19.9ms | 20.1ms | 164.2ms (40MB/s) |
+| Container, 2 CPUs, 4GB | 8MB/s (second run) | 15.8 / 23.6ms | 15.6ms | 91.5ms (48MB/s) |
+| Container, 2 CPUs, 4GB | 4MB/s | 21.5 / 18.7ms | 17.0ms | 179.2ms (46MB/s) |
+
+- **The default budget is 8MB/s, not the planned 16MB/s.** With 10 cores nothing competes, so even an unthrottled re-read didn't move live p99 beyond the noise between windows (±20% on its own). On 2 CPUs, the size of a 4GB node, 16MB/s of parsing and writing took enough CPU to raise live p99 by 44%; at 8MB/s it stayed within the noise in two runs. 8MB/s is ≈70x the 10GB/day average: a 1GB replay takes about two minutes. A node with more cores can raise `argus.replay.bytes-per-second`.
+- **Without the lane, a replay starves live ingest:** the same re-read unthrottled on the live lane raised live p99 3–8x (65–179ms) on 2 CPUs.
+- Peak heap 209–216MB of 256MB in every run. Every live push was accepted (202).
+
+Exports, tested functionally (no load test): `ElasticsearchExportSourceTest` on Elasticsearch 8.15.3 and OpenSearch 2.17.1 exports 30 hits with three per timestamp across 4-hit pages exactly once and in order, and replaces 7 deleted points in time without missing a hit; `CoralogixExportSourceTest` halves and regrows windows around a 35-row burst with a 10-row limit, every row once.
+
+Found while building:
+- **OpenSearch and Elasticsearch page differently.** Probed before writing the source: OpenSearch 2.17 has no implicit tiebreaker, rejects `_shard_doc` and a sort `format`, but sorts on `_id`; Elasticsearch 8 adds `_shard_doc` but refuses `_id`. Each flavour gets its own sort, and the expiry rule follows from it (D7).
+- **A resumed export's totals missed the re-fetched page:** its lines were spooled by the interrupted run after the last saved totals, so the duplicate page now counts once in the resumed job.
+- **An export refused for a busy replay slot created its stream** (the P3a bug, again, for exports); the slot is checked before the stream is created.
