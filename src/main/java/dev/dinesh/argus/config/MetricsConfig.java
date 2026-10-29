@@ -10,6 +10,7 @@ import dev.dinesh.argus.quota.QuotaStore;
 import dev.dinesh.argus.quota.RedisQuotaStore;
 import dev.dinesh.argus.suppression.RedisSuppressionStore;
 import dev.dinesh.argus.suppression.SuppressionStore;
+import dev.dinesh.argus.tail.TailHub;
 import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -50,8 +51,12 @@ public class MetricsConfig {
       ObjectProvider<WatermarkWalCapacity> wal,
       ObjectProvider<Archiver> archiver,
       SuppressionStore suppressionStore,
-      QuotaStore quotaStore) {
+      QuotaStore quotaStore,
+      TailHub tail) {
     return registry -> {
+      Gauge.builder("argus.tail.connections", tail, TailHub::connections)
+          .description("Open live tail connections")
+          .register(registry);
       Gauge.builder("argus.spool.pending", streams, StreamRegistry::pendingBytes)
           .baseUnit("bytes")
           .description("Acknowledged push bytes not yet ingested")
