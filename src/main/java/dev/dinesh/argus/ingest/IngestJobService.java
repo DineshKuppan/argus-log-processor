@@ -1,6 +1,7 @@
 package dev.dinesh.argus.ingest;
 
 import dev.dinesh.argus.config.IngestProperties;
+import dev.dinesh.argus.config.ReplayProperties;
 import dev.dinesh.argus.ingest.IngestJob.State;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.ingest.IngestPipeline.Request;
@@ -19,6 +20,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -33,9 +35,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
- * Runs ingest jobs on a fixed number of slots. Jobs beyond the slot count are rejected rather than
- * queued, so callers get immediate backpressure (HTTP 429) instead of unbounded memory growth. Jobs
- * belong to a tenant: a tenant sees only its own jobs, and sources are per tenant.
+ * Runs ingest jobs on a fixed number of slots per lane ({@code P3_PLAN.md} D8): live jobs on {@code
+ * max-concurrent-jobs}, replays on the {@link ReplayLane}'s, paced by its read budget. Jobs beyond
+ * a lane's slots are rejected rather than queued, so callers get immediate backpressure (HTTP 429)
+ * instead of unbounded memory growth. Jobs belong to a tenant: a tenant sees only its own jobs, and
+ * sources are per tenant.
  */
 @Slf4j
 @Service
@@ -53,6 +57,7 @@ public class IngestJobService {
   private final ParserRegistry parsers;
   private final TenantRoots tenantRoots;
   private final ThreadPoolExecutor executor;
+  private final ReplayLane replay;
   private final Map<String, IngestJob> jobs = new ConcurrentHashMap<>();
 
   /** Shared with stream runs: one run per source at a time. */
@@ -63,7 +68,13 @@ public class IngestJobService {
       ParserRegistry parsers,
       IngestProperties props,
       TenantRoots tenantRoots) {
-    this(pipeline, parsers, props, tenantRoots, new SourceLeases());
+    this(
+        pipeline,
+        parsers,
+        props,
+        tenantRoots,
+        new SourceLeases(),
+        new ReplayLane(ReplayProperties.defaults()));
   }
 
   @Autowired
@@ -72,11 +83,13 @@ public class IngestJobService {
       ParserRegistry parsers,
       IngestProperties props,
       TenantRoots tenantRoots,
-      SourceLeases leases) {
+      SourceLeases leases,
+      ReplayLane replay) {
     this.pipeline = pipeline;
     this.parsers = parsers;
     this.tenantRoots = tenantRoots;
     this.leases = leases;
+    this.replay = replay;
     AtomicInteger threadCount = new AtomicInteger();
     this.executor =
         new ThreadPoolExecutor(
@@ -106,13 +119,19 @@ public class IngestJobService {
     }
   }
 
-  /** Thrown when every job slot is busy. */
+  /** Thrown when every job slot of the lane is busy. */
   public static class JobSlotsBusyException extends IngestBusyException {
     /** About how long a job slot takes to free up. */
     static final int RETRY_AFTER_SECONDS = 30;
 
-    JobSlotsBusyException(int slots) {
-      super("All " + slots + " ingest job slots are busy; retry later", RETRY_AFTER_SECONDS);
+    public JobSlotsBusyException(Lane lane, int slots) {
+      super(
+          "All "
+              + slots
+              + " "
+              + lane.name().toLowerCase(Locale.ROOT)
+              + " job slots are busy; retry later",
+          RETRY_AFTER_SECONDS);
     }
   }
 
@@ -121,7 +140,7 @@ public class IngestJobService {
     /** Longer than for busy slots: the archive must drain a fifth of the WAL first. */
     static final int RETRY_AFTER_SECONDS = 60;
 
-    WalFullException() {
+    public WalFullException() {
       super("The WAL is full while the archive catches up; retry later", RETRY_AFTER_SECONDS);
     }
   }
@@ -136,12 +155,25 @@ public class IngestJobService {
     }
   }
 
+  /** Starts a job on its default lane: replay when {@code fromBeginning}, live otherwise. */
+  public IngestJob submit(
+      String tenantId,
+      String rawPath,
+      String requestedSourceId,
+      boolean fromBeginning,
+      String format,
+      String pattern)
+      throws IOException {
+    return submit(tenantId, rawPath, requestedSourceId, fromBeginning, format, pattern, null);
+  }
+
   /**
    * Validates the request and starts a job.
    *
    * @throws NoSuchFileException if the file does not exist
    * @param format primary format, or null to detect it
    * @param pattern Logback layout for format {@code logback}
+   * @param requestedLane null for the default: replay when {@code fromBeginning}, live otherwise
    * @throws IllegalArgumentException if the path is outside the allowed roots, not a regular file,
    *     the source id is invalid, or the format or pattern is not supported
    */
@@ -151,7 +183,8 @@ public class IngestJobService {
       String requestedSourceId,
       boolean fromBeginning,
       String format,
-      String pattern)
+      String pattern,
+      Lane requestedLane)
       throws IOException {
     TenantIds.requireValid(tenantId);
     Path realPath = tenantRoots.forTenant(tenantId).requireFile(rawPath);
@@ -160,13 +193,20 @@ public class IngestJobService {
             ? defaultSourceId(realPath)
             : SourceOffset.requireValidSourceId(requestedSourceId);
     LogParser parser = parsers.resolve(format, pattern).orElse(null);
+    Lane lane = requestedLane != null ? requestedLane : fromBeginning ? Lane.REPLAY : Lane.LIVE;
     if (pipeline.walFull()) {
       throw new WalFullException();
     }
 
     IngestJob job =
         new IngestJob(
-            UUID.randomUUID().toString(), tenantId, sourceId, realPath, fromBeginning, parser);
+            UUID.randomUUID().toString(),
+            tenantId,
+            sourceId,
+            realPath,
+            fromBeginning,
+            parser,
+            lane);
     Optional<String> owner = leases.tryAcquireForFile(tenantId, sourceId, job.id());
     if (owner.isPresent()) {
       throw new SourceBusyException(sourceId, owner.get());
@@ -174,18 +214,24 @@ public class IngestJobService {
     try {
       evictOldJobs(tenantId);
       jobs.put(job.id(), job);
-      executor.execute(() -> runJob(job));
+      if (lane == Lane.REPLAY) {
+        replay.execute(() -> runJob(job));
+      } else {
+        executor.execute(() -> runJob(job));
+      }
     } catch (RejectedExecutionException e) {
       jobs.remove(job.id());
       leases.release(tenantId, sourceId, job.id());
-      throw new JobSlotsBusyException(executor.getMaximumPoolSize());
+      throw new JobSlotsBusyException(
+          lane, lane == Lane.REPLAY ? replay.maxConcurrentJobs() : executor.getMaximumPoolSize());
     }
     log.info(
-        "Ingest job {} submitted tenant={} source={} path={}",
+        "Ingest job {} submitted tenant={} source={} path={} lane={}",
         job.id(),
         tenantId,
         sourceId,
-        realPath);
+        realPath,
+        lane);
     return job;
   }
 
@@ -218,12 +264,13 @@ public class IngestJobService {
   private void runJob(IngestJob job) {
     job.running();
     try {
-      Outcome outcome =
-          pipeline.run(
-              new Request(
-                  job.tenantId(), job.path(), job.sourceId(), job.fromBeginning(), job.parser()),
-              job.progress(),
-              job.cancelFlag());
+      Request request =
+          new Request(
+              job.tenantId(), job.path(), job.sourceId(), job.fromBeginning(), job.parser());
+      if (job.lane() == Lane.REPLAY) {
+        request = request.onReplayLane(replay.readLimit());
+      }
+      Outcome outcome = pipeline.run(request, job.progress(), job.cancelFlag());
       job.finished(outcome == Outcome.CANCELLED ? State.CANCELLED : State.COMPLETED, null);
     } catch (Exception e) {
       job.finished(State.FAILED, e.getClass().getSimpleName() + ": " + e.getMessage());

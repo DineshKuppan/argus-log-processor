@@ -64,6 +64,8 @@ public class IngestPipeline {
    *     read to the file's last newline
    * @param pathIsIdentity a checkpoint for a different path starts the next generation (a stream's
    *     numbered spools), rather than resuming when the inode and head match
+   * @param readLimit the reader waits for each batch's bytes (the replay lane's budget), or null
+   * @param lowPriority run the reader and parser threads at minimum priority (the replay lane)
    */
   public record Request(
       String tenantId,
@@ -72,12 +74,32 @@ public class IngestPipeline {
       boolean fromBeginning,
       LogParser parser,
       Long endOffset,
-      boolean pathIsIdentity) {
+      boolean pathIsIdentity,
+      ByteRateLimiter readLimit,
+      boolean lowPriority) {
 
     /** A file: read to its last newline, identified by inode and head. */
     public Request(
         String tenantId, Path path, String sourceId, boolean fromBeginning, LogParser parser) {
       this(tenantId, path, sourceId, fromBeginning, parser, null, false);
+    }
+
+    /** At full speed and normal priority (the live lane). */
+    public Request(
+        String tenantId,
+        Path path,
+        String sourceId,
+        boolean fromBeginning,
+        LogParser parser,
+        Long endOffset,
+        boolean pathIsIdentity) {
+      this(tenantId, path, sourceId, fromBeginning, parser, endOffset, pathIsIdentity, null, false);
+    }
+
+    /** The same run on the replay lane: paced by {@code limit}, at minimum thread priority. */
+    public Request onReplayLane(ByteRateLimiter limit) {
+      return new Request(
+          tenantId, path, sourceId, fromBeginning, parser, endOffset, pathIsIdentity, limit, true);
     }
   }
 
@@ -245,7 +267,9 @@ public class IngestPipeline {
               request.tenantId(),
               new EnvelopeFactory(request.tenantId(), sourceId, resume.generation()),
               progress,
-              cancel);
+              cancel,
+              request.readLimit(),
+              request.lowPriority());
     } catch (Exception e) {
       source.close();
       throw e;
@@ -279,6 +303,8 @@ public class IngestPipeline {
     private final EnvelopeFactory envelopes;
     private final IngestProgress progress;
     private final AtomicBoolean cancel;
+    private final ByteRateLimiter readLimit;
+    private final boolean lowPriority;
     private final BlockingQueue<RawBatch> raw;
     private final BlockingQueue<LogBatch> parsed;
     private final AtomicBoolean stop = new AtomicBoolean();
@@ -296,7 +322,9 @@ public class IngestPipeline {
         String tenantId,
         EnvelopeFactory envelopes,
         IngestProgress progress,
-        AtomicBoolean cancel) {
+        AtomicBoolean cancel,
+        ByteRateLimiter readLimit,
+        boolean lowPriority) {
       this.source = source;
       this.tenantId = tenantId;
       this.chain = chain;
@@ -306,6 +334,8 @@ public class IngestPipeline {
       this.committedOffset = checkpointTemplate.byteOffset();
       this.progress = progress;
       this.cancel = cancel;
+      this.readLimit = readLimit;
+      this.lowPriority = lowPriority;
       this.raw = new ArrayBlockingQueue<>(props.rawQueueCapacity());
       this.parsed = new ArrayBlockingQueue<>(props.parsedQueueCapacity());
     }
@@ -327,6 +357,9 @@ public class IngestPipeline {
               },
               THREAD_PREFIX + sourceId + "-" + stage);
       thread.setDaemon(true);
+      if (lowPriority) {
+        thread.setPriority(Thread.MIN_PRIORITY);
+      }
       thread.start();
       return thread;
     }
@@ -334,12 +367,19 @@ public class IngestPipeline {
     private void read() {
       try {
         for (RawBatch batch = source.nextBatch(); batch != null; batch = source.nextBatch()) {
+          if (readLimit != null
+              && !readLimit.acquire(batch.endOffset() - batch.startOffset(), this::stopping)) {
+            return;
+          }
           if (!handOff(raw, batch)) {
             return;
           }
           progress.read(batch.endOffset(), batch.truncatedLines());
         }
         handOff(raw, END_OF_RAW);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        fail(e);
       } catch (Exception e) {
         fail(e);
       }

@@ -9,7 +9,7 @@ import org.junit.jupiter.api.Test;
 class IngestJobStatusTest {
 
   private final IngestJob job =
-      new IngestJob("job", "default", "app", Path.of("/data/in/app.log"), false, null);
+      new IngestJob("job", "default", "app", Path.of("/data/in/app.log"), false, null, Lane.LIVE);
 
   @Test
   void percentIsZeroBeforeTheRunStarts() {

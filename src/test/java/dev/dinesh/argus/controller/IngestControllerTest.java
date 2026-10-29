@@ -1,5 +1,6 @@
 package dev.dinesh.argus.controller;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
@@ -13,10 +14,12 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.config.IngestProperties;
+import dev.dinesh.argus.config.ReplayProperties;
 import dev.dinesh.argus.config.TenancyConfig;
 import dev.dinesh.argus.ingest.IngestJobService;
 import dev.dinesh.argus.ingest.IngestPipeline;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
+import dev.dinesh.argus.ingest.ReplayLane;
 import dev.dinesh.argus.ingest.SourceLeases;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.tenant.ApiKeyTenantResolver;
@@ -102,6 +105,11 @@ class IngestControllerTest {
       return new IngestProperties(
           0, null, null, 0, 0, null, 1, List.of(ROOT), ROOT.resolve("cp"), null);
     }
+
+    @Bean
+    ReplayLane replayLane() {
+      return new ReplayLane(ReplayProperties.defaults());
+    }
   }
 
   @Autowired MockMvc mvc;
@@ -170,6 +178,28 @@ class IngestControllerTest {
         .andExpect(header().string("Location", startsWith("/api/v2/ingest/jobs/")))
         .andExpect(jsonPath("$.sourceId").value("api-app"))
         .andExpect(jsonPath("$.jobId").isNotEmpty());
+  }
+
+  @Test
+  void aJobFromTheBeginningIsOnTheReplayLaneUnlessLiveIsRequested() throws Exception {
+    submit(
+            Map.of(
+                "path", ROOT.resolve("app.log").toString(),
+                "sourceId", "api-replay",
+                "fromBeginning", "true"))
+        .andExpect(status().isAccepted())
+        .andExpect(jsonPath("$.lane").value("REPLAY"));
+    submit(
+            Map.of(
+                "path", ROOT.resolve("other.log").toString(),
+                "sourceId", "api-live",
+                "fromBeginning", "true",
+                "lane", "live"))
+        .andExpect(status().isAccepted())
+        .andExpect(jsonPath("$.lane").value("LIVE"));
+    submit(Map.of("path", ROOT.resolve("app.log").toString(), "lane", "fast"))
+        .andExpect(status().isBadRequest())
+        .andExpect(jsonPath("$.error").value(containsString("live or replay")));
   }
 
   @Test
