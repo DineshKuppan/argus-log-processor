@@ -4,6 +4,7 @@ import dev.dinesh.argus.ingest.IngestJobService;
 import dev.dinesh.argus.ingest.IngestJobService.IngestBusyException;
 import dev.dinesh.argus.ingest.IngestJobService.SourceBusyException;
 import dev.dinesh.argus.ingest.IngestJobStatus;
+import dev.dinesh.argus.ingest.Lane;
 import dev.dinesh.argus.tenant.CurrentTenant;
 import java.io.IOException;
 import java.nio.file.NoSuchFileException;
@@ -45,9 +46,16 @@ public class IngestController {
    *     {@code raw}, {@code logback}); detected from the file's first lines when omitted
    * @param pattern Logback layout such as {@code %d{ISO8601} [%t] %-5p %c - %m%n}; implies {@code
    *     logback}
+   * @param lane {@code live} or {@code replay} (its own slots and read budget); defaults to {@code
+   *     replay} with {@code fromBeginning}, else {@code live}
    */
   public record IngestFileRequest(
-      String path, String sourceId, Boolean fromBeginning, String format, String pattern) {}
+      String path,
+      String sourceId,
+      Boolean fromBeginning,
+      String format,
+      String pattern,
+      String lane) {}
 
   @PostMapping("/file")
   public ResponseEntity<IngestJobStatus> ingestFile(
@@ -60,7 +68,8 @@ public class IngestController {
             request.sourceId(),
             fromBeginning,
             request.format(),
-            request.pattern());
+            request.pattern(),
+            Lane.parse(request.lane()));
     return ResponseEntity.accepted()
         .header(HttpHeaders.LOCATION, "/api/v2/ingest/jobs/" + job.id())
         .body(IngestJobStatus.of(job));

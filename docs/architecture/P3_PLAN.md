@@ -4,7 +4,7 @@
 > Exit criteria: **T8** (replay any range without starving live ingest: live p99 degrades ≤20%) and **tenant isolation** (one tenant over its quota or flooding a stream never gets another tenant a 429 or a slower response). P3a also re-runs T1, T3 and T4 through the push path.
 > Ships as two PRs, like P1 and P2:
 > - **P3a** (§2–§7): HTTP push ingest (`POST /api/v2/ingest/streams/{id}`), per-tenant ingest quotas, and suppression on the push path.
-> - **P3b** (§8): Elasticsearch and Coralogix export sources, and the replay lane. Measures T8.
+> - **P3b** (§8, results in §10): Elasticsearch and Coralogix export sources, and the replay lane. Measures T8.
 
 ## 1. Goal and scope
 
@@ -159,16 +159,93 @@ Disk budget (§2 of the design): WAL 30GB + Parquet staging ≤2GB + spool ≤2G
 ## 8. P3b: export sources and the replay lane (second PR)
 
 ### D7. Export sources write to a spool too
-- **Situation:** ELK and Coralogix exports are pulled page by page. Their cursors (PIT + `search_after` sort values; a Coralogix time window) are the offsets of §5 of the design.
-- **Action:** an export job pages through the remote system and appends each page to a stream spool exactly as a push request would, using `hash(query, cursor)` as its `Idempotency-Key` (D2), and saves the cursor only after the page is in the spool. A crash re-fetches at most one page, and the key makes the re-append a no-op.
-  - `ElasticsearchExportSource`: point-in-time + `search_after`, `_doc`-tiebreaker sort, page size 5,000; `_source` becomes the line. Tested with Testcontainers (OpenSearch and Elasticsearch images).
-  - `CoralogixExportSource`: the DataPrime query API over `java.net.http`, one query per time window, halving a window that hits the result limit. Tested against a protocol stub, like GCS; the API is re-checked against Coralogix's docs when built.
-- **Result:** one path from "bytes arrived" to "archived" for files, pushes and exports.
+- **Situation:** ELK and Coralogix exports are pulled page by page. Their cursors (PIT + `search_after` sort values; a Coralogix time window) are the offsets of §5 of the design. A crash in the middle of a multi-hour export must neither lose nor duplicate a page.
+- **Task:** export a time range `[from, to)` from either system into the ordinary pipeline, resumable after a crash or restart, without a second implementation of parsing, segments, checkpoints and archive.
+- **Action:** an export job pages through the remote system and appends each page to a stream spool, as a push request would (D1). Its `Idempotency-Key` (D2) is `sha256(export, run, page)`, where *page* is the deterministic part of the cursor the page was fetched from (not the PIT id, which changes). The cursor is saved (temp file + fsync + rename, `checkpoint-dir/tenant=T/_export/<stream>.json`) only after the page is in the spool, so a crash re-fetches at most one page and its re-append is answered from the index. Re-submitting the same export (same source, query and range) on the same stream resumes from the cursor; `fromBeginning` starts a new run (a new run id, so new keys); a different export on that stream starts over. Each page is one canonical line, `Export page finished …`.
+  - **`ElasticsearchExportSource`** (`java.net.http`, no client library): a point in time over the source's index, `range` on the timestamp field, sorted ascending, `size` = page size (5,000), `_source` (compact JSON) becomes the line. Elasticsearch and OpenSearch differ, so the flavour is read from `GET /` (probed on 8.15 and 2.17):
+
+    | | Elasticsearch 8 | OpenSearch 2 |
+    |---|---|---|
+    | Open / close a PIT | `POST /<index>/_pit`, `DELETE /_pit` | `POST /<index>/_search/point_in_time`, `DELETE /_search/point_in_time` |
+    | Tiebreaker | implicit `_shard_doc` (sorting on `_id` is disabled) | none; `_shard_doc` is unknown, so the sort adds `_id` |
+    | Timestamp sort value | ISO text (sort `format`, keeps nanoseconds) | epoch millis (sort `format` is rejected) |
+
+    A PIT expires after `keep-alive` (10m) without a request, e.g. while the job is paused. Both answer `search_context_missing_exception`; the job opens a new PIT and continues. On OpenSearch `(timestamp, _id)` is stable across PITs, so it continues exactly. On Elasticsearch `_shard_doc` means nothing in a new PIT, so it continues from the last timestamp inclusive: documents sharing that one timestamp can be exported twice (at-least-once), never missed.
+  - **`CoralogixExportSource`**: `POST <url>/api/v1/dataprime/query` (`Authorization: Bearer`), one query per time window with `metadata.startDate` (inclusive), `endDate` (exclusive), `tier` and `limit` (≤12,000 on frequent search, ≤50,000 on archive). The answer is NDJSON (`queryId`, `result.results[]` with `metadata`, `labels`, `userData`, then `statistics`). A window that returns `limit` rows, has a `NumberOfResultsLimitWarning`, or ends `INCOMPLETE` / `TIMED_OUT` is halved and queried again (down to 1ms, then the job fails); a window under a quarter of the limit doubles the next one, up to `initial-window`. A window is a page; its key names `[start, end)`. A row becomes a JSON line: `userData` (an object, or `{"message": text}`), plus `timestamp` and `severity` from `metadata` when absent, and `coralogix.<label>` for each label. Tested against a protocol stub, like GCS, with the protocol checked against Coralogix's API reference (2026-10).
+  - **Transient failures** (connection errors, 429, 5xx) are retried 3 times with backoff (1s, 2s, 4s) inside the job; then the job fails, and re-submitting it resumes from the cursor. 400 / 401 / 403 fail at once.
+- **Result:** one path from "bytes arrived" to "archived" for files, pushes and exports. Exactly-once per page with Coralogix and OpenSearch, and with Elasticsearch while its PIT lives.
 
 ### D8. The replay lane
-- **Situation:** T8: a backfill or replay must not starve live ingest. Today every job shares `max-concurrent-jobs`.
-- **Action:** jobs carry a `lane` (`live` | `replay`). `fromBeginning` file jobs and export jobs default to `replay`. The replay lane has its own slots (`argus.replay.max-concurrent-jobs`, 1), a read rate limit (`argus.replay.bytes-per-second`), and lower-priority threads, and it bypasses suppression (guardrail 8). Live pushes and stream runs never wait for a replay slot.
-- **Result:** measured by `ReplayIsolationIT`: push p99 with and without a 1GB replay running; target ≤20% worse.
+- **Situation:** T8: a backfill or replay must not starve live ingest. Today every file job shares `max-concurrent-jobs`, and a re-ingest runs as fast as the disk allows.
+- **Action:** jobs carry a `lane` (`live` | `replay`). `fromBeginning` file jobs and every export job default to `replay`; `lane` overrides it for file jobs. The replay lane (`ReplayLane`) has:
+  - its own slots (`argus.replay.max-concurrent-jobs`, 1; a full lane is 429), so live file jobs never wait for a replay and a replay never waits for live jobs;
+  - one shared read budget (`argus.replay.bytes-per-second`, 8MB/s, ≈70x the 10GB/day average; first planned at 16MB/s, lowered after T8 on 2 CPUs, §10): the reader of a replay file job, and each export page, waits for its bytes. A 1GB replay takes about two minutes, a day of the 10GB target about 21;
+  - minimum-priority threads (advisory: Linux ignores Java priorities without `-XX:ThreadPriorityPolicy=1`, so the read budget is what isolates);
+  - for exports, room for live pushes in the spool: an export pauses (status `paused: SPOOL_FULL`) while its stream holds `argus.replay.max-pending-bytes` (256MB) not yet ingested, or the spool as a whole holds half of `max-spool-bytes`; and like every job it waits while the WAL is full.
+  - Suppression is bypassed (guardrail 8): replay file jobs never had it, and export pages go to the spool directly, not through the push path. The push quota doesn't apply either; the read budget does.
+  - Live pushes and stream runs use their own slots and threads (D4), so they never wait for a replay slot.
+- **Result:** measured by `ReplayIsolationIT` (T8): push p99 with and without a 1GB replay running; target ≤20% worse.
+
+### D9. Export sources are configured, not named in requests
+- **Situation:** an export reads from a URL with credentials. Taking either from the request would let any API key make the server call any address (SSRF into the cluster network) and put secrets in request bodies and logs.
+- **Action:** sources are configured (`argus.export.sources[i]`: `name`, `tenant`, `type`, `url`, `index`, credentials, page size); a request names a source, which must belong to the caller's tenant (another tenant's source is 404, like a job). Credentials come from configuration (environment variables in practice) and are never logged or returned. The request chooses only the query, the time range and the target stream.
+- **Result:** tenants can export only what an operator wired for them, from where it was wired (guardrail 4).
+
+### Components (P3b)
+
+| Component | Package | Role |
+|---|---|---|
+| `Lane`, `ReplayLane`, `ByteRateLimiter` | `ingest` | D8: the replay lane's slots, read budget and thread priority |
+| `IngestJobService`, `IngestPipeline.Request` | `ingest` | Jobs on two lanes; a run can carry a read limit and low-priority stage threads |
+| `ExportSource`, `ElasticsearchExportSource`, `CoralogixExportSource` | `export` (new) | D7: one page per call, with the cursor to continue from |
+| `ExportJobService`, `ExportJob`, `ExportCursorStore`, `ExportSources` | `export` | Admission, paging into the spool, cursors, the configured sources (D9) |
+| `ExportController` | `controller` | `POST /api/v2/ingest/exports`, `GET` / `DELETE /exports/{id}` |
+| `ReplayProperties`, `ExportProperties` | `config` | Binding |
+
+### Configuration (P3b)
+
+```properties
+argus.replay.max-concurrent-jobs=1
+argus.replay.bytes-per-second=8MB
+argus.replay.max-pending-bytes=256MB       # an export pauses while its stream has this much to ingest
+
+argus.export.sources[0].name=elk
+argus.export.sources[0].tenant=acme
+argus.export.sources[0].type=elasticsearch  # elasticsearch (or OpenSearch) | coralogix
+argus.export.sources[0].url=https://es.internal:9200
+argus.export.sources[0].index=logs-*
+argus.export.sources[0].timestamp-field=@timestamp
+argus.export.sources[0].api-key=${ELK_API_KEY}   # or username / password
+argus.export.sources[0].page-size=5000
+argus.export.sources[0].keep-alive=10m
+argus.export.sources[1].name=cx
+argus.export.sources[1].tenant=acme
+argus.export.sources[1].type=coralogix
+argus.export.sources[1].url=https://api.eu2.coralogix.com
+argus.export.sources[1].api-key=${CX_API_KEY}
+argus.export.sources[1].tier=frequent_search      # or archive
+argus.export.sources[1].initial-window=1h
+```
+
+### Tests (P3b)
+
+| Kind | Test |
+|---|---|
+| Unit | `ByteRateLimiterTest` (rate, no saved-up credit, stop while waiting); `ReplayLaneTest`; `IngestJobServiceTest`: lanes default from `fromBeginning`, a busy replay lane never blocks a live job, a replay run is rate limited |
+| Unit | `ExportJobServiceTest` with an in-memory source: pages land in the spool in order, the cursor is saved after each page, a crash between append and cursor re-fetches one page and the key drops it, resume vs `fromBeginning` vs a different export, pause on spool, cancel, another tenant's source is 404, one export per stream |
+| Protocol | `CoralogixExportSourceTest` against a stub: request shape and auth, window halving and growth, statistics status, retries, row → line |
+| Integration | `ElasticsearchExportSourceTest` on Elasticsearch 8.15 and OpenSearch 2.17 (Testcontainers, skipped without Docker): ties across page boundaries, `[from, to)`, a PIT deleted mid-export (exact on OpenSearch, nothing missed on Elasticsearch) |
+| API | `ExportControllerTest`, `IngestControllerTest` (`lane`) |
+| Load (`load` tag) | `ReplayIsolationIT` (T8): push p99 alone vs with a 1GB replay job; ≤20% worse |
+
+### Implementation order (P3b)
+1. This section.
+2. The replay lane: `ByteRateLimiter`, `ReplayLane`, lanes in `IngestJobService` and the pipeline, `lane` in the API + tests.
+3. The export framework: `ExportSource` port, `ExportJobService`, cursors, `ExportController`, configuration + tests with an in-memory source.
+4. `ElasticsearchExportSource` + Testcontainers tests.
+5. `CoralogixExportSource` + stub tests.
+6. `ReplayIsolationIT` (T8); results in §10.
+7. Docs.
 
 ## 9. Results (P3a)
 Measured on an Apple M1 Pro (10 cores, SSD), JDK 17, with the application in its own JVM at `-Xmx256m` and the clients in the test JVM, over HTTP on localhost. Lines are ~200-byte JSON records, pushed gzipped in batches.
@@ -192,3 +269,25 @@ Found in review (fixed, each with a test):
 - **Rejected requests created their stream**, using up `max-streams-per-tenant` slots that can't be freed. The stream is now created after every other bound.
 - **Spool numbers had six digits**, about two years of one-a-minute rotations; they now grow to nine.
 - Also: `date` is no longer a JSON timestamp key (it turned business fields into event times; the Fluent Bit example sets `json_date_key timestamp`), suppressed lines aren't counted as truncated, a running stream run shows in status (`RUNNING`, with `paused: WAL_FULL`), and `spool-dir` is made absolute so another spelling of it doesn't re-ingest every spool.
+
+## 10. Results (P3b)
+`ReplayIsolationIT` (T8): one client pushes 200-line gzip batches with a 10ms pause, for 30s windows: before a replay, during a 1GB `fromBeginning` re-read on the replay lane, and after it is cancelled; then during the same re-read on the live lane (unthrottled), for contrast. The baseline is the mean of the before and after p99s. The application runs in its own 256MB JVM.
+
+| Where the application ran | Replay budget | Live p99 before / after | During the replay | During the unthrottled re-read |
+|---|---|---|---|---|
+| Host (Apple M1 Pro, 10 cores) | 16MB/s | 31.4 / 38.6ms | 25.0ms (16.0MB/s) | 33.0ms (64MB/s) |
+| Container, 2 CPUs, 4GB (`-Dargus.load.docker-cpus=2`) | 16MB/s | 21.3 / 20.8ms | **30.2ms, +44%: fails T8** | 64.8ms (34MB/s) |
+| Container, 2 CPUs, 4GB | 8MB/s | 27.9 / 19.9ms | 20.1ms | 164.2ms (40MB/s) |
+| Container, 2 CPUs, 4GB | 8MB/s (second run) | 15.8 / 23.6ms | 15.6ms | 91.5ms (48MB/s) |
+| Container, 2 CPUs, 4GB | 4MB/s | 21.5 / 18.7ms | 17.0ms | 179.2ms (46MB/s) |
+
+- **The default budget is 8MB/s, not the planned 16MB/s.** With 10 cores nothing competes, so even an unthrottled re-read didn't move live p99 beyond the noise between windows (±20% on its own). On 2 CPUs, the size of a 4GB node, 16MB/s of parsing and writing took enough CPU to raise live p99 by 44%; at 8MB/s it stayed within the noise in two runs. 8MB/s is ≈70x the 10GB/day average: a 1GB replay takes about two minutes. A node with more cores can raise `argus.replay.bytes-per-second`.
+- **Without the lane, a replay starves live ingest:** the same re-read unthrottled on the live lane raised live p99 3–8x (65–179ms) on 2 CPUs.
+- Peak heap 209–216MB of 256MB in every run. Every live push was accepted (202).
+
+Exports, tested functionally (no load test): `ElasticsearchExportSourceTest` on Elasticsearch 8.15.3 and OpenSearch 2.17.1 exports 30 hits with three per timestamp across 4-hit pages exactly once and in order, and replaces 7 deleted points in time without missing a hit; `CoralogixExportSourceTest` halves and regrows windows around a 35-row burst with a 10-row limit, every row once.
+
+Found while building:
+- **OpenSearch and Elasticsearch page differently.** Probed before writing the source: OpenSearch 2.17 has no implicit tiebreaker, rejects `_shard_doc` and a sort `format`, but sorts on `_id`; Elasticsearch 8 adds `_shard_doc` but refuses `_id`. Each flavour gets its own sort, and the expiry rule follows from it (D7).
+- **A resumed export's totals missed the re-fetched page:** its lines were spooled by the interrupted run after the last saved totals, so the duplicate page now counts once in the resumed job.
+- **An export refused for a busy replay slot created its stream** (the P3a bug, again, for exports); the slot is checked before the stream is created.

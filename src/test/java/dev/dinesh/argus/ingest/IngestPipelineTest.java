@@ -153,6 +153,65 @@ class IngestPipelineTest {
   }
 
   @Test
+  void aReplayLaneRunIsPacedByItsReadBudgetAndWritesTheSameOutput() throws Exception {
+    Path file = writeLog(100); // ~13KB
+    long size = Files.size(file);
+    Path liveOut = dir.resolve("live");
+    Path replayOut = dir.resolve("replay");
+    pipeline(localSink(liveOut), checkpoints(dir.resolve("cp-live")))
+        .run(
+            new Request("default", file, "app", false, null),
+            new IngestProgress(),
+            new AtomicBoolean());
+
+    long start = System.nanoTime();
+    Outcome outcome =
+        pipeline(localSink(replayOut), checkpoints(dir.resolve("cp-replay")))
+            .run(
+                new Request("default", file, "app", false, null)
+                    .onReplayLane(new ByteRateLimiter(size * 2)), // the file in ~0.5s
+                new IngestProgress(),
+                new AtomicBoolean());
+
+    long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+    assertEquals(Outcome.COMPLETED, outcome);
+    assertTrue(elapsedMs >= 400, "paced run took only " + elapsedMs + "ms");
+    assertEquals(
+        withoutObservedTime(outputFiles(liveOut)), withoutObservedTime(outputFiles(replayOut)));
+  }
+
+  @Test
+  void aCancelEndsAReplayRunWaitingForItsReadBudget() throws Exception {
+    Path file = writeLog(100);
+    AtomicBoolean cancel = new AtomicBoolean();
+    IngestProgress progress = new IngestProgress();
+    Thread canceller =
+        new Thread(
+            () -> {
+              try {
+                Thread.sleep(200);
+              } catch (InterruptedException e) {
+                return;
+              }
+              cancel.set(true);
+            });
+    canceller.start();
+    long start = System.nanoTime();
+
+    Outcome outcome =
+        pipeline(localSink(dir.resolve("out")), checkpoints(dir.resolve("cp")))
+            .run(
+                new Request("default", file, "app", false, null)
+                    .onReplayLane(new ByteRateLimiter(100)), // hours for the file
+                progress,
+                cancel);
+
+    assertEquals(Outcome.CANCELLED, outcome);
+    assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) < 5_000);
+    canceller.join();
+  }
+
+  @Test
   void tenantsIngestingTheSameSourceShareNothing() throws Exception {
     Path file = writeLog(20);
     Path out = dir.resolve("out");

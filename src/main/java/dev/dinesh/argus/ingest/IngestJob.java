@@ -15,7 +15,7 @@ public final class IngestJob {
     FAILED,
     CANCELLED;
 
-    boolean isFinished() {
+    public boolean isFinished() {
       return this == COMPLETED || this == FAILED || this == CANCELLED;
     }
   }
@@ -26,6 +26,7 @@ public final class IngestJob {
   private final Path path;
   private final boolean fromBeginning;
   private final LogParser parser;
+  private final Lane lane;
   private final Instant createdAt = Instant.now();
   private final IngestProgress progress = new IngestProgress();
   private final AtomicBoolean cancel = new AtomicBoolean();
@@ -42,13 +43,15 @@ public final class IngestJob {
       String sourceId,
       Path path,
       boolean fromBeginning,
-      LogParser parser) {
+      LogParser parser,
+      Lane lane) {
     this.id = id;
     this.tenantId = tenantId;
     this.sourceId = sourceId;
     this.path = path;
     this.fromBeginning = fromBeginning;
     this.parser = parser;
+    this.lane = lane;
   }
 
   void running() {
@@ -84,6 +87,10 @@ public final class IngestJob {
   /** Requested primary parser, or null if the format is detected. */
   public LogParser parser() {
     return parser;
+  }
+
+  public Lane lane() {
+    return lane;
   }
 
   public Instant createdAt() {

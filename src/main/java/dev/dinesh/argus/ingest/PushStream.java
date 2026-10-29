@@ -75,7 +75,7 @@ public final class PushStream {
     return parser;
   }
 
-  void useParser(LogParser requested) {
+  public void useParser(LogParser requested) {
     parser = requested;
     messageParser = requested;
   }

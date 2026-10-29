@@ -6,7 +6,28 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
-### P3a: HTTP push ingest, quotas and suppression on push (unmerged)
+### P3b: export sources and the replay lane (unmerged)
+Plan and results: [`P3_PLAN.md`](docs/architecture/P3_PLAN.md) §8, §10.
+
+#### Added
+- **Exports:** `POST /api/v2/ingest/exports` (`GET` / `DELETE /exports/{id}`) copies `[from, to)` from a configured source into a stream, as a replay-lane job.
+  - `ElasticsearchExportSource`: Elasticsearch 7.12+ or OpenSearch 2.x (detected from `GET /`), point in time + `search_after`, `_source` as the line. Each flavour sorts with the tiebreaker it supports; an expired point in time is replaced.
+  - `CoralogixExportSource`: the DataPrime query API, one query per adaptive time window (halved when full, doubled when sparse).
+  - Each page is appended to the stream spool under an `Idempotency-Key` derived from the export, the run and the page, and only then is the cursor saved (`checkpoint-dir/tenant=T/_export/<stream>.json`). Re-posting an export resumes it; `fromBeginning` runs it again; a crash re-fetches one page, which the key drops.
+  - Transient failures are retried 3 times (1s, 2s, 4s); 4xx and bad queries fail at once.
+  - Sources are configured (`argus.export.sources[i]`), each for one tenant; requests never carry URLs or credentials, and credentials are never logged.
+  - One `Export page finished …` canonical line per page and `Export finished …` per job.
+- **Replay lane** (`argus.replay.*`): `fromBeginning` file jobs (or `lane: replay`) and exports run on their own slots (1) with one shared read budget (8MB/s) and minimum-priority threads. An export also pauses while its stream has 256MB not yet ingested, or the spool is half full.
+- `ReplayIsolationIT` (T8, tag `load`); `-Dargus.load.docker-cpus=N` runs any push load test's server in an N-CPU, 4GB container.
+
+#### Changed
+- `POST /api/v2/ingest/file` takes `lane`; job status shows it. A busy lane's 429 names the lane.
+- `IngestPipeline.Request` gains a read limit and low-priority stage threads (`onReplayLane`).
+
+#### Measured
+- **T8:** with the application in a 2-CPU, 4GB container, live push p99 during a 1GB replay at 8MB/s was 15.6ms and 20.1ms in two runs, against 15.8–27.9ms in the windows before and after (no measurable slowdown). The same re-read unthrottled on the live lane raised it to 65–179ms. At the planned 16MB/s, p99 rose 44%, so the default is 8MB/s.
+
+### P3a: HTTP push ingest, quotas and suppression on push: [#8](https://github.com/DineshKuppan/argus-log-processor/pull/8) (2026-10-29)
 Plan and results: [`P3_PLAN.md`](docs/architecture/P3_PLAN.md).
 
 #### Added

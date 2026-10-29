@@ -12,6 +12,7 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Rotation and truncation | A file that was replaced, truncated, or truncated and regrown (`copytruncate`) restarts from 0 as a new generation, without overwriting earlier output |
 | Partial last line | A run stops at the last `\n`; a line still being written waits for the next run |
 | Job control | `GET` / `DELETE /api/v2/ingest/jobs/{id}`: progress, format, line counts, outputs. Jobs run on `max-concurrent-jobs` slots, with no queue (429 when busy) and one job per source at a time |
+| Replay lane | `fromBeginning` jobs (or `lane: replay`) run on their own slots (`argus.replay.max-concurrent-jobs`, 1) with a shared read budget (8MB/s) and low-priority threads, so a re-ingest never takes live ingest's slots or bandwidth. On 2 CPUs a 1GB replay left live push p99 within the noise (15.6ms vs 15.8 / 23.6ms before and after); the same re-read unthrottled raised it 3–8x |
 | Long lines | Lines over `max-line-bytes` (1MB) are truncated and counted |
 
 ## Push ingest (v2)
@@ -26,6 +27,15 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Crash-safe spool | Bytes that were never acknowledged are truncated at startup; spool files rotate at 64MB and are deleted once ingested; each spool file is its own output generation |
 | Status | `GET /api/v2/ingest/streams/{id}` (and the list): spool bytes, bytes not yet ingested, request and line counters, the last run |
 | Speed | 132k lines/s end to end (8 clients, 1,000-line gzip batches) at a 256MB heap; request p99 93ms |
+
+## Exports (v2)
+| Feature | Details |
+|---|---|
+| Elasticsearch and OpenSearch | `POST /api/v2/ingest/exports` copies `[from, to)` of an index into a stream: point in time + `search_after`, each hit's `_source` one JSON line, an optional query object. Elasticsearch 7.12+ and OpenSearch 2.x, told apart by `GET /`, each with the tiebreaker it supports (`_shard_doc`, `_id`). Tested on 8.15 and 2.17 |
+| Coralogix | The DataPrime query API, one query per time window: a full window is halved and queried again, a sparse one doubles the next (up to 1h). Each row becomes its `userData` plus timestamp, severity and labels. Frequent-search or archive tier |
+| Resumable, no duplicate pages | Each page is durable in the stream's spool (under a key derived from the export and the page) before the cursor after it is saved. Re-posting the export resumes; a crash re-fetches one page, which the key drops. An expired Elasticsearch point in time can repeat hits sharing one timestamp, never miss one |
+| Paced | Exports run on the replay lane and pause while their stream has 256MB not yet ingested, or the WAL is full, leaving the spool to live pushes |
+| Configured sources only | A request names a source configured for its tenant; URLs and credentials never come from requests (no SSRF), and credentials never appear in logs or status |
 
 ## Formats and parsing
 | Feature | Details |
@@ -83,9 +93,9 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 ## Operations
 | Feature | Details |
 |---|---|
-| Canonical log lines | One wide line per ingest run, push request, v1 scan, suppression check and archived segment, with offsets, counts and timings |
+| Canonical log lines | One wide line per ingest run, push request, export page and export job, v1 scan, suppression check and archived segment, with offsets, counts and timings |
 | Memory sizing | Runs in 4GB with `-XX:MaxRAMPercentage=60 -XX:MaxDirectMemorySize=512m` |
 | OpenAPI | Swagger UI at `/swagger-ui.html`, with the API-key scheme declared |
 | Actuator | `/actuator/health` and the other Spring Boot endpoints |
 | Test data | `DataSeeder` streams a reproducible Nginx log of any size to disk |
-| Tests | 348 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3 and GCS, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions; push throughput and tenant isolation, push during an archive outage, `kill -9` during push) |
+| Tests | 398 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3, GCS, Elasticsearch and OpenSearch, a Coralogix protocol stub, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions; push throughput and tenant isolation, push during an archive outage, `kill -9` during push; T8 replay isolation) |

@@ -76,36 +76,92 @@ final class PushLoad {
     return args;
   }
 
+  /**
+   * With {@code -Dargus.load.docker-cpus=N} the server runs in a Linux container limited to N CPUs
+   * and 4GB (the sizing target's node), from the same class path, mounted read-only. Its data
+   * directory is a Docker volume at {@code work}'s path, so fsyncs aren't measured through the host
+   * file share; the host then sees only {@code server.log}.
+   */
+  static final String DOCKER_CPUS = System.getProperty("argus.load.docker-cpus");
+
+  static boolean inDocker() {
+    return DOCKER_CPUS != null && !DOCKER_CPUS.isBlank();
+  }
+
   /** The application in a separate JVM with {@code heap}. */
   static final class Server {
     private final Process process;
     private final Path log;
+    private final String container;
 
-    private Server(Process process, Path log) {
+    private Server(Process process, Path log, String container) {
       this.process = process;
       this.log = log;
+      this.container = container;
     }
 
     static Server start(Path work, String heap, List<String> args) throws Exception {
+      return start(work, heap, List.of(), args);
+    }
+
+    /**
+     * @param jvmOptions extra JVM options (system properties for {@link PushServerMain})
+     */
+    static Server start(Path work, String heap, List<String> jvmOptions, List<String> args)
+        throws Exception {
       Path log = work.resolve("server.log");
       long logStart = Files.exists(log) ? Files.size(log) : 0;
-      List<String> command =
-          new ArrayList<>(
-              List.of(
-                  Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                  heap,
-                  "-XX:+ExitOnOutOfMemoryError",
-                  "-cp",
-                  System.getProperty("java.class.path"),
-                  PushServerMain.class.getName()));
+      List<String> command = new ArrayList<>();
+      String container = null;
+      if (inDocker()) {
+        container = "argus-load-" + ProcessHandle.current().pid() + "-" + System.nanoTime();
+        command.addAll(
+            List.of(
+                "docker",
+                "run",
+                "--rm",
+                "-i",
+                "--name",
+                container,
+                "--cpus=" + DOCKER_CPUS,
+                "-m",
+                "4g",
+                "--memory-swap",
+                "4g",
+                "-p",
+                "127.0.0.1:" + serverPort(args) + ":" + serverPort(args),
+                "-v",
+                System.getProperty("user.home")
+                    + "/.m2:"
+                    + System.getProperty("user.home")
+                    + "/.m2:ro",
+                "-v",
+                Path.of("").toAbsolutePath() + ":" + Path.of("").toAbsolutePath() + ":ro",
+                "-v",
+                container + ":" + work,
+                "eclipse-temurin:17-jre",
+                "java"));
+      } else {
+        command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+      }
+      command.addAll(List.of(heap, "-XX:+ExitOnOutOfMemoryError"));
+      command.addAll(jvmOptions);
+      // Surefire's java.class.path can be a manifest-only jar in a temp directory the container
+      // can't see; the real entries are in surefire.test.class.path.
+      String classPath =
+          inDocker()
+              ? System.getProperty(
+                  "surefire.test.class.path", System.getProperty("java.class.path"))
+              : System.getProperty("java.class.path");
+      command.addAll(List.of("-cp", classPath, PushServerMain.class.getName()));
       command.addAll(args);
       Process process =
           new ProcessBuilder(command)
               .redirectErrorStream(true)
               .redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()))
               .start();
-      Server server = new Server(process, log);
-      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+      Server server = new Server(process, log, container);
+      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(inDocker() ? 300 : 90);
       while (!server.logSince(logStart).contains("READY port=")) {
         if (!process.isAlive()) {
           throw new IllegalStateException("server exited:\n" + server.tail());
@@ -119,8 +175,19 @@ final class PushLoad {
       return server;
     }
 
+    private static String serverPort(List<String> args) {
+      return args.stream()
+          .filter(a -> a.startsWith("--server.port="))
+          .map(a -> a.substring("--server.port=".length()))
+          .reduce((a, b) -> b)
+          .orElseThrow(() -> new IllegalArgumentException("no --server.port"));
+    }
+
     /** {@code kill -9}. */
-    void kill() throws InterruptedException {
+    void kill() throws Exception {
+      if (container != null) {
+        new ProcessBuilder("docker", "kill", container).inheritIO().start().waitFor();
+      }
       process.destroyForcibly();
       process.waitFor(30, TimeUnit.SECONDS);
     }
@@ -133,6 +200,9 @@ final class PushLoad {
       if (!process.waitFor(90, TimeUnit.SECONDS)) {
         process.destroyForcibly();
         throw new IllegalStateException("server did not stop:\n" + tail());
+      }
+      if (container != null) {
+        new ProcessBuilder("docker", "volume", "rm", "-f", container).start().waitFor();
       }
       String heapLine =
           Files.readAllLines(log).stream()
