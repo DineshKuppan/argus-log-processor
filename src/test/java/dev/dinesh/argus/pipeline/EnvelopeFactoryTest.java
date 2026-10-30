@@ -41,6 +41,17 @@ class EnvelopeFactoryTest {
   }
 
   @Test
+  void anUnplacedLineHasNoEventId() {
+    LogEnvelope e =
+        new EnvelopeFactory("default", "app", 0)
+            .createUnplaced(parsed("info", Map.of("trace_id", "abc")), NOW);
+
+    assertNull(e.eventId());
+    assertEquals("abc", e.traceId());
+    assertEquals(new LogEnvelope.Source("app", 0, 0, "json"), e.source());
+  }
+
+  @Test
   void liftsTraceContextAndServiceNameOutOfTheAttributes() {
     LogEnvelope e =
         new EnvelopeFactory("default", "app", 0)

@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). P4–P5 are design only. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). **P4 implemented** (SSE live tail with per-tenant rings, Micrometer / Prometheus metrics, a parser for producers' canonical lines; see [`P4_PLAN.md`](P4_PLAN.md)). P5 is design only. Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents
@@ -318,14 +318,14 @@ flowchart LR
 
 | Concern | Design |
 |---|---|
-| Tap point | **After suppression** (users see what would be "printed"), before sinks. A per-tenant in-memory ring buffer (e.g. last 10k lines). Distributed version: a Redis Stream / Kafka topic per tenant partition. |
+| Tap point | **After suppression** (users see what would be "printed"), before sinks: a pushed line once it is durable in the spool, a file job's line at parse ([`P4_PLAN.md`](P4_PLAN.md) D1). A per-tenant in-memory ring buffer (10k lines / 4MB) that each connection reads with its own cursor (D2). Distributed version: a Redis Stream / Kafka topic per tenant partition. |
 | Protocol | **SSE**: `GET /api/v2/tail?tenant=&level=&q=`. It's one-way, works over plain HTTP/1.1 and proxies, and reconnects automatically. WebSocket only if bidirectional control is needed later. |
-| Filtering | On the server, using `FilterSpec.toPredicate()`, so filtered-out lines never use network bandwidth. |
-| Slow consumers | Each connection gets a bounded queue (e.g. 1,000 lines). When it's full, **drop the oldest** lines and send a `{"dropped": N}` marker. The ingest pipeline never waits on a tail client. |
+| Filtering | On the server (`level`, `source`, `q`), so filtered-out lines never use network bandwidth. `TailFilter` rather than `FilterSpec`, which works on v1 records. |
+| Slow consumers | Each connection's cursor into the tenant's ring: when the ring overtakes it, the client **loses the oldest** lines and gets a `{"dropped": N}` marker. The ingest pipeline never waits on a tail client, and memory doesn't grow with connections. |
 | Rate | If the matching rate exceeds a per-connection cap (e.g. 200 lines/s), sample and mark the stream as `sampled`. |
 | Resume | Every event has an `id` (monotonic sequence). The browser's `Last-Event-ID` replays from the ring buffer if the line is still there; otherwise the stream starts fresh with a gap marker. |
 | Limits | Per-tenant max concurrent tail connections (quota); idle timeout; heartbeat comment every 15s to keep proxies from closing the connection. |
-| Restart | The ring is pre-filled from the WAL tail (warm-up, §5). |
+| Restart | Later: pre-fill the ring from the WAL tail (warm-up, §5). Until then a reconnect after a restart gets `event: reset`. |
 
 ---
 
@@ -422,8 +422,8 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **S:** Java 17 (pom).
 - **T:** Throughput and simplicity for I/O-heavy stages.
 - **A:** Stay on 17 (no change) vs. move to 21 LTS (virtual threads, generational ZGC, Spring Boot 3.2+ support).
-  **Choice:** Recommend 21 before P4 (many concurrent tail connections). Not required for P0–P3: push ingest is ~10 requests/s at the target, far within Tomcat's platform threads, and on 21 virtual threads still pin inside `synchronized`, which the pipeline uses ([`P3_PLAN.md`](P3_PLAN.md) D6).
-- **R:** A tail test with 1,000 concurrent SSE clients stays within the heap budget.
+  **Choice:** Stay on 17 through P4. P0–P3 don't need it: push ingest is ~10 requests/s at the target, far within Tomcat's platform threads ([`P3_PLAN.md`](P3_PLAN.md) D6). Live tail (P4) uses a platform thread per connection, capped, because on 21 a virtual thread blocked in a socket write inside `synchronized` pins its carrier, so a few stalled clients could stall every virtual thread ([`P4_PLAN.md`](P4_PLAN.md) D3). Move to virtual threads once the build is on Java 24+ (JEP 491).
+- **R:** A tail test with 1,000 concurrent SSE clients stays within the memory budget (`LiveTailIT`).
 
 ---
 

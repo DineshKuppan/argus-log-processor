@@ -16,10 +16,14 @@ public class KeyValueLogParser implements LogParser {
   public static final String NAME = "kv";
 
   private static final Pattern LEADING_PAIR = Pattern.compile("^\\s*[\\w.]+=");
-  private static final Pattern KV = Pattern.compile("([\\w.]+)=(\"[^\"]*\"|\\S*)");
-  private static final List<String> TIMESTAMP_KEYS = List.of("timestamp", "time", "ts");
-  private static final List<String> LEVEL_KEYS = List.of("level", "lvl", "severity");
-  private static final List<String> MESSAGE_KEYS = List.of("msg", "message");
+  // Shared with CanonicalLineParser. The lookbehind starts a key only where a run of key characters
+  // starts, and the possessive run never backtracks: without them, find() over a long run with no
+  // '='
+  // retries from every position in it, which takes time quadratic in its length (1MB: ~45 minutes).
+  static final Pattern KV = Pattern.compile("(?<![\\w.])([\\w.]++)=(\"[^\"]*\"|\\S*)");
+  static final List<String> TIMESTAMP_KEYS = List.of("timestamp", "time", "ts");
+  static final List<String> LEVEL_KEYS = List.of("level", "lvl", "severity");
+  static final List<String> MESSAGE_KEYS = List.of("msg", "message");
 
   @Override
   public String name() {

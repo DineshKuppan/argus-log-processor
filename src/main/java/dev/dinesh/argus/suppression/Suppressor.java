@@ -1,5 +1,6 @@
 package dev.dinesh.argus.suppression;
 
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.tenant.TenantIds;
 import java.util.Collection;
 
@@ -17,10 +18,16 @@ public class Suppressor {
 
   private final SuppressionStore store;
   private final MessageFingerprint fingerprint;
+  private final ArgusMetrics metrics;
 
   public Suppressor(SuppressionStore store, MessageFingerprint fingerprint) {
+    this(store, fingerprint, ArgusMetrics.noop());
+  }
+
+  public Suppressor(SuppressionStore store, MessageFingerprint fingerprint, ArgusMetrics metrics) {
     this.store = store;
     this.fingerprint = fingerprint;
+    this.metrics = metrics;
   }
 
   /**
@@ -47,6 +54,7 @@ public class Suppressor {
     }
     String key = key(tenantId, message);
     SuppressionDecision decision = store.acquire(key, message);
+    metrics.suppressionDecision(tenantId, decision.allowed());
     if (allowedKeys != null && decision.allowed()) {
       allowedKeys.add(key);
     }

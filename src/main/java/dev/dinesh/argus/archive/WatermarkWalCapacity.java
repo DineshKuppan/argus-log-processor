@@ -53,6 +53,12 @@ public final class WatermarkWalCapacity implements WalCapacity {
     return isFull(false);
   }
 
+  /** Pending WAL bytes, as last measured (at most {@code refresh} old). */
+  public synchronized long pendingBytes() {
+    isFull(false);
+    return lastBytes;
+  }
+
   /** {@code fresh}: measure now, ignoring the cached size. */
   private synchronized boolean isFull(boolean fresh) {
     long now = System.nanoTime();

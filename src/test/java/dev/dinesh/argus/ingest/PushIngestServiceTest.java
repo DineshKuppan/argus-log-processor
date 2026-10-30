@@ -15,6 +15,7 @@ import dev.dinesh.argus.config.QuotaProperties;
 import dev.dinesh.argus.ingest.PushIngestService.PushRequest;
 import dev.dinesh.argus.ingest.PushIngestService.PushResult;
 import dev.dinesh.argus.ingest.PushRejectedException.Reason;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.quota.LocalQuotaStore;
 import dev.dinesh.argus.quota.QuotaService;
@@ -22,6 +23,8 @@ import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.suppression.LocalSuppressionStore;
 import dev.dinesh.argus.suppression.MessageFingerprint;
 import dev.dinesh.argus.suppression.Suppressor;
+import dev.dinesh.argus.tail.TailEvent;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -51,6 +54,8 @@ class PushIngestServiceTest {
   private final SourceLeases leases = new SourceLeases();
   private StreamRegistry registry;
   private Suppressor suppressor;
+  private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
+  private final RecordingTail tail = new RecordingTail();
 
   @AfterEach
   void closeSpools() {
@@ -91,9 +96,19 @@ class PushIngestServiceTest {
             new QuotaProperties(null, DataSize.ofBytes(quotaBytesPerSecond), 1.0, Map.of()));
     suppressor =
         new Suppressor(
-            new LocalSuppressionStore(Duration.ofSeconds(10), 1000), new MessageFingerprint(false));
+            new LocalSuppressionStore(Duration.ofSeconds(10), 1000),
+            new MessageFingerprint(false),
+            new ArgusMetrics(meters));
     return new PushIngestService(
-        registry, pipeline, quotas, suppressor, new ParserRegistry(), props, ingest);
+        registry,
+        pipeline,
+        quotas,
+        suppressor,
+        new ParserRegistry(),
+        props,
+        ingest,
+        new ArgusMetrics(meters),
+        tail);
   }
 
   private static PushRequest request(String tenant, String body) {
@@ -234,6 +249,80 @@ class PushIngestServiceTest {
     assertEquals(1, otherTenant.accepted(), "suppression is per tenant");
     assertEquals(
         "{\"ts\":1,\"msg\":\"disk full\"}\n{\"ts\":3,\"msg\":\"other\"}\n", spooled("acme"));
+  }
+
+  @Test
+  void acceptedLinesAreTailedOnceSpooledAfterSuppression() throws IOException {
+    PushIngestService service = service();
+    service.push(
+        request(
+            "acme",
+            "{\"level\":\"error\",\"msg\":\"disk full\"}\n"
+                + "{\"msg\":\"disk full\"}\n"
+                + "{\"msg\":\"other\",\"trace_id\":\"t1\"}\n"));
+
+    assertEquals(List.of("disk full", "other"), tail.bodies());
+    TailEvent first = tail.published.get(0);
+    assertEquals("app", first.source());
+    assertEquals("json", first.format());
+    assertEquals(17, first.severityNumber());
+    assertEquals(null, first.eventId(), "assigned only when the spool is ingested");
+    assertEquals(null, first.offset());
+    assertEquals("t1", tail.published.get(1).traceId());
+    assertEquals(List.of("acme"), tail.tenants, "one publish per request");
+
+    byte[] keyed = "{\"msg\":\"keyed\"}\n".getBytes(StandardCharsets.UTF_8);
+    service.push(request("acme", keyed, null, "k1"));
+    service.push(request("acme", keyed, null, "k1"));
+    assertEquals(3, tail.published.size(), "a repeated key is answered, not tailed again");
+
+    tail.watched = false;
+    service.push(request("acme", "{\"msg\":\"unseen\"}\n"));
+    assertEquals(3, tail.published.size());
+  }
+
+  @Test
+  void withoutSuppressionLinesAreStillParsedForATail() throws IOException {
+    PushProperties noSuppression =
+        new PushProperties(
+            dir.resolve("spool"),
+            DataSize.ofMegabytes(1),
+            100,
+            4,
+            null,
+            DataSize.ofGigabytes(1),
+            null,
+            3,
+            0,
+            0,
+            false);
+    PushIngestService service = service(noSuppression, 1L << 20);
+    service.push(request("acme", "{\"msg\":\"same\"}\n{\"msg\":\"same\"}\n"));
+    assertEquals(List.of("same", "same"), tail.bodies());
+  }
+
+  @Test
+  void metricsCountRequestsLinesAndDecisionsPerTenant() throws IOException {
+    PushIngestService service = service(push(1 << 20, 100, 4, 1L << 30, 3), 64);
+    service.push(request("acme", "{\"msg\":\"a\"}\n{\"msg\":\"a\"}\n{\"msg\":\"b\"}\n"));
+    rejection(() -> service.push(request("acme", "{\"msg\":\"c\"}\n".repeat(20))));
+
+    assertEquals(1, requests("accepted"));
+    assertEquals(1, requests("rejected_quota"));
+    assertEquals(2, meters.get("argus.push.lines").tags("result", "accepted").counter().count());
+    assertEquals(1, meters.get("argus.push.lines").tags("result", "suppressed").counter().count());
+    assertEquals(
+        1, meters.get("argus.suppression.decisions").tags("decision", "deny").counter().count());
+    assertEquals(
+        1, meters.get("argus.push.request").tag("outcome", "rejected_quota").timer().count());
+  }
+
+  private double requests(String outcome) {
+    return meters
+        .get("argus.push.requests")
+        .tags("tenant", "acme", "outcome", outcome)
+        .counter()
+        .count();
   }
 
   @Test

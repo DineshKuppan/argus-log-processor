@@ -37,10 +37,21 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Paced | Exports run on the replay lane and pause while their stream has 256MB not yet ingested, or the WAL is full, leaving the spool to live pushes |
 | Configured sources only | A request names a source configured for its tenant; URLs and credentials never come from requests (no SSRF), and credentials never appear in logs or status |
 
+## Live tail (v2)
+| Feature | Details |
+|---|---|
+| Server-Sent Events | `GET /api/v2/tail` streams the caller tenant's lines as they are accepted, after suppression: a pushed line once it is durable (not when the spool is ingested, up to a minute later), a file job's lines as they are parsed. Replays and exports stay off the tail |
+| Server-side filters | `level` (minimum severity, any spelling), `source` (source or stream id), `q` (body substring, ignoring case) |
+| Never slows ingest | One bounded ring per tailed tenant (10,000 lines / 4MB); publishing never waits, and costs nothing while nobody tails the tenant. Each client reads the ring on its own thread: a slow or stalled client blocks only itself, loses the oldest lines and gets `{"dropped": N}` |
+| Rate cap | At most 200 matching lines a second per client; the rest are reported as dropped, so a client tailing a 400k lines/s file job sees a sample, not a firehose |
+| Resume | Each event's SSE id is resumable with `Last-Event-ID` while the line is still in the ring; otherwise `event: reset` |
+| Limits | 16 connections per tenant, 256 per node (429 + `Retry-After`), 1-hour connections (clients reconnect), a heartbeat every 15s |
+| Freshness | On 2 CPUs a pushed line reached an open tail in 6.9ms (p50) / 39ms (p99) after the request; 16 clients that never read cost push p99 no more than 16 that read (within 7%, 4 runs); 1,000 connections fit in a 256MB heap |
+
 ## Formats and parsing
 | Feature | Details |
 |---|---|
-| Built-in parsers | Nginx/Apache access log (`nginx_access`), JSON (`json`), Kubernetes CRI (`cri`, including a JSON body), key-value (`kv`), raw text (`raw`) |
+| Built-in parsers | Canonical log lines (`canonical`: `[ts] canonical-log-line k=v …`, Stripe style, numbers and booleans typed), Nginx/Apache access log (`nginx_access`), JSON (`json`), Kubernetes CRI (`cri`, including a JSON body), key-value (`kv`), raw text (`raw`) |
 | Logback layouts | `pattern` compiles a layout such as `%d{ISO8601} [%t] %-5p %c - %m%n` into a parser (`logback`) |
 | Format detection | Each source's format is detected from its first 100 lines, or set with `format` / `pattern` |
 | Per-line fallback | A line the main parser rejects tries the other parsers, then `raw`. Unparsed lines are kept with `argus.unparsed` (`keep-unparsed=false` drops them) |
@@ -93,9 +104,10 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 ## Operations
 | Feature | Details |
 |---|---|
-| Canonical log lines | One wide line per ingest run, push request, export page and export job, v1 scan, suppression check and archived segment, with offsets, counts and timings |
+| Canonical log lines | One wide line per ingest run, push request, export page and export job, tail connection, v1 scan, suppression check and archived segment, with offsets, counts and timings |
+| Metrics | Prometheus at `:9001/actuator/prometheus` (a separate management port: the scrape names tenants): lines, bytes and outcomes per tenant and lane, segment commit time, push requests by outcome and latency, suppression decisions, spool and WAL pending bytes, WAL full, archive lag and upload time, export pages and retries, replay wait, tail connections and dropped lines, Redis fail-opens, plus JVM and HTTP metrics |
 | Memory sizing | Runs in 4GB with `-XX:MaxRAMPercentage=60 -XX:MaxDirectMemorySize=512m` |
 | OpenAPI | Swagger UI at `/swagger-ui.html`, with the API-key scheme declared |
-| Actuator | `/actuator/health` and the other Spring Boot endpoints |
+| Health | `/actuator/health` on the management port, UP without Redis unless a Redis store is configured; `/livez` and `/readyz` probes on the API port too |
 | Test data | `DataSeeder` streams a reproducible Nginx log of any size to disk |
 | Tests | 398 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3, GCS, Elasticsearch and OpenSearch, a Coralogix protocol stub, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions; push throughput and tenant isolation, push during an archive outage, `kill -9` during push; T8 replay isolation) |

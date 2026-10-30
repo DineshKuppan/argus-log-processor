@@ -38,11 +38,24 @@ public final class EnvelopeFactory {
    * trace and service fields are removed.
    */
   public LogEnvelope create(ParserChain.Parsed parsed, long lineOffset, Instant observedAt) {
+    return create(parsed, eventId(lineOffset), lineOffset, observedAt);
+  }
+
+  /**
+   * A line not yet placed in a generation and offset (a pushed line shown on the tail at receive
+   * time): no {@code eventId}, and no hashing to compute one.
+   */
+  public LogEnvelope createUnplaced(ParserChain.Parsed parsed, Instant observedAt) {
+    return create(parsed, null, 0, observedAt);
+  }
+
+  private LogEnvelope create(
+      ParserChain.Parsed parsed, String eventId, long lineOffset, Instant observedAt) {
     LogRecord record = parsed.record();
     Map<String, Object> attributes = record.getMeta();
     String service = serviceName(attributes);
     return new LogEnvelope(
-        eventId(lineOffset),
+        eventId,
         tenantId,
         record.getTimestamp(),
         observedAt,

@@ -9,6 +9,7 @@ import com.github.luben.zstd.ZstdInputStream;
 import dev.dinesh.argus.archive.ArchiveIndex.Entry;
 import dev.dinesh.argus.archive.WalSegments.Segment;
 import dev.dinesh.argus.config.ArchiveProperties;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.sink.EventTimePartition;
 import java.io.BufferedInputStream;
@@ -87,6 +88,7 @@ public class Archiver implements SmartLifecycle {
   private final ArchiveProperties props;
   private final ObjectMapper mapper;
   private final ObjectReader envelopes;
+  private final ArgusMetrics metrics;
 
   private volatile boolean running;
   private ScheduledExecutorService worker;
@@ -96,7 +98,17 @@ public class Archiver implements SmartLifecycle {
 
   public Archiver(
       ObjectStore store, WalSegments wal, ArchiveProperties props, ObjectMapper mapper) {
+    this(store, wal, props, mapper, ArgusMetrics.noop());
+  }
+
+  public Archiver(
+      ObjectStore store,
+      WalSegments wal,
+      ArchiveProperties props,
+      ObjectMapper mapper,
+      ArgusMetrics metrics) {
     this.store = store;
+    this.metrics = metrics;
     this.wal = wal;
     this.index = new ArchiveIndex(wal.root(), mapper);
     this.props = props;
@@ -302,6 +314,27 @@ public class Archiver implements SmartLifecycle {
           TimeUnit.NANOSECONDS.toMillis(convertNanos),
           convertNanos > 0 ? TimeUnit.NANOSECONDS.toMillis(totalNanos - convertNanos) : 0,
           error == null ? null : error.getClass().getSimpleName() + ": " + error.getMessage());
+      metrics.archiveSegment(
+          String.valueOf(outcome),
+          parquetBytes,
+          convertNanos > 0 && outcome == Outcome.ARCHIVED ? totalNanos - convertNanos : 0);
+    }
+  }
+
+  /**
+   * Age of the oldest segment still waiting to be archived, in seconds; 0 when none waits. One WAL
+   * listing per call, the same walk an archive pass makes every {@code scan-interval}.
+   */
+  public double oldestPendingSeconds() {
+    try {
+      List<Segment> pending = wal.pending(); // oldest first
+      if (pending.isEmpty()) {
+        return 0;
+      }
+      long oldest = pending.get(0).modified().toMillis();
+      return Math.max(0, System.currentTimeMillis() - oldest) / 1e3;
+    } catch (IOException | RuntimeException e) {
+      return 0;
     }
   }
 

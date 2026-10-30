@@ -26,6 +26,7 @@ import dev.dinesh.argus.ingest.IngestPipeline;
 import dev.dinesh.argus.ingest.ReplayLane;
 import dev.dinesh.argus.ingest.SourceLeases;
 import dev.dinesh.argus.ingest.StreamRegistry;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.parser.ParserRegistry;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -101,7 +102,8 @@ class ExportJobServiceTest {
             new ParserRegistry(),
             MAPPER,
             push,
-            Duration.ofMillis(10));
+            Duration.ofMillis(10),
+            ArgusMetrics.noop());
   }
 
   @AfterEach

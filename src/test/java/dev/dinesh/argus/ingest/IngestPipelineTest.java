@@ -16,12 +16,14 @@ import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.LocalSinkProperties;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.ingest.IngestPipeline.Request;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.pipeline.EnvelopeFactory;
 import dev.dinesh.argus.sink.LocalVolumeSink;
 import dev.dinesh.argus.sink.LogSink;
 import dev.dinesh.argus.sink.WalCapacity;
 import dev.dinesh.argus.source.LogBatch;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -115,6 +117,90 @@ class IngestPipelineTest {
 
   private IngestPipeline pipeline(LogSink sink, FileCheckpointStore checkpoints) {
     return new IngestPipeline(PROPS, new ParserRegistry(), sink, checkpoints);
+  }
+
+  /** Live file jobs are tailed with the ids the archive holds; stream runs and replays are not. */
+  @Test
+  void onlyLiveFileJobsPublishToTheTail() throws Exception {
+    Path file = writeLog(25);
+    RecordingTail tail = new RecordingTail();
+    IngestPipeline pipeline =
+        new IngestPipeline(
+            PROPS,
+            new ParserRegistry(),
+            localSink(dir.resolve("out")),
+            checkpoints(dir.resolve("cp")),
+            WalCapacity.UNBOUNDED,
+            ArgusMetrics.noop(),
+            tail);
+
+    pipeline.run(
+        new Request("acme", file, "app", false, null), new IngestProgress(), new AtomicBoolean());
+
+    assertEquals(25, tail.published.size());
+    List<JsonNode> written = records(dir.resolve("out"));
+    assertEquals(written.get(3).get("eventId").asText(), tail.published.get(3).eventId());
+    assertEquals(
+        written.get(3).get("source").get("offset").asLong(), tail.published.get(3).offset());
+    assertEquals("nginx_access", tail.published.get(0).format());
+
+    pipeline.run(
+        new Request("acme", file, "app", true, null).onReplayLane(new ByteRateLimiter(1L << 30)),
+        new IngestProgress(),
+        new AtomicBoolean());
+    pipeline.run(
+        new Request("acme", file, "spool", true, null, Files.size(file), true),
+        new IngestProgress(),
+        new AtomicBoolean());
+    assertEquals(25, tail.published.size(), "replays and stream runs are not tailed");
+
+    tail.watched = false;
+    pipeline.run(
+        new Request("acme", file, "other", true, null), new IngestProgress(), new AtomicBoolean());
+    assertEquals(25, tail.published.size());
+  }
+
+  /** The meters count what the run's canonical line reports. */
+  @Test
+  void metricsMatchTheRunsCounts() throws Exception {
+    Path file = writeLog(95);
+    Files.writeString(file, "no format knows this line\n", StandardOpenOption.APPEND);
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    IngestPipeline pipeline =
+        new IngestPipeline(
+            PROPS,
+            new ParserRegistry(),
+            localSink(dir.resolve("out")),
+            checkpoints(dir.resolve("cp")),
+            WalCapacity.UNBOUNDED,
+            new ArgusMetrics(registry));
+    IngestProgress progress = new IngestProgress();
+
+    pipeline.run(new Request("acme", file, "app", false, null), progress, new AtomicBoolean());
+
+    assertEquals(95, lines(registry, "primary"));
+    assertEquals(progress.unparsed(), lines(registry, "unparsed"));
+    assertEquals(1, progress.unparsed());
+    assertEquals(
+        Files.size(file),
+        registry
+            .get("argus.ingest.bytes")
+            .tags("tenant", "acme", "lane", "live")
+            .counter()
+            .count());
+    assertEquals(
+        progress.segmentsCommitted(),
+        registry.get("argus.ingest.segments").tag("tenant", "acme").counter().count());
+    assertEquals(
+        progress.segmentsCommitted(), registry.get("argus.ingest.segment.commit").timer().count());
+  }
+
+  private static double lines(SimpleMeterRegistry registry, String outcome) {
+    return registry
+        .get("argus.ingest.lines")
+        .tags("tenant", "acme", "lane", "live", "outcome", outcome)
+        .counter()
+        .count();
   }
 
   private static Map<String, String> outputFiles(Path out) throws IOException {
