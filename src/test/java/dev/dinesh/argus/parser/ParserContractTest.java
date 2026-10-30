@@ -47,6 +47,9 @@ class ParserContractTest {
         Arguments.of(new CriLogParser(), "2025-08-21T12:00:00.000000000Z stdout F started"),
         Arguments.of(new KeyValueLogParser(), "level=INFO msg=\"CPU ok\" cpu=43"),
         Arguments.of(
+            new CanonicalLineParser(),
+            "[2019-03-18 22:48:32.999] canonical-log-line http_method=POST http_status=200"),
+        Arguments.of(
             new LogbackPatternParser("%d{ISO8601} [%t] %-5p %c - %m%n"),
             "2025-10-26 18:12:00,123 [main] INFO  dev.Argus - Started"),
         Arguments.of(new RawTextParser(), "anything at all"));

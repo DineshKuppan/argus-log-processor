@@ -16,6 +16,8 @@ public class ParserRegistry {
 
   private final List<LogParser> builtIns =
       List.of(
+          // First: its marker is unambiguous, so it never takes another format's lines.
+          new CanonicalLineParser(),
           new ServerAccessLogParser(),
           new JsonLogParser(),
           new CriLogParser(),

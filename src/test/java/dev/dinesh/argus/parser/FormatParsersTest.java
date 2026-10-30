@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.dinesh.argus.model.LogRecord;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
@@ -23,6 +24,72 @@ class FormatParsersTest {
     assertEquals("ERROR", parser.parse(line).getLevel());
     assertFalse(parser.parse(line).getMeta().containsKey("category"));
     assertEquals("apple", parser.parse(line + " apple").getMeta().get("category"));
+  }
+
+  @Test
+  void canonicalLinesKeepEveryFieldTyped() {
+    CanonicalLineParser parser = new CanonicalLineParser();
+    LogRecord r =
+        parser.parse(
+            "[2019-03-18 22:48:32.999] canonical-log-line http_method=POST http_path=/v1/charges"
+                + " http_status=200 duration=0.050 cached=false user=\"Jo Smith\" level=info");
+
+    assertEquals(Instant.parse("2019-03-18T22:48:32.999Z"), r.getTimestamp());
+    assertEquals("info", r.getLevel());
+    assertNull(r.getMessage(), "suppression then compares whole lines");
+    assertEquals(
+        Map.of(
+            "http_method",
+            "POST",
+            "http_path",
+            "/v1/charges",
+            "http_status",
+            200L,
+            "duration",
+            0.05,
+            "cached",
+            false,
+            "user",
+            "Jo Smith"),
+        r.getMeta());
+  }
+
+  @Test
+  void canonicalLinesTakeEitherMarkerSpellingAndAnIsoPrefixOrNone() {
+    CanonicalLineParser parser = new CanonicalLineParser();
+
+    LogRecord iso = parser.parse("2025-10-09T01:11:40Z canonical_log_line status=503");
+    assertEquals(Instant.parse("2025-10-09T01:11:40Z"), iso.getTimestamp());
+    assertEquals(503L, iso.getMeta().get("status"));
+
+    LogRecord bare = parser.parse("canonical-log-line ts=1760000000 id=00123 version=1.2.3");
+    assertEquals(Instant.ofEpochSecond(1760000000L), bare.getTimestamp());
+    assertEquals(123L, bare.getMeta().get("id"));
+    assertEquals("1.2.3", bare.getMeta().get("version"));
+
+    LogRecord badTime = parser.parse("[yesterday] canonical-log-line ts=soon a=1");
+    assertNull(badTime.getTimestamp());
+    assertEquals("soon", badTime.getMeta().get("timestamp"));
+
+    assertFalse(parser.canParse("canonical-log-lines a=1"));
+    assertFalse(parser.canParse("level=info msg=\"canonical-log-line\""));
+    assertNull(parser.parse("{\"type\":\"canonical-log-line\"}"));
+  }
+
+  @Test
+  void canonicalLinesAreDetectedAndOtherFormatsAreNot() {
+    ParserRegistry registry = new ParserRegistry();
+    assertEquals(
+        "canonical",
+        registry
+            .detect(
+                List.of(
+                    "[2019-03-18 22:48:32.999] canonical-log-line http_status=200",
+                    "[2019-03-18 22:48:33.104] canonical-log-line http_status=500"))
+            .parser()
+            .name());
+    assertEquals(
+        "kv", registry.detect(List.of("level=INFO msg=ok", "level=WARN msg=slow")).parser().name());
   }
 
   @Test
