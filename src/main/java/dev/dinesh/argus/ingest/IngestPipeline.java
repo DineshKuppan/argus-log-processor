@@ -481,7 +481,7 @@ public class IngestPipeline {
           LogEnvelope envelope = envelopes.create(result, batch.lineOffsets()[i], observedAt);
           records.add(envelope);
           if (tailEvents != null) {
-            tailEvents.add(TailEvent.ofFile(envelope, line.length()));
+            tailEvents.add(TailEvent.ofFile(envelope));
           }
         }
         if (tailEvents != null) {

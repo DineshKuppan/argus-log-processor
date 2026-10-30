@@ -321,18 +321,18 @@ public class Archiver implements SmartLifecycle {
     }
   }
 
-  /** Age of the oldest segment still waiting to be archived, in seconds; 0 when none waits. */
+  /**
+   * Age of the oldest segment still waiting to be archived, in seconds; 0 when none waits. One WAL
+   * listing per call, the same walk an archive pass makes every {@code scan-interval}.
+   */
   public double oldestPendingSeconds() {
     try {
-      long oldest = Long.MAX_VALUE;
-      for (Segment segment : wal.pending()) {
-        try {
-          oldest = Math.min(oldest, Files.getLastModifiedTime(segment.file()).toMillis());
-        } catch (IOException e) {
-          // archived (deleted) since the listing
-        }
+      List<Segment> pending = wal.pending(); // oldest first
+      if (pending.isEmpty()) {
+        return 0;
       }
-      return oldest == Long.MAX_VALUE ? 0 : Math.max(0, System.currentTimeMillis() - oldest) / 1e3;
+      long oldest = pending.get(0).modified().toMillis();
+      return Math.max(0, System.currentTimeMillis() - oldest) / 1e3;
     } catch (IOException | RuntimeException e) {
       return 0;
     }

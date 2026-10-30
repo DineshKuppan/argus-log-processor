@@ -39,4 +39,18 @@ class ArgusMetricsTest {
     assertEquals(1, registry.find("argus.ingest.lines").counters().size());
     assertEquals(100, registry.get("argus.ingest.bytes").counter().count());
   }
+
+  @Test
+  void archiveBytesCountOnlyArchivedSegments() {
+    SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    ArgusMetrics metrics = new ArgusMetrics(registry);
+
+    metrics.archiveSegment("FAILED", 50, 0);
+    metrics.archiveSegment("FAILED", 50, 0);
+    metrics.archiveSegment("ARCHIVED", 50, 1_000);
+
+    assertEquals(50, registry.get("argus.archive.bytes").counter().count());
+    assertEquals(
+        2, registry.get("argus.archive.segments").tag("outcome", "failed").counter().count());
+  }
 }

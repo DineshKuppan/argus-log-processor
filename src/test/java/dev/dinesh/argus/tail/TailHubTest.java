@@ -46,6 +46,11 @@ class TailHubTest {
   }
 
   private TailHub hub(int perTenant, int perNode, int linesPerSecond, Duration heartbeat) {
+    return hub(perTenant, perNode, linesPerSecond, heartbeat, 0);
+  }
+
+  private TailHub hub(
+      int perTenant, int perNode, int linesPerSecond, Duration heartbeat, int maxTenants) {
     hub =
         new TailHub(
             new TailProperties(
@@ -56,7 +61,8 @@ class TailHubTest {
                 heartbeat,
                 1000,
                 DataSize.ofMegabytes(1),
-                Duration.ofMillis(50)),
+                Duration.ofMillis(50),
+                maxTenants),
             MAPPER,
             new ArgusMetrics(meters));
     hub.start();
@@ -184,6 +190,25 @@ class TailHubTest {
   }
 
   /** A client that never reads blocks its own thread only; it then learns what it missed. */
+  @Test
+  void onlyMaxTenantsHoldARingAndRingsNobodyReadsMakeRoom() throws Exception {
+    TailHub hub = hub(4, 8, 100, Duration.ofSeconds(15), 2);
+    hub.open("acme", TailFilter.ALL, null, new Recorder());
+    TailConnection globex = hub.open("globex", TailFilter.ALL, null, new Recorder());
+    assertThrows(
+        TailLimitException.class, () -> hub.open("initech", TailFilter.ALL, null, new Recorder()));
+    assertEquals(2, hub.connections(), "a refused tenant holds no slot");
+
+    globex.close("test");
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+    while (hub.connections() > 1 && System.nanoTime() < deadline) {
+      Thread.sleep(10);
+    }
+    hub.open("initech", TailFilter.ALL, null, new Recorder());
+    assertTrue(hub.isWatched("initech"));
+    assertFalse(hub.isWatched("globex"), "its idle ring was released early to make room");
+  }
+
   @Test
   void aStalledClientNeverBlocksPublishingAndIsToldWhatItMissed() throws Exception {
     TailHub hub = hub();

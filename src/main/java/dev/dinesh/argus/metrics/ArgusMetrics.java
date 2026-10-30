@@ -73,12 +73,16 @@ public class ArgusMetrics {
         .increment();
   }
 
-  /** One WAL segment's archive attempt. */
+  /**
+   * One WAL segment's archive attempt. Bytes count only for an archived segment, so retries during
+   * an outage don't look like throughput.
+   */
   public void archiveSegment(String outcome, long parquetBytes, long uploadNanos) {
-    registry
-        .counter("argus.archive.segments", "outcome", outcome.toLowerCase(Locale.ROOT))
-        .increment();
-    count("argus.archive.bytes", Tags.empty(), parquetBytes);
+    String tag = outcome.toLowerCase(Locale.ROOT);
+    registry.counter("argus.archive.segments", "outcome", tag).increment();
+    if (tag.equals("archived")) {
+      count("argus.archive.bytes", Tags.empty(), parquetBytes);
+    }
     if (uploadNanos > 0) {
       registry.timer("argus.archive.upload").record(uploadNanos, TimeUnit.NANOSECONDS);
     }

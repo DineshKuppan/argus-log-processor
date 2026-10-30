@@ -17,6 +17,8 @@ import org.springframework.util.unit.DataSize;
  * @param ringBytes estimated bytes kept per tailed tenant
  * @param ringIdle a tenant's ring is kept this long after its last connection closes, so a
  *     reconnect can resume
+ * @param maxTenants tenants with a ring at once (rings × {@code ring-bytes} is the tail's memory);
+ *     a new tenant's tail gets 429 when every ring is in use
  */
 @ConfigurationProperties("argus.tail")
 public record TailProperties(
@@ -27,7 +29,8 @@ public record TailProperties(
     Duration heartbeat,
     int ringLines,
     DataSize ringBytes,
-    Duration ringIdle) {
+    Duration ringIdle,
+    int maxTenants) {
 
   public TailProperties {
     maxConnections = maxConnections > 0 ? maxConnections : 256;
@@ -38,6 +41,7 @@ public record TailProperties(
     ringLines = ringLines > 0 ? ringLines : 10_000;
     ringBytes = ringBytes != null ? ringBytes : DataSize.ofMegabytes(4);
     ringIdle = ringIdle != null ? ringIdle : Duration.ofMinutes(1);
+    maxTenants = maxTenants > 0 ? maxTenants : 32;
     if (maxDuration.isNegative() || maxDuration.isZero()) {
       throw new IllegalArgumentException("argus.tail.max-duration must be positive");
     }
@@ -50,6 +54,6 @@ public record TailProperties(
   }
 
   public static TailProperties defaults() {
-    return new TailProperties(0, 0, 0, null, null, 0, null, null);
+    return new TailProperties(0, 0, 0, null, null, 0, null, null, 0);
   }
 }

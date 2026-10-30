@@ -4,7 +4,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import dev.dinesh.argus.model.LogEnvelope;
+import dev.dinesh.argus.model.LogRecord;
+import dev.dinesh.argus.parser.ParserChain;
+import dev.dinesh.argus.parser.ParserChain.Outcome;
+import dev.dinesh.argus.pipeline.EnvelopeFactory;
+import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
@@ -20,6 +28,24 @@ class TailRingTest {
 
   static List<TailEvent> events(int count) {
     return IntStream.range(0, count).mapToObj(i -> event("line " + i, 9, 10)).toList();
+  }
+
+  @Test
+  void anEventWeighsItsAttributesNotJustItsBody() {
+    Map<String, Object> fields = new HashMap<>();
+    for (int i = 0; i < 20; i++) {
+      fields.put("field_" + i, "value number " + i);
+    }
+    fields.put("nested", Map.of("items", List.of("a".repeat(1000))));
+    LogRecord record = new LogRecord(null, "info", "short", fields);
+    LogEnvelope envelope =
+        new EnvelopeFactory("acme", "app", 0)
+            .createUnplaced(new ParserChain.Parsed(record, "json", Outcome.PRIMARY), Instant.EPOCH);
+
+    int weight = TailEvent.ofPush(envelope).weight();
+
+    // 21 entries of ~96 bytes plus their text, and the nested 1,000 characters at 2 bytes each.
+    assertTrue(weight > 20 * TailEvent.ENTRY_BYTES + 2_000, "weight " + weight);
   }
 
   @Test

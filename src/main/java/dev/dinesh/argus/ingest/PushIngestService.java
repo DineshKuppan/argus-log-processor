@@ -313,7 +313,6 @@ public class PushIngestService {
     boolean tailed = tail != null && tail.isWatched(stream.tenantId());
     ParserChain chain = props.suppress() || tailed ? messageChain(stream, body) : null;
     List<ParserChain.Parsed> tailLines = tailed ? new ArrayList<>() : null;
-    List<Integer> tailLengths = tailed ? new ArrayList<>() : null;
     List<String> allowedKeys = new ArrayList<>();
     byte[] out = body;
     int written = 0;
@@ -344,7 +343,6 @@ public class PushIngestService {
       }
       if (tailLines != null && parsed != null) {
         tailLines.add(parsed);
-        tailLengths.add(line.length());
       }
       if (length < end - start) {
         truncated++;
@@ -375,7 +373,7 @@ public class PushIngestService {
     stream.suppressedLines.addAndGet(suppressed);
     stream.truncatedLines.addAndGet(truncated);
     if (tailLines != null && !tailLines.isEmpty()) {
-      publish(stream, tailLines, tailLengths, receivedAt);
+      publish(stream, tailLines, receivedAt);
     }
     return new PushResult(
         stream.streamId(),
@@ -414,17 +412,12 @@ public class PushIngestService {
   }
 
   /** Durable in the spool now: shown on the tail at once, not when the stream runner ingests it. */
-  private void publish(
-      PushStream stream,
-      List<ParserChain.Parsed> lines,
-      List<Integer> lengths,
-      Instant receivedAt) {
-    // Generation and offset are assigned when the spool is ingested, so these envelopes' ids are
-    // never shown (TailEvent.ofPush).
+  private void publish(PushStream stream, List<ParserChain.Parsed> lines, Instant receivedAt) {
+    // Generation and offset are assigned when the spool is ingested, so pushed events have no id.
     EnvelopeFactory envelopes = new EnvelopeFactory(stream.tenantId(), stream.streamId(), 0);
     List<TailEvent> events = new ArrayList<>(lines.size());
-    for (int i = 0; i < lines.size(); i++) {
-      events.add(TailEvent.ofPush(envelopes.create(lines.get(i), 0, receivedAt), lengths.get(i)));
+    for (ParserChain.Parsed line : lines) {
+      events.add(TailEvent.ofPush(envelopes.createUnplaced(line, receivedAt)));
     }
     tail.publish(stream.tenantId(), events);
   }

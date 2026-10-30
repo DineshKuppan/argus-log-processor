@@ -204,7 +204,7 @@ curl -N localhost:9000/api/v2/tail?level=warn -H "X-Argus-Api-Key: $KEY"
 # id: 3f2a91c0-41
 # data: {"source":"web","format":"json","severityText":"error","severityNumber":17,"body":"disk full",…}
 # event: dropped
-# data: {"dropped":1250}        ← this client missed lines (too slow, or over 200 lines/s)
+# data: {"dropped":1250}        ← this client missed up to this many lines (too slow, or over 200 lines/s)
 ```
 - **Filters:** `level` (minimum severity), `source` (a source or stream id), `q` (body substring, ignoring case).
 - **Resume:** reconnecting with `Last-Event-ID` continues after the last line seen while it is still in the tenant's ring (10,000 lines); otherwise `event: reset`.
@@ -253,7 +253,7 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 | POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`, `lane` (`live` / `replay`; `replay` by default with `fromBeginning`). 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (the lane's job slots busy, or the WAL full while the archive catches up) |
 | POST | `/api/v2/ingest/exports` | Export `[from, to)` from a configured source into a stream: `source`, `streamId`, `query`, `from`, `to`, `fromBeginning`. 202, or 400 / 404 (no such source for the tenant) / 409 (an export already running on the stream) / 429 + `Retry-After` (replay slots busy, WAL full) |
 | GET, DELETE | `/api/v2/ingest/exports/{id}` | Export progress (pages, lines, `paused`, cursor position) / cancel before the next page |
-| GET | `/api/v2/tail` | Live tail (Server-Sent Events) of the tenant's lines: `level`, `source`, `q`, `Last-Event-ID`. `event: dropped` / `reset`; 400 bad filter, 429 + `Retry-After` at a connection limit |
+| GET | `/api/v2/tail` | Live tail (Server-Sent Events) of the tenant's lines: `level`, `source`, `q`, `Last-Event-ID`. `event: dropped` / `reset`; 400 bad filter, 429 + `Retry-After` at a connection or tailed-tenant limit |
 | POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, same key in progress, quota, WAL or spool full), 413, 409 (too many streams, or the id is a file job's source id), 415 |
 | GET | `/api/v2/ingest/streams/{id}`, `/api/v2/ingest/streams` | A stream's (or every stream's) spool, counters and last run. Another tenant's stream is 404 |
 | GET | `/api/v2/ingest/jobs/{id}` | Job progress: bytes, lines, format, segments, outputs, `paused` / `pausedMs`. Another tenant's job is 404 |

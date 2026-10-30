@@ -64,16 +64,50 @@ class FormatParsersTest {
 
     LogRecord bare = parser.parse("canonical-log-line ts=1760000000 id=00123 version=1.2.3");
     assertEquals(Instant.ofEpochSecond(1760000000L), bare.getTimestamp());
-    assertEquals(123L, bare.getMeta().get("id"));
+    assertEquals("00123", bare.getMeta().get("id"), "a leading zero is part of an id");
     assertEquals("1.2.3", bare.getMeta().get("version"));
 
     LogRecord badTime = parser.parse("[yesterday] canonical-log-line ts=soon a=1");
     assertNull(badTime.getTimestamp());
     assertEquals("soon", badTime.getMeta().get("timestamp"));
+    assertEquals("yesterday", badTime.getMeta().get("prefix"));
 
     assertFalse(parser.canParse("canonical-log-lines a=1"));
     assertFalse(parser.canParse("level=info msg=\"canonical-log-line\""));
     assertNull(parser.parse("{\"type\":\"canonical-log-line\"}"));
+  }
+
+  @Test
+  void canonicalValuesAreTypedOnlyWhenTheNumberKeepsTheirValue() {
+    Map<String, Object> meta =
+        new CanonicalLineParser()
+            .parse(
+                "canonical-log-line zip=02134 n=-0 big=123456789012345678 huge=1234567890123456789"
+                    + " amount=12345678901234567.89 price=19.99 small=0.000123")
+            .getMeta();
+
+    assertEquals("02134", meta.get("zip"));
+    assertEquals("-0", meta.get("n"));
+    assertEquals(123456789012345678L, meta.get("big"));
+    assertEquals("1234567890123456789", meta.get("huge"), "beyond a long");
+    assertEquals("12345678901234567.89", meta.get("amount"), "beyond a double's digits");
+    assertEquals(19.99, meta.get("price"));
+    assertEquals(0.000123, meta.get("small"));
+  }
+
+  @Test
+  void keyValuePairsAreFoundInLinearTime() {
+    // Before the possessive, lookbehind-anchored key, a run of key characters with no '=' was
+    // retried from every position in it: 40,000 characters took 4.6s, 1MB would take ~45 minutes.
+    String run = "a".repeat(1_000_000);
+    long start = System.nanoTime();
+    LogRecord canonical = new CanonicalLineParser().parse("canonical-log-line " + run + " x=1");
+    LogRecord kv = new KeyValueLogParser().parse("k=v " + run + " x=1");
+    long millis = (System.nanoTime() - start) / 1_000_000;
+
+    assertEquals(1L, canonical.getMeta().get("x"));
+    assertEquals("1", kv.getMeta().get("x"));
+    assertTrue(millis < 2_000, "took " + millis + "ms");
   }
 
   @Test

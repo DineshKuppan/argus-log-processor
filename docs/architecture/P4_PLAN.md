@@ -40,10 +40,10 @@ Argus can ingest, suppress, archive and replay, but nobody can watch it happen: 
 - **Situation:** the design (§9) names a bounded queue per connection that drops the oldest lines. With N connections on one tenant, that is N copies of every line, made on the ingest thread.
 - **Task:** publishing must cost the ingest thread the same whether 0 or 100 clients are tailing, must never wait, and memory must not grow with the number of connections.
 - **Action:** `TailHub` keeps one **ring** per tenant that has a tail open. Publishing appends the batch's references to the ring under its lock and signals; an append past capacity drops the oldest entries. Each connection keeps its own sequence number (cursor) into the ring and reads at its own pace. A cursor that the ring has overtaken (the client was too slow) jumps to the oldest entry still in the ring, and the client receives `event: dropped` `{"dropped": N}`. That is "drop oldest, per connection", with one copy per tenant.
-  - **Bounds:** `ring-lines` (10,000) and `ring-bytes` (4MB, estimated from line lengths: a 1MB line can't pin 10GB). A ring is created by the tenant's first connection and released one minute after its last one closes (so a reconnect can resume).
+  - **Bounds:** `ring-lines` (10,000) and `ring-bytes` (4MB, estimated from each event's body and attributes, two bytes a character plus ~96 bytes per map entry: a 1MB line can't pin 10GB, and a 500-character JSON line with 20 fields counts as the ~3KB it holds, not 500). A ring is created by the tenant's first connection and released one minute after its last one closes (so a reconnect can resume).
   - **Cost when nobody tails:** one map lookup per batch (push: per request). Nothing is built or copied.
   - **Filters run on the connection's thread**, not the ingest thread: `level` (minimum severity, any spelling `Severity` knows), `source` (exact source or stream id), `q` (case-insensitive substring of the body, ≤256 characters). `FilterSpec` works on v1 `LogRecord`s, and converting each envelope to reuse it would cost more than it saves.
-  - **Rate cap:** each connection sends at most `max-lines-per-second` (200) matching lines; the rest are counted as dropped. A tail of a 400k lines/s file job then costs ~200 serializations a second per client, not 400k.
+  - **Rate cap:** each connection sends at most `max-lines-per-second` (200) matching lines and examines at most 50x that; past either, it waits out the second and skips to the newest line. `dropped` counts matching lines over the cap plus every line it never examined (skipped, or overtaken by the ring), whether or not those would have matched the filter: knowing would mean examining them. For a filtered tail, `dropped` is therefore an upper bound on the lines missed. A tail of a 400k lines/s file job then costs ~200 serializations a second per client, not 400k.
   - **Resume:** each event's SSE `id` is `<ring id>-<sequence>`. A reconnect with `Last-Event-ID` from the same ring resumes after that line (or reports what was dropped); from another ring (a restart, or a ring released after idle) it starts at the newest line with `event: reset`.
 - **Result:** the ingest thread's cost is one lock and an array copy per batch, independent of clients. Memory is bounded by `ring-bytes` per tailed tenant (D7 gives the worst case).
 
@@ -69,6 +69,7 @@ Argus can ingest, suppress, archive and replay, but nobody can watch it happen: 
 | Lines per connection | `max-lines-per-second` (200) | Skipped, reported as dropped |
 | Connection age | `max-duration` (1h) | Closed; the client reconnects with `Last-Event-ID` |
 | Ring per tenant | `ring-lines` (10,000), `ring-bytes` (4MB) | Oldest lines dropped |
+| Tenants with a ring | `max-tenants` (32) | Rings nobody reads are released early; if all are read, 429 for a new tenant |
 
 Each connection emits one canonical line when it closes (guardrail 9): `Tail connection finished tenant=… filter=… sent=… dropped=… reason=… durationMs=…`. Tenancy as everywhere else: the tenant comes from the API key (`TenantInterceptor`), never a parameter. Browsers' `EventSource` can't send headers, so browser clients need a fetch-based SSE client; API keys in URLs would end up in access logs.
 
@@ -86,14 +87,14 @@ Each connection emits one canonical line when it closes (guardrail 9): `Tail con
 - **Situation:** Stripe-style canonical lines (`canonical-log-line http_method=GET http_path=/v1/charges status=200 duration=0.050 …`, often after a `[timestamp]` prefix) don't start with `key=`, so `kv` rejects them and they are stored as `raw`. Argus's own canonical lines exist per operation (push request, ingest run, archive segment, export page and job, v1 scan) and P4 adds one per tail connection.
 - **Task:** store producers' canonical lines as wide records, queryable by field; decide whether Argus also needs a generic per-request line (design §10's `CanonicalLogFilter`).
 - **Action:**
-  - A `canonical` parser: an optional timestamp prefix (`[…]` or ISO 8601), the `canonical-log-line` marker, then logfmt pairs. Numbers and booleans are typed (`status=200` is a number, `duration=0.050` a decimal), so NDJSON output and the tail show them as numbers. `timestamp`/`level`/`message` keys are lifted like `kv`. A JSON line with `"type": "canonical-log-line"` already parses as `json` with every field kept. Registered first in `ParserRegistry.builtIns`: its marker is unambiguous, so it can't steal other formats' lines.
+  - A `canonical` parser: an optional timestamp prefix (`[…]` or ISO 8601), the `canonical-log-line` marker, then logfmt pairs. Numbers and booleans are typed (`status=200` is a number, `duration=0.050` a decimal) when the number keeps the value: a leading zero (`id=00123`, `zip=02134`), more digits than a long, or more than 15 significant digits in a decimal stay text. A `[bracket]` that isn't a time (a thread or request id) is kept as the `prefix` attribute. So NDJSON output and the tail show them as numbers. `timestamp`/`level`/`message` keys are lifted like `kv`. A JSON line with `"type": "canonical-log-line"` already parses as `json` with every field kept. Registered first in `ParserRegistry.builtIns`: its marker is unambiguous, so it can't steal other formats' lines.
   - **No generic per-request line.** `http.server.requests` (D5) gives every endpoint's rate, status and latency, and the push, ingest and export lines already say what happened inside. A line per `/suppression/check` call (possibly thousands a second) would be a log flood for no new fact.
 - **Result:** canonical lines from ingested applications are stored with their fields as attributes (in Parquet, `attributes['http_path']` for a `GROUP BY`), with `source.format = canonical` marking them.
 
 ### D7. Memory budget
 | Item | Bound |
 |---|---|
-| Tail rings | `ring-bytes` (4MB) × tenants with a tail open (or closed in the last minute). Configured tenants are few; 25 tailed tenants = 100MB |
+| Tail rings | `ring-bytes` (4MB, estimated heap) × `max-tenants` (32): at most 128MB |
 | Tail connections | 256 threads × a 256KB requested stack, mostly uncommitted; one batch of serialized events each (≤200 lines) |
 | Metrics | A few hundred meters (tenants × tags), well under 10MB |
 
@@ -124,6 +125,7 @@ argus.tail.heartbeat=15s
 argus.tail.ring-lines=10000
 argus.tail.ring-bytes=4MB
 argus.tail.ring-idle=1m                   # a ring outlives its last connection this long, for resumes
+argus.tail.max-tenants=32                 # tenants with a ring at once: the tail's memory bound
 
 argus.metrics.max-tenants=100
 management.server.port=9001

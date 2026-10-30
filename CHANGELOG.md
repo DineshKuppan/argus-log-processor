@@ -12,11 +12,11 @@ Plan and results: [`P4_PLAN.md`](docs/architecture/P4_PLAN.md).
 #### Added
 - **Live tail:** `GET /api/v2/tail` (Server-Sent Events) streams the caller tenant's lines as they are accepted, after suppression: pushed lines once durable in the spool, live file jobs' lines as they are parsed (stream runs and the replay lane don't publish).
   - Filters `level`, `source`, `q`; `Last-Event-ID` resume, `event: reset` when it can't; `event: dropped` `{"dropped":N}` for lines a client missed; a heartbeat every 15s.
-  - `TailHub` keeps one ring per tailed tenant (10,000 lines / 4MB, released a minute after its last connection). Publishing never waits; each connection reads the ring with its own cursor on its own thread, at most 200 lines a second (`argus.tail.*`).
-  - Limits: 16 connections per tenant, 256 per node (429 + `Retry-After: 30`), one hour per connection. One `Tail connection finished …` canonical line per connection.
+  - `TailHub` keeps one ring per tailed tenant (10,000 lines / 4MB of estimated heap, counting each event's attributes; released a minute after its last connection, or earlier when all 32 rings (`max-tenants`) are taken). Publishing never waits; each connection reads the ring with its own cursor on its own thread, at most 200 lines a second (`argus.tail.*`).
+  - Limits: 16 connections per tenant, 256 per node, 32 tailed tenants (429 + `Retry-After: 30`), one hour per connection. One `Tail connection finished …` canonical line per connection.
 - **Metrics:** Micrometer with the Prometheus registry at `:9001/actuator/prometheus` (`management.server.port`). Counters are recorded where the canonical lines are emitted (`argus_ingest_*`, `argus_push_*`, `argus_suppression_decisions_total`, `argus_archive_*`, `argus_export_*`, `argus_replay_wait_seconds`, `argus_tail_*`); gauges for spool and WAL pending bytes, WAL full, active jobs per lane, archive lag, tail connections and Redis fail-opens. The `tenant` tag is capped at `argus.metrics.max-tenants` (100).
 - `/livez` and `/readyz` on the API port.
-- **`canonical` parser:** `[timestamp] canonical-log-line k=v …` (or `canonical_log_line`), with numbers and booleans typed; first in detection priority.
+- **`canonical` parser:** `[timestamp] canonical-log-line k=v …` (or `canonical_log_line`), with numbers and booleans typed when the number keeps the value (`id=00123` stays text); first in detection priority.
 - `LiveTailIT` (T7, tag `load`); `PushLoad.Server.residentKilobytes()`.
 
 #### Changed
@@ -24,10 +24,12 @@ Plan and results: [`P4_PLAN.md`](docs/architecture/P4_PLAN.md).
 - The 401 for a missing API key, and the tail's 400 / 429, set their content type, so clients sending `Accept: text/event-stream` get them instead of a 500.
 - Push parses lines for the tail even with suppression off, but only while the tenant is tailed.
 - ADR-6: stay on Java 17; platform threads per tail connection, virtual threads once on Java 24+.
+- `KeyValueLogParser`'s pair pattern (now shared with `canonical`) runs in linear time: a run of key characters with no `=` was retried from every position, so a 1MB line took ~45 minutes (40,000 characters: 4.6s).
 
 #### Measured
 - **T7 freshness (2 CPUs, 4GB container):** push-to-tail p50 6.9ms, p99 38.9ms (300 pushes); a file job's first line reached the tail 77ms after the job was submitted.
 - **T7 isolation (2 CPUs):** under ~10k lines/s of pushes, 16 tail clients that never read cost push p99 −1.5% to +6.5% against 16 that read (4 runs), with throughput unchanged; the stalled clients were then told what they missed. Tailing itself (16 reading clients against none) cost −4% to +17% of push p99.
+- **P3a push load tests after P4:** T1 146k lines/s end to end (P3a: 132k), request p99 97ms, peak heap 249MB of 256MB; T3 196 429s, the WAL drained in 15.8s after the outage and all 1M lines were archived; T4 kill -9 after 590 of 800 batches lost and duplicated nothing.
 - **ADR-6:** 1,000 open tail connections at a 256MB heap (peak 189MB); one pushed line reached all of them, fan-out p99 484ms on 2 CPUs (171ms on the host, where the server's resident memory was 511MB).
 
 ### P3b: export sources and the replay lane: [#9](https://github.com/DineshKuppan/argus-log-processor/pull/9) (2026-10-30)

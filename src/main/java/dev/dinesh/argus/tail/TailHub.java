@@ -101,11 +101,20 @@ public class TailHub implements SmartLifecycle {
               + props.maxConnections()
               + " tail connections are in use (argus.tail.max-connections)");
     }
+    if (!tenants.containsKey(tenantId) && tenants.size() >= props.maxTenants()) {
+      // Every ring is in use: rings nobody reads give up their resume grace to make room.
+      releaseRings(0);
+    }
     boolean[] tenantFull = new boolean[1];
+    boolean[] ringsFull = new boolean[1];
     TenantTail tail =
         tenants.compute(
             tenantId,
             (id, t) -> {
+              if (t == null && tenants.size() >= props.maxTenants()) {
+                ringsFull[0] = true;
+                return null;
+              }
               TenantTail current =
                   t != null
                       ? t
@@ -118,6 +127,11 @@ public class TailHub implements SmartLifecycle {
               }
               return current;
             });
+    if (ringsFull[0]) {
+      connections.decrementAndGet();
+      throw new TailLimitException(
+          props.maxTenants() + " tenants are being tailed on this node (argus.tail.max-tenants)");
+    }
     if (tenantFull[0]) {
       connections.decrementAndGet();
       throw new TailLimitException(
@@ -154,10 +168,17 @@ public class TailHub implements SmartLifecycle {
             () -> closed(tenantId, self[0]));
     self[0] = connection;
     open.add(connection);
-    Thread sender =
-        new Thread(null, connection::run, "tail-" + tenantId + "-" + id, SENDER_STACK_BYTES);
-    sender.setDaemon(true);
-    connection.start(sender);
+    try {
+      Thread sender =
+          new Thread(null, connection::run, "tail-" + tenantId + "-" + id, SENDER_STACK_BYTES);
+      sender.setDaemon(true);
+      connection.start(sender);
+    } catch (RuntimeException | Error e) {
+      // No sender thread (e.g. "unable to create native thread"): nothing else would free the
+      // slots.
+      closed(tenantId, connection);
+      throw e;
+    }
     return connection;
   }
 
@@ -191,8 +212,11 @@ public class TailHub implements SmartLifecycle {
 
   /** Releases the rings of tenants nobody has tailed for {@code ring-idle}. */
   void releaseIdleRings() {
+    releaseRings(props.ringIdle().toNanos());
+  }
+
+  private void releaseRings(long idle) {
     long now = System.nanoTime();
-    long idle = props.ringIdle().toNanos();
     for (String tenantId : tenants.keySet()) {
       tenants.computeIfPresent(
           tenantId,
