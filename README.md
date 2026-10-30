@@ -10,13 +10,19 @@ A Spring Boot service that ingests, parses, filters, aggregates and archives log
 |---|---|
 | [FEATURES.md](FEATURES.md) | Everything Argus does today, by area |
 | [CHANGELOG.md](CHANGELOG.md) | What changed, merged PR by merged PR |
-| [ROADMAP.md](ROADMAP.md) | What's next (P3b → P5) and the open items |
+| [ROADMAP.md](ROADMAP.md) | What's next (P5) and the open items |
 | [docs/architecture/SCALING_DESIGN.md](docs/architecture/SCALING_DESIGN.md) | Target architecture, capacity maths, ADRs |
 | [CLAUDE.md](CLAUDE.md) | Code map, guardrails and conventions for contributors |
 
 ## What's new
 
-- **Exports from Elasticsearch, OpenSearch and Coralogix, and a replay lane (P3b).**
+- **Live tail, metrics and canonical lines (P4).**
+  - `GET /api/v2/tail` streams a tenant's lines as Server-Sent Events as they are accepted, after suppression, filtered by `level`, `source` and `q`. A pushed line reaches a tail in 39ms (p99, 2 CPUs).
+  - One bounded ring per tailed tenant: publishing never waits, so a slow client only loses lines (`{"dropped": N}`) and can't slow ingest. On 2 CPUs, 16 tail clients that never read cost push latency no more than 16 that read; 1,000 open connections fit in a 256MB heap.
+  - Prometheus metrics on a separate management port (`:9001/actuator/prometheus`): rates, outcomes and latencies of ingest, push, suppression, archive, exports, replay and tail; spool, WAL and archive-lag gauges.
+  - Health no longer reports DOWN when Redis is unreachable but unused.
+  - `canonical` parser for Stripe-style `canonical-log-line k=v …` lines from the applications Argus ingests.
+- **Exports from Elasticsearch, OpenSearch and Coralogix, and a replay lane (P3b, PR #9).**
   - `POST /api/v2/ingest/exports` copies a time range from a configured source into a stream: Elasticsearch or OpenSearch with a point in time and `search_after`, Coralogix with its DataPrime query API in adaptive time windows. Each page is durable in the spool before its cursor is saved, so an interrupted export resumes where it stopped, without duplicating a page.
   - Re-reads (`fromBeginning`) and exports run on a **replay lane**: their own job slots and a shared read budget (8MB/s), so a backfill never takes live ingest's slots or bandwidth. Suppression and the push quota don't apply to replays.
   - Sources, URLs and credentials are configured per tenant; a request only names a source.
@@ -191,7 +197,30 @@ curl -X POST localhost:9000/api/v2/ingest/exports -H "X-Argus-Api-Key: $KEY" -H 
 - **Pace:** exports and `fromBeginning` file jobs share `argus.replay.bytes-per-second` (8MB/s) and `argus.replay.max-concurrent-jobs` (1). An export pauses while its stream has 256MB not yet ingested.
 - **Delivery:** every page once, with one exception: if an Elasticsearch point in time expires mid-export (`keep-alive`, 10m without a page), hits sharing the last exported timestamp can be exported twice.
 
-### 7. Archive to Parquet (optional)
+### 7. Watch it live
+```bash
+curl -N localhost:9000/api/v2/tail?level=warn -H "X-Argus-Api-Key: $KEY"
+# : connected
+# id: 3f2a91c0-41
+# data: {"source":"web","format":"json","severityText":"error","severityNumber":17,"body":"disk full",…}
+# event: dropped
+# data: {"dropped":1250}        ← this client missed lines (too slow, or over 200 lines/s)
+```
+- **Filters:** `level` (minimum severity), `source` (a source or stream id), `q` (body substring, ignoring case).
+- **Resume:** reconnecting with `Last-Event-ID` continues after the last line seen while it is still in the tenant's ring (10,000 lines); otherwise `event: reset`.
+- **Limits:** 16 connections per tenant, 256 per node (429 + `Retry-After`); connections close after an hour.
+- **Browsers:** `EventSource` can't send the API key header; use a fetch-based SSE client.
+
+### 8. Metrics
+```bash
+curl -s localhost:9001/actuator/prometheus | grep '^argus_'
+# argus_ingest_lines_total{lane="live",outcome="primary",tenant="acme"} 2000000.0
+# argus_push_requests_total{outcome="rejected_quota",tenant="acme"} 12.0
+# argus_wal_pending_bytes 1.2884901888E10
+```
+The management port (9001) names every tenant and its volumes: keep it internal. Kubernetes probes: `/livez` and `/readyz` on port 9000.
+
+### 9. Archive to Parquet (optional)
 ```properties
 # A directory or Kubernetes PersistentVolume…
 argus.archive.store=filesystem
@@ -224,6 +253,7 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 | POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`, `lane` (`live` / `replay`; `replay` by default with `fromBeginning`). 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (the lane's job slots busy, or the WAL full while the archive catches up) |
 | POST | `/api/v2/ingest/exports` | Export `[from, to)` from a configured source into a stream: `source`, `streamId`, `query`, `from`, `to`, `fromBeginning`. 202, or 400 / 404 (no such source for the tenant) / 409 (an export already running on the stream) / 429 + `Retry-After` (replay slots busy, WAL full) |
 | GET, DELETE | `/api/v2/ingest/exports/{id}` | Export progress (pages, lines, `paused`, cursor position) / cancel before the next page |
+| GET | `/api/v2/tail` | Live tail (Server-Sent Events) of the tenant's lines: `level`, `source`, `q`, `Last-Event-ID`. `event: dropped` / `reset`; 400 bad filter, 429 + `Retry-After` at a connection limit |
 | POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, same key in progress, quota, WAL or spool full), 413, 409 (too many streams, or the id is a file job's source id), 415 |
 | GET | `/api/v2/ingest/streams/{id}`, `/api/v2/ingest/streams` | A stream's (or every stream's) spool, counters and last run. Another tenant's stream is 404 |
 | GET | `/api/v2/ingest/jobs/{id}` | Job progress: bytes, lines, format, segments, outputs, `paused` / `pausedMs`. Another tenant's job is 404 |
@@ -238,7 +268,7 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 | POST | `/api/v1/logs/filter` | Filtered records (≤50MB) |
 
 - **v1 errors:** 400 for bad input or a path outside the caller's roots, 404 for a missing file, and 429 + `Retry-After` when both aggregation slots are busy.
-- **Health:** `/actuator/health`. It reports DOWN when Redis isn't reachable, even with the in-memory suppression store; see [ROADMAP.md](ROADMAP.md).
+- **Health and metrics:** `:9001/actuator/health` and `:9001/actuator/prometheus` (management port); `/livez` and `/readyz` on the API port. Redis is part of health only with a Redis suppression or quota store.
 
 ## Generate test data
 
@@ -252,11 +282,12 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 398 tests; Redis, S3, GCS and Elasticsearch tests need Docker
+mvn test                                         # 431 tests; Redis, S3, GCS and Elasticsearch tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
 mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
                                                  # decisions, push throughput / isolation, push backpressure, kill -9 during push,
-                                                 # T8 replay isolation (-Dargus.load.docker-cpus=2 runs the server in a 2-CPU container)
+                                                 # T8 replay isolation, T7 live tail (-Dargus.load.docker-cpus=2 runs the server
+                                                 # in a 2-CPU container)
 ```
 
 ## License

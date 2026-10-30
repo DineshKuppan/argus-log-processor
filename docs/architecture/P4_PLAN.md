@@ -32,7 +32,7 @@ Argus can ingest, suppress, archive and replay, but nobody can watch it happen: 
 
   Chosen (c).
   - **Push:** `PushIngestService` publishes the request's allowed lines once its spool append returns (not for a duplicate `Idempotency-Key`, not when the append fails). It already parses each line for suppression; with suppression off, it parses only while the tenant has a tail open.
-  - **Files:** `IngestPipeline`'s parse stage publishes each batch's envelopes, for live-lane file jobs only (`Request.tail`). Stream runs (already published at receive) and replay-lane runs (fromBeginning jobs, exports) don't.
+  - **Files:** `IngestPipeline`'s parse stage publishes each batch's envelopes, for live-lane file jobs only (`Request.tailed()`). Stream runs (already published at receive) and replay-lane runs (fromBeginning jobs, exports) don't.
   - A file line is published before its segment is committed: a crash can show it twice on a tail, never lose it from the output. Tail is a view, not a delivery guarantee.
 - **Result:** pushed lines are visible within milliseconds of the 202, and file lines within one batch of being read. Pushed lines carry no `eventId` on the tail, since their generation is assigned only when the stream runner ingests the spool; file lines carry the `eventId` the archive will hold.
 
@@ -59,7 +59,7 @@ Argus can ingest, suppress, archive and replay, but nobody can watch it happen: 
   | **(c) A platform thread per connection (small stack), capped by connection limits** | Blocking is harmless and isolated; no build change | ~1,000 threads at the cap (stacks reserve virtual memory and commit only what they use) |
 
   Chosen (c). The SSE response is a Spring `SseEmitter` (Tomcat holds no request thread while it is open). Its sender thread waits on the tenant ring's condition with a 15s timeout, and sends a `:` heartbeat comment when nothing arrives, which is also how a vanished client is noticed. Events are written in batches: one write and one flush per wakeup, not per line.
-- **Result:** a stalled client blocks only its own thread, never ingest or another client. The build stays on Java 17. ADR-6 changes to "virtual threads once the build is on Java 24+", measured by the 1,000-connection test (§5).
+- **Result:** a stalled client blocks only its own thread, never ingest or another client. The build stays on Java 17. ADR-6 changes to "virtual threads once the build is on Java 24+", measured by the 1,000-connection case of `LiveTailIT` (§5).
 
 ### D4. Tail limits
 | Bound | Default | When reached |
@@ -109,7 +109,7 @@ Within the 2.4GB heap and the native headroom of guardrail 5.
 | `TailFilter`, `TailEvent` | `tail` | Filter parsing and matching; the event (envelope + source + estimated size) and its JSON view |
 | `TailController` | `controller` | `GET /api/v2/tail?level=&source=&q=`, `Last-Event-ID`; 400 bad filter, 429 + `Retry-After` at a limit |
 | `ArgusMetrics` | `metrics` (new) | The meters of §4, resolved once per tag set; the tenant-tag `MeterFilter` |
-| `IngestPipeline`, `PushIngestService`, `IngestJobService`, `ReplayLane`, `Archiver`, `ExportJobService`, `Suppressor`, `WatermarkWalCapacity`, `StreamRegistry` | existing | Record metrics where their canonical lines are emitted; push and the parse stage publish to the tail (D1); `Request.tail` |
+| `IngestPipeline`, `PushIngestService`, `IngestJobService`, `ReplayLane`, `Archiver`, `ExportJobService`, `Suppressor`, `WatermarkWalCapacity`, `StreamRegistry` | existing | Record metrics where their canonical lines are emitted; push and the parse stage publish to the tail (D1); `Request.tailed()` |
 | `CanonicalLineParser` | `parser` | D6 |
 | `TailProperties`, `MetricsConfig`, `RedisHealthConfig` | `config` | Binding; the Redis health contributor only with a Redis store |
 
@@ -123,16 +123,18 @@ argus.tail.max-duration=1h
 argus.tail.heartbeat=15s
 argus.tail.ring-lines=10000
 argus.tail.ring-bytes=4MB
+argus.tail.ring-idle=1m                   # a ring outlives its last connection this long, for resumes
 
 argus.metrics.max-tenants=100
 management.server.port=9001
-management.endpoints.web.exposure.include=health,info,prometheus
+management.endpoints.web.exposure.include=health,info,metrics,prometheus
+management.endpoint.health.probes.add-additional-paths=true   # /livez and /readyz on the API port too
 management.health.redis.enabled=false     # on again only with argus.suppression.store / argus.quota.store=redis
 ```
 
 | Meter (Prometheus name) | Type | Tags |
 |---|---|---|
-| `argus_ingest_lines_total` | counter | `tenant`, `lane`, `outcome` (`parsed` / `fallback` / `unparsed` / `rejected`) |
+| `argus_ingest_lines_total` | counter | `tenant`, `lane`, `outcome` (`primary` / `fallback` / `unparsed` / `rejected`) |
 | `argus_ingest_bytes_total` | counter | `tenant`, `lane` |
 | `argus_ingest_segments_total`, `argus_ingest_segment_commit_seconds` | counter, timer | `tenant` / — |
 | `argus_ingest_jobs_active` | gauge | `lane` |
@@ -140,13 +142,13 @@ management.health.redis.enabled=false     # on again only with argus.suppression
 | `argus_push_lines_total` | counter | `tenant`, `result` (`accepted` / `suppressed` / `truncated`) |
 | `argus_spool_pending_bytes` | gauge | — |
 | `argus_suppression_decisions_total` | counter | `tenant`, `decision` |
-| `argus_suppression_store_errors_total` | counter | `store` (fail-open events) |
+| `argus_store_fail_open_total` | counter | `store` (`suppression` / `quota`: Redis calls answered by failing open) |
 | `argus_wal_pending_bytes`, `argus_wal_full` | gauge | — |
 | `argus_archive_segments_total`, `argus_archive_bytes_total`, `argus_archive_upload_seconds` | counter, timer | `outcome` / — |
 | `argus_archive_oldest_pending_seconds` | gauge | — (how far the archive is behind) |
 | `argus_export_pages_total`, `argus_export_lines_total`, `argus_export_retries_total` | counter | `tenant`, `source` |
 | `argus_replay_wait_seconds` | timer | — (time replay readers spent waiting for the read budget) |
-| `argus_tail_connections` | gauge | `tenant` |
+| `argus_tail_connections` | gauge | — |
 | `argus_tail_lines_sent_total`, `argus_tail_lines_dropped_total` | counter | `tenant` |
 
 ## 5. Tests
@@ -154,22 +156,19 @@ management.health.redis.enabled=false     # on again only with argus.suppression
 | Kind | Test |
 |---|---|
 | Unit | `TailRingTest`: sequence numbers, line and byte bounds, overtaken cursors report what was dropped, waiting and signalling |
-| Unit | `TailHubTest`: no ring and no cost while unwatched, per-tenant isolation (another tenant's lines never appear), limits, ring released after idle, resume and `reset` |
-| Unit | `TailConnectionTest`: filters, rate cap, batched frames, heartbeat, a stalled writer (blocking `write`) never blocks `publish` |
+| Unit | `TailHubTest` (with `TailConnection`): no ring while unwatched, per-tenant isolation (another tenant's lines never appear), filters, limits, a stalled writer (blocking `write`) never blocks `publish` and is told what it missed, the rate cap, `Last-Event-ID` resume and `reset`, heartbeats, ring released after idle, shutdown |
 | Unit | `CanonicalLineParserTest` + `ParserContractTest` / `FormatParsersTest` cases; detection doesn't change for other formats |
-| Unit | `ArgusMetricsTest` (`SimpleMeterRegistry`): counters match the canonical line's counts for a pipeline run and a push request; the tenant-tag cap |
+| Unit | `ArgusMetricsTest` (the tenant-tag cap); in `IngestPipelineTest` / `PushIngestServiceTest` (`SimpleMeterRegistry`), counters match the canonical line's counts for a pipeline run and push requests |
 | API | `TailControllerTest`: 401 without a key, SSE headers, filters, 400 for a bad `level`, 429 at each limit, `Last-Event-ID` |
-| Wiring | `ArgusWebApplicationTest`: `/actuator/prometheus` on the management port lists the `argus_*` meters; health is UP without Redis |
+| Wiring | `MetricsEndpointTest`: `/actuator/prometheus` on the management port (not the API port) lists the `argus_*` meters; health is UP without Redis; `/livez` / `/readyz` on the API port |
 | Pipeline | Push and file lines published once each; stream runs and replay-lane runs publish nothing |
-| Load (`load` tag) | `TailFreshnessIT` (T7): pushed and file-ingested marker lines reach an SSE client; p99 ≤2s |
-| Load | `TailSlowClientIT` (T7): push load alone, then with 16 tail clients that never read; throughput and p99 within the T8 margin (≤20%), ingest never blocks, and the stalled clients see `dropped` |
-| Load | `TailConnectionsIT` (ADR-6): 1,000 open idle tail connections (limits raised); heap and native memory stay within the budget, a line still reaches them all |
+| Load (`load` tag) | `LiveTailIT` (T7): pushed and file-ingested marker lines reach an SSE client, p99 ≤2s; push load alone, then with 16 tail clients that never read, throughput and p99 within the T8 margin (≤20%), and a stalled client then sees `dropped`; 1,000 open tail connections (limits raised) within the memory budget, a line reaching them all |
 
 ## 6. Implementation order (one commit per step)
 1. The plan (this file), ADR-6 update.
 2. Metrics: `ArgusMetrics`, the Prometheus registry and management port, the meters of §4 at the existing canonical lines, Redis health.
 3. Tail core: `TailRing`, `TailHub`, `TailConnection`, `TailFilter` + tests.
-4. Tail taps (push, parse stage, `Request.tail`) and `TailController` + tests.
+4. Tail taps (push, parse stage, `Request.tailed()`) and `TailController` + tests.
 5. `canonical` parser + tests.
 6. T7 load tests (freshness, slow clients, 1,000 connections); measurements in §9.
 7. Docs: CLAUDE.md, README, FEATURES, ROADMAP, CHANGELOG, design doc §9/§10/§11.
@@ -178,7 +177,7 @@ management.health.redis.enabled=false     # on again only with argus.suppression
 | Risk | Mitigation |
 |---|---|
 | A popular tenant's ring holds large envelopes alive | `ring-bytes` from line lengths; rings exist only while tailed |
-| Tail threads take CPU from ingest on a 2-CPU node | Rate cap per connection; measured in `TailSlowClientIT` |
+| Tail threads take CPU from ingest on a 2-CPU node | Rate cap per connection; measured in `LiveTailIT` |
 | Proxies buffer SSE | `X-Accel-Buffering: no`, `Cache-Control: no-cache`, heartbeats |
 | Metrics on hot paths | Counters resolved once per tag set and incremented per batch, not per line |
 | The management port is exposed by accident | Separate port, documented; the scrape includes tenant ids and volumes, not log content |
@@ -188,3 +187,25 @@ management.health.redis.enabled=false     # on again only with argus.suppression
 - **Pre-fill the ring after a restart** from the newest WAL segments (design §5 warm-up): lines are on disk; until then, a reconnect after a restart gets `reset`.
 - **Several instances:** each instance tails what it ingests. A shared tail needs a Redis Stream or Kafka topic per tenant (P5).
 - **Virtual threads** once the build moves to Java 24+ (D3).
+- **Dead connections behind proxies:** a proxy that keeps the server side of a closed client open makes the server's writes succeed, so the connection holds its slot until `max-duration`. A shorter idle limit, or slots reclaimed when a tenant is at its limit (oldest connection first), would bound it (§9).
+
+## 9. Results
+
+`LiveTailIT` (tag `load`), the application in its own 256MB JVM pushed to over HTTP. "2 CPUs" is `-Dargus.load.docker-cpus=2`: a container with 2 CPUs and 4GB, the sizing target's node; "host" is a 10-core laptop.
+
+| Check | 2 CPUs | Host |
+|---|---|---|
+| Push-to-tail latency (300 single-line pushes, from sending the request to the line arriving on an open tail) | p50 6.9ms, p99 38.9ms, max 333ms | p50 12.7ms, p99 28.0ms |
+| File job to its first line on the tail | 77ms | 38ms |
+| Push p99 with 16 tail clients that never read, against 16 that read (4 runs) | −1.5%, +6.5%, −0.8%, −1.2% (e.g. 24.3 vs 24.6ms) | — (10s windows: too noisy, ±40%) |
+| Push p99 with 16 reading clients, against no tail (what tailing costs) | +16.9%, +5.6%, −3.9%, +14.4% | — |
+| Push throughput (~10k lines/s offered) | unchanged within 3% in every window | 7.1–7.4k lines/s |
+| A stalled client, once it reads, is told what it missed | yes | yes |
+| 1,000 open tail connections: one pushed line reaches all | fan-out p50 340ms, p99 484ms; peak heap 189MB of 256MB | p99 171ms; resident memory 489MB idle, 511MB after the fan-out |
+
+- **T7 is met:** a line is visible on a tail within tens of milliseconds of the 202, far within 2s, and a client that stops reading costs ingest no more than one that reads: its sender thread blocks in a socket write, the ring overtakes its cursor, and publishing never waits.
+- **Tailing itself costs up to ~17% of push p99** on 2 CPUs while 16 clients read (building and publishing envelopes, and 16 senders serializing 200 lines a second each); across runs it ranged from −4% to +17%, so part of it is noise. It applies only while a tenant is tailed.
+- **How the slow-client check is measured:** four windows of the same push load (no tail; 16 reading clients; 16 stalled clients; no tail again). The first version compared the stalled window with the windows before and after, and failed once at +42%: the ring outlives its last client by `ring-idle`, so the "after" window was still paying the publishing cost (it was +78% itself), and the comparison mixed "tailing costs something" with "a slow client costs more". Comparing stalled with reading clients isolates the second.
+- **Docker Desktop's port proxy keeps the server side of a closed client open**, so through it a client that disconnects still holds its tail slot (the server's writes keep succeeding) for at least a minute: the test raises the per-tenant limit to 32 for that reason. A real proxy or load balancer that behaves the same way would hold slots until `max-duration` (1h). A heartbeat can't detect it; an idle timeout per connection would (§8).
+- **ADR-6's result holds on Java 17:** 1,000 connections, each a platform thread with a 256KB stack, fit in a 256MB heap with about 500MB resident in all. The fan-out to 1,000 clients is the slowest path measured (p99 484ms on 2 CPUs), still within T7.
+- **The rate cap showed in the first run:** the last line of a 1,000-line file, parsed as one batch, never reached the tail. Past 200 lines a second a client gets a `dropped` count instead, by design (§2 D2), so the freshness check times the file's first line.

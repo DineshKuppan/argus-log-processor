@@ -217,6 +217,18 @@ final class PushLoad {
       return process.isAlive();
     }
 
+    /** The server JVM's resident set size (heap, stacks, metaspace, buffers), or -1 in Docker. */
+    long residentKilobytes() throws IOException, InterruptedException {
+      if (container != null) {
+        return -1;
+      }
+      Process ps =
+          new ProcessBuilder("ps", "-o", "rss=", "-p", Long.toString(process.pid())).start();
+      String out = new String(ps.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+      ps.waitFor();
+      return out.isEmpty() ? -1 : Long.parseLong(out);
+    }
+
     long countLogLines(String needle) throws IOException {
       try (Stream<String> lines = Files.lines(log)) {
         return lines.filter(l -> l.contains(needle)).count();

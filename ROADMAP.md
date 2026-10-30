@@ -16,8 +16,8 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | **P2b** | GCS, WAL watermarks, WAL compression | ✅ Done (#7) |
 | **P3a** | HTTP push ingest, quotas, suppression on push | ✅ Done (#8) |
 | **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ✅ Done (#9) |
-| **P4** | Live tail, metrics, producers' canonical lines | 🚧 In progress ([plan](docs/architecture/P4_PLAN.md)) |
-| **P5** | OpenSearch hot tier, optional Kafka | Planned |
+| **P4** | Live tail, metrics, producers' canonical lines | ✅ Done |
+| **P5** | OpenSearch hot tier, optional Kafka | ⏭ Next |
 
 ## Acceptance criteria
 
@@ -29,26 +29,19 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | T4 | Durability | `kill -9` at a random point → no lost records, duplicates only with the same `eventId` | ✅ P0 (files); P3a (push with `Idempotency-Key`: no loss, one `eventId` per line) |
 | T5 | Freshness | p99 ingest-to-searchable ≤30s | P5 |
 | T6 | Suppression | Correct at the 10s boundary; p99 <1ms | ✅ 8.8µs |
-| T7 | Live tail | Visible ≤2s after ingest; a slow client can't slow ingest | P4 |
+| T7 | Live tail | Visible ≤2s after ingest; a slow client can't slow ingest | ✅ 2 CPUs: push-to-tail p99 39ms; 16 tail clients that never read cost push p99 no more than 16 that read (within 7%, 4 runs), throughput unchanged; 1,000 connections at a 256MB heap |
 | T8 | Replay | Replay any range without starving live ingest | ✅ 2 CPUs: live push p99 unchanged within noise during a 1GB replay at 8MB/s (3–8x worse without the lane) |
 | T9 | Cost | Cold tier ≤3TiB at 7 years (≥8x compression) | ✅ 14.6x on synthetic data; re-measure on real logs |
 
-## Next: P4
-Visibility.
-- Server-Sent Events live tail with per-connection bounded buffers that drop the oldest lines (T7).
-- Micrometer metrics.
-- Canonical lines for the applications Argus ingests.
-
-## Later
-- **P5: hot search tier.**
-  - `OpenSearchSink` with ILM and tuned mappings, under a multi-sink router that acknowledges each WAL segment per sink (T5).
-  - Optional Kafka buffer, with suppression partitioned by key.
+## Next: P5
+Hot search tier.
+- `OpenSearchSink` with ILM and tuned mappings, under a multi-sink router that acknowledges each WAL segment per sink (T5).
+- Optional Kafka buffer, with suppression partitioned by key (and a tail shared by every instance).
 
 ## Open items
 - **Re-measure T9 on real logs.** The 14.6x comes from `DataSeeder`, whose vocabulary is small. Real logs will compress less.
 - **Test against real AWS S3 and GCS.** Only S3Mock and fake-gcs-server (plus a protocol stub for GCS resumes) are tested today.
 - **Run T3 at full length:** the 10-minute outage is tested scaled down to 30s (`-Dargus.load.outage-seconds`).
-- **Health without Redis:** `/actuator/health` reports DOWN when Redis is unreachable, even with the local suppression store. Disable the Redis indicator unless the Redis store is in use.
 - **Multiline framing:** stack traces become one record per line. A `framing` stage would join continuation lines.
 - **Records without an event time** land in `dt=unknown`, and v1's time filters skip them.
 - **v1 `/parse`, `/parse/regexp` and `/filter`** still read whole files behind the 50MB cap.
@@ -60,4 +53,10 @@ Visibility.
 - **Exports against the real services:** Coralogix is tested against a protocol stub only; run an export against a Coralogix account, and against a production-sized Elasticsearch / OpenSearch index.
 - **Exactly-once Elasticsearch exports across an expired point in time:** hits sharing the last exported timestamp can be exported twice. A stable unique sort field (when the index has one) would make it exact.
 - **Byte-range replay:** a replay re-reads a whole file (`fromBeginning`) or an export's time range; there is no "re-ingest offsets X–Y of this file".
+- **Tail warm-up:** a restart empties the tail rings; pre-fill them from the newest WAL segments so a reconnect resumes instead of getting `reset`.
+- **Tail across instances:** each instance tails only what it ingests; a shared tail needs a Redis Stream or Kafka topic per tenant (P5).
+- **Dead tail connections behind proxies:** a proxy that keeps a closed client's server side open holds its tail slot until `max-duration` (seen with Docker Desktop's port proxy); add an idle limit or reclaim the oldest slot at the tenant's limit.
+- **Browser tail clients:** `EventSource` can't send the API key header; a fetch-based SSE client is needed (or short-lived tail tokens).
+- **Virtual threads for tail connections** once the build is on Java 24+ (JEP 491; [`P4_PLAN.md`](docs/architecture/P4_PLAN.md) D3).
+- **Dashboards and alerts:** P4 exports the meters; ship example Grafana dashboards and alert rules (WAL above the high watermark, archive lag, 429 rate).
 - **Replay budget per node size:** 8MB/s is measured on 2 CPUs; derive it from the CPU count, or pace by lines rather than bytes.
