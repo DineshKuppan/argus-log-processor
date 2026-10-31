@@ -8,8 +8,11 @@ import dev.dinesh.argus.archive.FileSystemObjectStore;
 import dev.dinesh.argus.archive.GcsObjectStore;
 import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
-import dev.dinesh.argus.archive.WatermarkWalCapacity;
+import dev.dinesh.argus.hot.HotIndexer;
 import dev.dinesh.argus.sink.WalCapacity;
+import dev.dinesh.argus.wal.WalSegments;
+import dev.dinesh.argus.wal.WalSink;
+import dev.dinesh.argus.wal.WatermarkWalCapacity;
 import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -26,7 +29,9 @@ class ArchiveConfigTest {
   @Configuration
   @EnableConfigurationProperties({
     ArchiveProperties.class,
+    HotProperties.class,
     LocalSinkProperties.class,
+    SearchProperties.class,
     WalProperties.class
   })
   static class Base {
@@ -38,7 +43,7 @@ class ArchiveConfigTest {
 
   private ApplicationContextRunner runner() {
     return new ApplicationContextRunner()
-        .withUserConfiguration(Base.class, ArchiveConfig.class)
+        .withUserConfiguration(Base.class, WalConfig.class, ArchiveConfig.class, HotConfig.class)
         .withPropertyValues(
             "argus.sink.local.root=" + dir.resolve("wal"),
             "argus.archive.staging-dir=" + dir.resolve("staging"));
@@ -53,6 +58,34 @@ class ArchiveConfigTest {
               assertThat(context).doesNotHaveBean(Archiver.class);
               assertThat(context).doesNotHaveBean(ObjectStore.class);
               assertThat(context).doesNotHaveBean(WalCapacity.class);
+              assertThat(context).doesNotHaveBean(HotIndexer.class);
+            });
+  }
+
+  @Test
+  void theWalIsRoutedToEveryConfiguredSink() {
+    runner()
+        .withPropertyValues("argus.hot.store=opensearch", "argus.hot.url=http://127.0.0.1:1")
+        .run(
+            context -> {
+              assertThat(context).hasNotFailed();
+              assertThat(context).doesNotHaveBean(Archiver.class);
+              assertThat(context).hasSingleBean(HotIndexer.class); // unreachable: only warns
+              WalSegments wal = context.getBean(WalSegments.class);
+              assertThat(wal.routed()).containsExactly(WalSink.HOT);
+              assertThat(context).hasSingleBean(WalCapacity.class);
+            });
+    runner()
+        .withPropertyValues(
+            "argus.hot.store=elasticsearch",
+            "argus.hot.url=http://127.0.0.1:1",
+            "argus.archive.store=filesystem",
+            "argus.archive.filesystem.root=" + dir.resolve("archive"))
+        .run(
+            context -> {
+              assertThat(context).hasSingleBean(Archiver.class);
+              assertThat(context.getBean(WalSegments.class).routed())
+                  .containsExactlyInAnyOrder(WalSink.ARCHIVE, WalSink.HOT);
             });
   }
 

@@ -111,6 +111,28 @@ public class ArgusMetrics {
     count("argus.tail.lines.dropped", Tags.of(TENANT, tenant), lines);
   }
 
+  /** One WAL segment indexed into the hot tier ({@code P5_PLAN.md} D2). */
+  public void hotSegment(String tenant, String outcome, long indexed, long rejected, long skipped) {
+    registry.counter("argus.hot.segments", "outcome", outcome.toLowerCase(Locale.ROOT)).increment();
+    count("argus.hot.documents", Tags.of(TENANT, tenant, "outcome", "indexed"), indexed);
+    count("argus.hot.documents", Tags.of(TENANT, tenant, "outcome", "rejected"), rejected);
+    count("argus.hot.documents", Tags.of(TENANT, tenant, "outcome", "outside_retention"), skipped);
+  }
+
+  /** One {@code _bulk} request. */
+  public void hotBulk(boolean ok, long nanos) {
+    registry
+        .timer("argus.hot.bulk", "outcome", ok ? "ok" : "failed")
+        .record(nanos, TimeUnit.NANOSECONDS);
+  }
+
+  /** One search request ({@code P5_PLAN.md} D6). */
+  public void search(String tenant, String outcome, long nanos) {
+    registry
+        .timer("argus.search.requests", TENANT, tenant, "outcome", outcome)
+        .record(nanos, TimeUnit.NANOSECONDS);
+  }
+
   private void count(String name, Tags tags, long amount) {
     if (amount > 0) {
       registry.counter(name, tags).increment(amount);

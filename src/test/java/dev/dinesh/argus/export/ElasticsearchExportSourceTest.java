@@ -8,7 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.dinesh.argus.config.ExportProperties;
-import dev.dinesh.argus.export.ElasticsearchExportSource.Flavor;
+import dev.dinesh.argus.engine.SearchEngineClient.Flavor;
 import dev.dinesh.argus.export.ExportSource.Cursor;
 import dev.dinesh.argus.export.ExportSource.Page;
 import dev.dinesh.argus.export.ExportSource.Query;

@@ -16,7 +16,12 @@ A Spring Boot service that ingests, parses, filters, aggregates and archives log
 
 ## What's new
 
-- **Live tail, metrics and canonical lines (P4).**
+- **Hot search tier and the search API (P5).**
+  - With `argus.hot.store=opensearch|elasticsearch`, every line is also indexed into OpenSearch 2.7+ or Elasticsearch 7.17+ and kept for 14 days; `GET /api/v2/search` finds a tenant's lines by time range, text, level, source, service and attributes.
+  - The hot tier reads the WAL on its own, as the archive does: either can be down without stopping the other, and a segment leaves the WAL only once both have it. Re-indexing (after a crash, a retry or an outage) never duplicates a line: each document's id is its `eventId`.
+  - Tenancy is enforced by the server: the tenant filter comes from the API key and sits beside, never inside, the caller's query.
+  - On 2 CPUs at the target peak (4,150 lines/s), a pushed line is searchable in 11.8s (p50) / 20.1s (p99), within T5's 30s. A 60s cluster outage and a `kill -9` while indexing lost and duplicated nothing. The strict mapping is 65.6% (OpenSearch) / 37.4% (Elasticsearch) smaller on disk than the default dynamic mapping.
+- **Live tail, metrics and canonical lines (P4, PR #10).**
   - `GET /api/v2/tail` streams a tenant's lines as Server-Sent Events as they are accepted, after suppression, filtered by `level`, `source` and `q`. A pushed line reaches a tail in 39ms (p99, 2 CPUs).
   - One bounded ring per tailed tenant: publishing never waits, so a slow client only loses lines (`{"dropped": N}`) and can't slow ingest. On 2 CPUs, 16 tail clients that never read cost push latency no more than 16 that read; 1,000 open connections fit in a 256MB heap.
   - Prometheus metrics on a separate management port (`:9001/actuator/prometheus`): rates, outcomes and latencies of ingest, push, suppression, archive, exports, replay and tail; spool, WAL and archive-lag gauges.
@@ -220,7 +225,28 @@ curl -s localhost:9001/actuator/prometheus | grep '^argus_'
 ```
 The management port (9001) names every tenant and its volumes: keep it internal. Kubernetes probes: `/livez` and `/readyz` on port 9000.
 
-### 9. Archive to Parquet (optional)
+### 9. Search the last 14 days (optional hot tier)
+```properties
+argus.hot.store=opensearch                # or elasticsearch; checked against the cluster at startup
+argus.hot.url=https://search.internal:9200
+# argus.hot.api-key / username / password from the environment (ARGUS_HOT_API_KEY, …)
+argus.hot.dedicated-tenants=bigco         # tenants with their own daily indices; the rest share one, routed by tenant
+argus.sink.local.compression=zstd         # recommended: the WAL holds the lines while the cluster is down
+```
+```bash
+curl -G localhost:9000/api/v2/search -H "X-Argus-Api-Key: $KEY" \
+  --data-urlencode from=2026-11-01T09:00:00Z --data-urlencode to=2026-11-01T10:00:00Z \
+  --data-urlencode 'q=payment -retry' --data-urlencode level=error --data-urlencode attr=http_status:503
+# → {"hits":[{"eventId":"…","timestamp":"…","severityText":"ERROR","body":"payment failed","attributes":{"http_status":503},…}],
+#    "next":"eyJoIjoi…","partial":false,"tookMs":14}
+# Next page: the same parameters plus cursor=<next>
+```
+- **Index layout:** `argus-logs-YYYY.MM.DD-shared` (or `…-t-<tenant>`) per day of event time, deleted after `argus.hot.retention` (14 days) by Argus itself, on either engine.
+- **Freshness:** with a hot store, pushed lines are ingested at least every 10s (`argus.hot.flush-interval`), so they are searchable within 30s.
+- **Bounds:** `from`/`to` required, at most 14 days apart and within the hot window (older lines are in the archive); `q` searches the body (`"phrases"`, `-not`, `a | b`, `prefix*`; no regexes); `size` ≤500; 8 searches at once per node (429), 503 while the cluster is down.
+- **Outages:** the WAL holds what the cluster hasn't indexed; past the WAL's high watermark, ingest pauses (429), as for an archive outage.
+
+### 10. Archive to Parquet (optional)
 ```properties
 # A directory or Kubernetes PersistentVolume…
 argus.archive.store=filesystem
@@ -253,6 +279,7 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 | POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`, `lane` (`live` / `replay`; `replay` by default with `fromBeginning`). 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (the lane's job slots busy, or the WAL full while the archive catches up) |
 | POST | `/api/v2/ingest/exports` | Export `[from, to)` from a configured source into a stream: `source`, `streamId`, `query`, `from`, `to`, `fromBeginning`. 202, or 400 / 404 (no such source for the tenant) / 409 (an export already running on the stream) / 429 + `Retry-After` (replay slots busy, WAL full) |
 | GET, DELETE | `/api/v2/ingest/exports/{id}` | Export progress (pages, lines, `paused`, cursor position) / cancel before the next page |
+| GET | `/api/v2/search` | Search the hot tier (with `argus.hot.store`): `from`, `to` (required, ≤14 days, within the hot window), `q`, `level`, `source`, `service`, `attr=key:value`, `size`, `cursor` → `hits`, `next`, `partial`. 400 out of bounds, 404 without a hot tier, 429 + `Retry-After` (search slots busy), 503 + `Retry-After` (cluster busy or down) |
 | GET | `/api/v2/tail` | Live tail (Server-Sent Events) of the tenant's lines: `level`, `source`, `q`, `Last-Event-ID`. `event: dropped` / `reset`; 400 bad filter, 429 + `Retry-After` at a connection or tailed-tenant limit |
 | POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, same key in progress, quota, WAL or spool full), 413, 409 (too many streams, or the id is a file job's source id), 415 |
 | GET | `/api/v2/ingest/streams/{id}`, `/api/v2/ingest/streams` | A stream's (or every stream's) spool, counters and last run. Another tenant's stream is 404 |
@@ -282,12 +309,13 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 431 tests; Redis, S3, GCS and Elasticsearch tests need Docker
+mvn test                                         # 491 tests; Redis, S3, GCS, Elasticsearch and OpenSearch tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
 mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
                                                  # decisions, push throughput / isolation, push backpressure, kill -9 during push,
-                                                 # T8 replay isolation, T7 live tail (-Dargus.load.docker-cpus=2 runs the server
-                                                 # in a 2-CPU container)
+                                                 # T8 replay isolation, T7 live tail, T5 hot-tier freshness, a hot-tier outage and
+                                                 # kill -9 while indexing (-Dargus.load.docker-cpus=2 runs the server in a 2-CPU
+                                                 # container)
 ```
 
 ## License

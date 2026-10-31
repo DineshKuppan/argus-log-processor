@@ -1,9 +1,8 @@
-package dev.dinesh.argus.archive;
+package dev.dinesh.argus.wal;
 
 import dev.dinesh.argus.config.WalProperties;
 import dev.dinesh.argus.sink.WalCapacity;
 import java.io.IOException;
-import java.nio.file.Files;
 import java.time.Duration;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
@@ -11,9 +10,9 @@ import java.util.function.LongSupplier;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * {@link WalCapacity} from the bytes of pending (not yet archived) WAL segments, with hysteresis:
- * full once they reach the high watermark, and again free only below the low watermark.
- * Thread-safe; shared by every ingest job.
+ * {@link WalCapacity} from the bytes of pending WAL segments (some routed sink hasn't acknowledged
+ * them; {@link WalSegments#pending()}), with hysteresis: full once they reach the high watermark,
+ * and again free only below the low watermark. Thread-safe; shared by every ingest job.
  *
  * <p>{@link #awaitRoom} measures afresh at each segment boundary, so the WAL passes the high
  * watermark by at most the segment being written per job; {@link #isFull} (new-job checks) and the
@@ -110,15 +109,7 @@ public final class WatermarkWalCapacity implements WalCapacity {
   /** Fails open: if the WAL can't be measured, ingest isn't paused because of it. */
   private static long pendingBytes(WalSegments wal) {
     try {
-      long total = 0;
-      for (WalSegments.Segment segment : wal.pending()) {
-        try {
-          total += Files.size(segment.file());
-        } catch (IOException e) {
-          // archived (deleted) since the listing
-        }
-      }
-      return total;
+      return WalSegments.bytes(wal.pending());
     } catch (IOException | RuntimeException e) {
       log.warn("Could not measure the WAL; not pausing ingest for it", e);
       return 0;

@@ -3,9 +3,9 @@ package dev.dinesh.argus.ingest;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import dev.dinesh.argus.archive.WalSegments;
 import dev.dinesh.argus.ingest.PushLoad.Client;
 import dev.dinesh.argus.ingest.PushLoad.Server;
+import dev.dinesh.argus.wal.WalSegments;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.PosixFilePermissions;
