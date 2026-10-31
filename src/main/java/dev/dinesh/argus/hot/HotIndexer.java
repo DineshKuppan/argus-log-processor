@@ -400,7 +400,14 @@ public class HotIndexer implements SmartLifecycle {
         throw new IOException(
             "_bulk answered " + response.status() + ": " + response.excerpt(ERROR_CHARS));
       }
-      JsonNode body = mapper.readTree(response.body());
+      JsonNode body;
+      try {
+        body = mapper.readTree(response.body());
+      } catch (JsonProcessingException e) {
+        // The engine's (or a proxy's) fault, not the segment's: never set the segment aside for it.
+        throw new IOException(
+            "_bulk answered " + response.status() + " that isn't JSON: " + response.excerpt(80), e);
+      }
       if (!body.path("errors").asBoolean(false)) {
         tally.indexed += items.size();
         return;

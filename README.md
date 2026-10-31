@@ -309,7 +309,7 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 488 tests; Redis, S3, GCS, Elasticsearch and OpenSearch tests need Docker
+mvn test                                         # 491 tests; Redis, S3, GCS, Elasticsearch and OpenSearch tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
 mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
                                                  # decisions, push throughput / isolation, push backpressure, kill -9 during push,

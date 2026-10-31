@@ -282,6 +282,17 @@ class HotIndexerTest {
   }
 
   @Test
+  void anAnswerThatIsNotJsonFailsThePassWithoutSettingTheSegmentAside() throws Exception {
+    Path segment = fixture.segment("acme", "app", 0, 0, 2, T);
+    answers.add(ids -> "<html>proxy error</html>");
+
+    assertFalse(indexer(10).runOnce());
+
+    assertTrue(Files.exists(segment), "the segment is fine; the answer wasn't");
+    assertEquals(1, wal.pending(WalSink.HOT).size());
+  }
+
+  @Test
   void theIndexActionsCarryTheDayIndexIdAndRouting() throws Exception {
     fixture.segment("acme", "app", 0, 0, 1, T);
     List<JsonNode> actions = new CopyOnWriteArrayList<>();

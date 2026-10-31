@@ -105,7 +105,10 @@ public class SearchService {
         throw new SearchException(400, 0, "The search engine rejected this search");
       }
       JsonNode body = mapper.readTree(response.body());
-      partial = body.path("timed_out").asBoolean(false);
+      // A shard that failed (or timed out) leaves the hits incomplete without failing the search.
+      partial =
+          body.path("timed_out").asBoolean(false)
+              || body.path("_shards").path("failed").asInt(0) > 0;
       engineTookMs = body.path("took").asLong(-1);
       List<SearchHit> found = new ArrayList<>();
       JsonNode lastSort = null;
