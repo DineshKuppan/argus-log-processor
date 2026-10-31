@@ -48,6 +48,19 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Limits | 16 connections per tenant, 256 per node (429 + `Retry-After`), 1-hour connections (clients reconnect), a heartbeat every 15s |
 | Freshness | On 2 CPUs a pushed line reached an open tail in 6.9ms (p50) / 39ms (p99) after the request; 16 clients that never read cost push p99 no more than 16 that read (within 7%, 4 runs); 1,000 connections fit in a 256MB heap |
 
+## Hot tier and search (v2)
+| Feature | Details |
+|---|---|
+| Hot search tier | Opt-in with `argus.hot.store=opensearch|elasticsearch` (OpenSearch 2.7+, Elasticsearch 7.17+, detected and checked at startup). Every WAL segment is indexed with `_bulk`, each line's document id its `eventId`, so retries, crashes and outages never duplicate a line |
+| Independent of the archive | The archive and the hot tier each read the WAL and acknowledge each segment; a segment is deleted only once both have it (ADR-7). Either can be down without stopping the other; past the WAL's high watermark ingest pauses with 429s |
+| Daily indices, 14-day retention | `argus-logs-YYYY.MM.DD-shared` per day of event time, or `…-t-<tenant>` for dedicated tenants; Argus deletes days past `retention` itself, the same way on both engines (no ILM / ISM policies) |
+| Mapping | A strict mapping with `best_compression`: keywords for filters, `body` as text without norms, trace ids without doc values, attributes in one `flattened` / `flat_object` field, so arbitrary attributes neither explode the mapping nor conflict in type. Measured 65.6% smaller than OpenSearch's default dynamic mapping and 37.4% smaller than Elasticsearch's, on synthetic lines |
+| Search API | `GET /api/v2/search`: a required range (≤14 days, within the hot window), text in the body (`"phrases"`, `-not`, `a | b`, `prefix*`; no regexes or fuzzy matching), `level`, `source`, `service`, `attr=key:value`; newest first, cursor paging |
+| Tenant isolation | The tenant filter comes from the API key and sits beside the caller's query; only the caller's indices are read. Tested on both engines with queries and attribute filters naming another tenant |
+| Bounded searches | 8 searches at once per node (429, no queue), ≤500 hits a page, a 32MB cap on the engine's answer, a 10s engine timeout (then `partial: true`); 503 + `Retry-After` while the cluster is busy or down |
+| Freshness | With a hot store, pushed lines are ingested at least every 10s. On 2 CPUs at 4,150 lines/s, a pushed line was found by the search API 11.8s (p50) / 20.1s (p99) after its 202 (T5: ≤30s) |
+| Rejections | A document the engine rejects is counted (`argus_hot_documents_total{outcome="rejected"}`) and its reason logged, not retried: the archive keeps the line. 429 / 5xx items are retried |
+
 ## Formats and parsing
 | Feature | Details |
 |---|---|
@@ -104,10 +117,10 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 ## Operations
 | Feature | Details |
 |---|---|
-| Canonical log lines | One wide line per ingest run, push request, export page and export job, tail connection, v1 scan, suppression check and archived segment, with offsets, counts and timings |
-| Metrics | Prometheus at `:9001/actuator/prometheus` (a separate management port: the scrape names tenants): lines, bytes and outcomes per tenant and lane, segment commit time, push requests by outcome and latency, suppression decisions, spool and WAL pending bytes, WAL full, archive lag and upload time, export pages and retries, replay wait, tail connections and dropped lines, Redis fail-opens, plus JVM and HTTP metrics |
+| Canonical log lines | One wide line per ingest run, push request, export page and export job, tail connection, v1 scan, suppression check, archived segment, indexed segment and search (without the query's text), with offsets, counts and timings |
+| Metrics | Prometheus at `:9001/actuator/prometheus` (a separate management port: the scrape names tenants): lines, bytes and outcomes per tenant and lane, segment commit time, push requests by outcome and latency, suppression decisions, spool and WAL pending bytes (also per sink), WAL full, archive lag and upload time, hot-tier documents by outcome, bulk latency and lag, searches by outcome and latency, export pages and retries, replay wait, tail connections and dropped lines, Redis fail-opens, plus JVM and HTTP metrics |
 | Memory sizing | Runs in 4GB with `-XX:MaxRAMPercentage=60 -XX:MaxDirectMemorySize=512m` |
 | OpenAPI | Swagger UI at `/swagger-ui.html`, with the API-key scheme declared |
 | Health | `/actuator/health` on the management port, UP without Redis unless a Redis store is configured; `/livez` and `/readyz` probes on the API port too |
 | Test data | `DataSeeder` streams a reproducible Nginx log of any size to disk |
-| Tests | 398 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3, GCS, Elasticsearch and OpenSearch, a Coralogix protocol stub, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions; push throughput and tenant isolation, push during an archive outage, `kill -9` during push; T8 replay isolation) |
+| Tests | 488 tests: port contract tests (parsers, object stores), crash and replay tests, Testcontainers for Redis, S3, GCS, Elasticsearch and OpenSearch (exports, and the hot tier and search on both engines), Coralogix and `_bulk` protocol stubs, and load tests (1GB ingest + archive at a 256MB heap, T3 archive outage, 1M suppression decisions; push throughput and tenant isolation, push during an archive outage, `kill -9` during push; T8 replay isolation; T7 live tail; T5 hot-tier freshness, a hot-tier outage, `kill -9` while indexing, the mapping's disk saving) |

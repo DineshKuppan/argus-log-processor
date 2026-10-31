@@ -17,8 +17,8 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | **P3a** | HTTP push ingest, quotas, suppression on push | ✅ Done (#8) |
 | **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ✅ Done (#9) |
 | **P4** | Live tail, metrics, producers' canonical lines | ✅ Done (#10) |
-| **P5** | OpenSearch / Elasticsearch hot tier, search API | 📝 Planned ([`P5_PLAN.md`](docs/architecture/P5_PLAN.md)) |
-| **P6** | Optional Kafka buffer, suppression by key, shared tail | Later |
+| **P5** | OpenSearch / Elasticsearch hot tier, search API | ✅ Done |
+| **P6** | Optional Kafka buffer, suppression by key, shared tail | ⏭ Next |
 
 ## Acceptance criteria
 
@@ -28,20 +28,17 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | T2 | Memory | Heap ≤2.4GB, no OOM on a 10GB file | ✅ 810MB peak (P0) |
 | T3 | Backpressure | Sink stalled for 10 min → no OOM, sources paused or 429, WAL under its watermark, full recovery | ✅ Scaled tests: a 30s outage during a 500MB file ingest paused ingest within one segment of the watermark; a 20s outage during push load turned into 429s, and all 1M acknowledged lines were archived afterwards (both at a 256MB heap) |
 | T4 | Durability | `kill -9` at a random point → no lost records, duplicates only with the same `eventId` | ✅ P0 (files); P3a (push with `Idempotency-Key`: no loss, one `eventId` per line) |
-| T5 | Freshness | p99 ingest-to-searchable ≤30s | P5 |
+| T5 | Freshness | p99 ingest-to-searchable ≤30s | ✅ 2 CPUs, 4,150 lines/s pushed: p50 11.8s, p99 20.1s from the 202 to the search API finding the line (OpenSearch 2.17; Elasticsearch 8.15 on the host: p99 17.8s) |
 | T6 | Suppression | Correct at the 10s boundary; p99 <1ms | ✅ 8.8µs |
 | T7 | Live tail | Visible ≤2s after ingest; a slow client can't slow ingest | ✅ 2 CPUs: push-to-tail p99 39ms; 16 tail clients that never read cost push p99 no more than 16 that read (within 7%, 4 runs), throughput unchanged; 1,000 connections at a 256MB heap |
 | T8 | Replay | Replay any range without starving live ingest | ✅ 2 CPUs: live push p99 unchanged within noise during a 1GB replay at 8MB/s (3–8x worse without the lane) |
 | T9 | Cost | Cold tier ≤3TiB at 7 years (≥8x compression) | ✅ 14.6x on synthetic data; re-measure on real logs |
 
-## Next: P5
-Hot search tier ([`P5_PLAN.md`](docs/architecture/P5_PLAN.md)).
-- A `HotIndexer` as a second consumer of the WAL: each sink acknowledges each segment, and the last acknowledgement deletes it (ADR-7).
-- Daily indices per event day on OpenSearch 2.7+ or Elasticsearch 7.17 / 8.x, a shared index with routing plus dedicated indices for configured tenants, `flattened` / `flat_object` attributes, retention by Argus (14 days).
-- `GET /api/v2/search`: time-bounded, tenant-filtered on the server, `search_after` paging.
-- T5: p99 ingest-to-searchable ≤30s, with a 10s stream flush while a hot store is configured.
-
-Then P6: the optional Kafka buffer, with suppression partitioned by key and a tail shared by every instance.
+## Next: P6
+Kafka, optional (the design's Phase 3).
+- Kafka as the buffer: the archive and the hot tier become consumer groups (ADR-7 is that shape on the local WAL).
+- Suppression partitioned by key, and a live tail shared by every instance.
+- HPA on consumer lag, once several instances share the work.
 
 ## Open items
 - **Re-measure T9 on real logs.** The 14.6x comes from `DataSeeder`, whose vocabulary is small. Real logs will compress less.
@@ -60,6 +57,12 @@ Then P6: the optional Kafka buffer, with suppression partitioned by key and a ta
 - **Byte-range replay:** a replay re-reads a whole file (`fromBeginning`) or an export's time range; there is no "re-ingest offsets X–Y of this file".
 - **Tail warm-up:** a restart empties the tail rings; pre-fill them from the newest WAL segments so a reconnect resumes instead of getting `reset`.
 - **Tail across instances:** each instance tails only what it ingests; a shared tail needs a Redis Stream or Kafka topic per tenant (P6).
+- **Hot tier on a managed cluster:** tested against OpenSearch 2.17 and Elasticsearch 8.15 containers only; add AWS SigV4 for Amazon OpenSearch Service with IAM auth.
+- **Search the cold tier:** ranges older than the hot window (14 days) are only in Parquet; add Athena / BigQuery queries (asynchronous) behind the search API.
+- **Typed attributes in the hot tier:** attribute values are indexed as text; promote configured keys to numeric fields for ranges and aggregations.
+- **Coalesce small segments in the archive:** with a hot store, streams run every 10s, so the archive gets 6x more (smaller) Parquet objects; merge a source's segments into one object per few minutes or 64MB.
+- **Hot indexer fairness:** one thread, oldest segment first, so one tenant's backlog delays the others' freshness; and a hot-tier outage longer than the WAL's room pauses ingest (a lag limit past which the hot copy is skipped is an option).
+- **Re-measure the mapping saving on real logs:** 65.6% (OpenSearch) / 37.4% (Elasticsearch) on synthetic lines.
 - **Dead tail connections behind proxies:** a proxy that keeps a closed client's server side open holds its tail slot until `max-duration` (seen with Docker Desktop's port proxy); add an idle limit or reclaim the oldest slot at the tenant's limit.
 - **Browser tail clients:** `EventSource` can't send the API key header; a fetch-based SSE client is needed (or short-lived tail tokens).
 - **Virtual threads for tail connections** once the build is on Java 24+ (JEP 491; [`P4_PLAN.md`](docs/architecture/P4_PLAN.md) D3).

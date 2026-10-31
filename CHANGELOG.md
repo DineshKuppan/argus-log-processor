@@ -6,6 +6,28 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
+### P5: hot search tier and the search API (unmerged)
+Plan and results: [`P5_PLAN.md`](docs/architecture/P5_PLAN.md).
+
+#### Added
+- **Hot tier** (`argus.hot.*`, opt-in with `argus.hot.store=opensearch|elasticsearch`): `HotIndexer` indexes every committed WAL segment into OpenSearch 2.7+ or Elasticsearch 7.17+ with `_bulk`, `_id = eventId` and per-tenant routing, so retries, crashes and outages never duplicate a line. 429 / 5xx items are retried; documents the engine rejects are counted and logged (the archive keeps them); a failed request backs off and resumes at the last good bulk. One `Hot segment finished …` canonical line per segment.
+  - Daily indices per UTC day of event time: `argus-logs-YYYY.MM.DD-shared` (routed by tenant) or `…-t-<tenant>` for `argus.hot.dedicated-tenants`. `HotRetention` deletes days past `retention` (14 days) on either engine, instead of ILM / ISM policies.
+  - A versioned composable index template: strict mapping, `best_compression`, `refresh_interval` 5s, attributes as `flattened` (Elasticsearch) / `flat_object` (OpenSearch). The configured store is checked against the cluster at startup.
+- **`GET /api/v2/search`:** a required `[from, to)` (≤14 days, within the hot window), `q` (body only; phrases, `-not`, `|`, prefixes; no regexes or fuzzy), `level`, `source`, `service`, repeatable `attr=key:value`, `size` (≤500) and a cursor; newest first. The tenant filter comes from the API key and sits beside the caller's query. 8 searches at once per node (429), 503 + `Retry-After` while the cluster is busy or down, 404 without a hot tier. One `Search finished …` canonical line per request, without the query's text.
+- `engine.SearchEngineClient`: one OpenSearch / Elasticsearch client (auth, timeouts, flavour and version), shared by the export source, the hot tier and search.
+- Metrics: `argus_hot_documents_total{outcome}`, `argus_hot_segments_total`, `argus_hot_bulk_seconds`, `argus_hot_lag_seconds`, `argus_search_requests_seconds`, `argus_wal_sink_pending_bytes{sink}`.
+- `HotTierIT` (T5, outage, crash, mapping saving; tag `load`); `HotTierEngineTest` on OpenSearch 2.17 and Elasticsearch 8.15.
+
+#### Changed
+- **The WAL is acknowledged per sink** (ADR-7): `WalSegments` and `WatermarkWalCapacity` move to the `wal` package; each sink (archive, hot tier) writes its own marker (`.archived` as before, `.indexed`), and the last acknowledgement deletes the segment. The watermarks count segments some sink hasn't acknowledged. Without an archive store, segments are kept (they are the cold output) and only marked.
+- With a hot store, stream runs happen at least every 10s (`argus.hot.flush-interval`), for T5.
+- `ElasticsearchExportSource` uses the shared client; its behaviour is unchanged.
+
+#### Measured
+- **T5 (2 CPUs, 4,150 lines/s pushed, OpenSearch):** from the 202 to the search API finding the line, p50 11.8s, p99 20.1s (≤30s). Elasticsearch on the host: p99 17.8s.
+- **Hot-tier outage (60s, 2 CPUs):** push and archiving went on; afterwards the index held exactly the 200,800 acknowledged lines. **`kill -9` while indexing:** exactly 160,000 documents for 160,000 lines.
+- **Mapping:** 65.6% smaller on disk than OpenSearch's default dynamic mapping, 37.4% than Elasticsearch's (200,000 synthetic lines).
+
 ### P4: live tail, metrics and producers' canonical lines: [#10](https://github.com/DineshKuppan/argus-log-processor/pull/10) (2026-10-30)
 Plan and results: [`P4_PLAN.md`](docs/architecture/P4_PLAN.md).
 

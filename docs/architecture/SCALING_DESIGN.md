@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). **P4 implemented** (SSE live tail with per-tenant rings, Micrometer / Prometheus metrics, a parser for producers' canonical lines; see [`P4_PLAN.md`](P4_PLAN.md)). **P5 planned** (OpenSearch / Elasticsearch hot tier with per-sink WAL acknowledgements and a search API; see [`P5_PLAN.md`](P5_PLAN.md)); Kafka moves to P6. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). **P4 implemented** (SSE live tail with per-tenant rings, Micrometer / Prometheus metrics, a parser for producers' canonical lines; see [`P4_PLAN.md`](P4_PLAN.md)). **P5 implemented** (OpenSearch / Elasticsearch hot tier as a second WAL consumer with per-sink acknowledgements, daily indices with tuned mappings and retention, `GET /api/v2/search`; see [`P5_PLAN.md`](P5_PLAN.md)); Kafka moves to P6, which is design only. Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents
@@ -260,7 +260,7 @@ flowchart TD
 | Hot-tier isolation | Large tenants: **index per tenant** (`logs-<tenant>-YYYY.MM.DD`). Small tenants: a shared index with `routing=tenantId` and filtered aliases, to avoid shard explosion (ADR-4). |
 | Cold-tier isolation | Per-tenant prefix `tenant=<id>/`, IAM policies scoped by prefix, optional per-tenant KMS key. |
 | Cache/key isolation | Every cache key, Redis key and object prefix starts with `tenantId`. |
-| Search API | `GET /api/v2/search?tenant&from&to&service&severity&q=`. Queries for ≤14 days go to OpenSearch. Older ranges go to Athena / BigQuery over Parquet (asynchronous: returns a query id, then results are polled). The time range is required and bounded, to prevent unbounded scans. |
+| Search API | `GET /api/v2/search?from&to&q&level&source&service&attr` (P5, [`P5_PLAN.md`](P5_PLAN.md) D6). The tenant comes from the API key and is a server-side filter beside the user's query; ranges are required, ≤14 days and within the hot window. Ranges older than the hot tier will go to Athena / BigQuery over Parquet (asynchronous: a query id, then polled results; not built yet). |
 
 ---
 
@@ -285,11 +285,11 @@ flowchart LR
 
 ### Ingestion phase
 - The local WAL is the durable buffer.
-- A router dual-writes batches to the hot sink and the archive writer.
-- Each sink acknowledges independently, and the checkpoint advances only when both have acknowledged.
+- Each sink (archive, hot tier) reads the committed WAL on its own and acknowledges each segment; the last acknowledgement deletes it (ADR-7). The source checkpoint advances at the local commit, as since P2, so a sink outage grows the WAL instead of stalling sources.
 - When Kafka is introduced (PLAN.md §1.4), it replaces the WAL as the buffer and each tier becomes an independent consumer group.
 
 ### Hot tier (days 1–14): OpenSearch / Elasticsearch
+> Built in P5 ([`P5_PLAN.md`](P5_PLAN.md)): daily indices per event day deleted by Argus after 14 days (instead of ILM / ISM, D4), `attributes` as `flattened` / `flat_object` under a strict mapping (D5), indexed from the WAL as an independent consumer (ADR-7). The measured disk saving is in P5_PLAN §9.
 - **Purpose:** operational monitoring, alerts, live debugging.
 - **Lifecycle:**
   - daily rollover via ILM/ISM;
