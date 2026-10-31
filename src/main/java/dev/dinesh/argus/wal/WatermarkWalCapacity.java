@@ -27,6 +27,7 @@ public final class WatermarkWalCapacity implements WalCapacity {
   private final LongSupplier pendingBytes;
   private final long highBytes;
   private final long lowBytes;
+  private final String unit;
   private final long refreshNanos;
   private final long pollMillis;
 
@@ -40,9 +41,21 @@ public final class WatermarkWalCapacity implements WalCapacity {
   }
 
   WatermarkWalCapacity(LongSupplier pendingBytes, long highBytes, long lowBytes, Duration refresh) {
-    this.pendingBytes = pendingBytes;
-    this.highBytes = highBytes;
-    this.lowBytes = lowBytes;
+    this(pendingBytes, highBytes, lowBytes, refresh, "bytes");
+  }
+
+  /**
+   * Watermarks over any measure of what the sinks haven't taken yet, e.g. Kafka consumer lag in
+   * records ({@code P6_PLAN.md} D5).
+   *
+   * @param unit what {@code pending} counts, for the log
+   */
+  public WatermarkWalCapacity(
+      LongSupplier pending, long high, long low, Duration refresh, String unit) {
+    this.pendingBytes = pending;
+    this.unit = unit;
+    this.highBytes = high;
+    this.lowBytes = low;
     this.refreshNanos = refresh.toNanos();
     this.pollMillis = Math.max(1, refresh.toMillis());
   }
@@ -68,15 +81,16 @@ public final class WatermarkWalCapacity implements WalCapacity {
       if (!full && lastBytes >= highBytes) {
         full = true;
         log.warn(
-            "WAL full: {} pending bytes ≥ high watermark {}; new segments wait until the archive"
-                + " drains it below {}",
+            "WAL full: {} pending {} ≥ high watermark {}; new segments wait until the sinks"
+                + " drain it below {}",
             lastBytes,
+            unit,
             highBytes,
             lowBytes);
       } else if (full && lastBytes < lowBytes) {
         full = false;
         log.info(
-            "WAL below the low watermark ({} < {} bytes); ingest resumes", lastBytes, lowBytes);
+            "WAL below the low watermark ({} < {} {}); ingest resumes", lastBytes, lowBytes, unit);
       }
     }
     return full;
