@@ -73,14 +73,14 @@ P6a replaces the WAL with a Kafka topic, with the sinks as consumer groups (ADR-
 - **Task:** produce exactly the P2 objects, keys and supersede behaviour from the topic, with bounded memory, and commit Kafka offsets only for archived data.
 - **Action:** one consumer thread in group `argus-archive` (`SmartLifecycle`, like the archiver).
   - **Staging:**
-    - Each line goes to a local staging file per open segment: `staging-dir/kafka/p<partition>/tenant=T/source=S/gen=G/<start>.ndjson.zst`, zstd level 1 as in P2.
+    - Each line goes to a local staging file per open segment: `staging-dir/tenant=T/dt=kafka/source=S/gen=G/<start>.staging`, zstd level 1 as in P2. A key and source are in one partition, so no partition directory is needed.
     - A line whose source offset isn't past the staged segment's last one starts a new attempt (a replay): the staged file is discarded and restarted.
     - Disk use is bounded by open segments × segment size: a few concurrent runs × ≤500MB of source, about 200MB each in zstd (NDJSON envelopes are ~4x the source, zstd ~10x smaller).
   - **On a commit marker:**
-    - the staged file is checked against the marker (`argus-lines`, `argus-end`) and becomes a `WalSegments.Segment`;
-    - `Archiver.archive(segment)` runs unchanged (Parquet per hour → `ObjectStore.put` → `ArchiveIndex` supersede);
+    - the staged file is renamed `<start>-<end>.ndjson.zst`, laid out like the local WAL, and becomes a `WalSegments.Segment`;
+    - `Archiver.archive(segment)` runs unchanged (Parquet per hour → `ObjectStore.put` → `ArchiveIndex` supersede, the index kept in the staging root);
     - the staged file is then deleted.
-    - A mismatch (lines lost to a bug) fails loudly and isn't archived.
+    - A line count that doesn't match the marker's `argus-lines` (a bug) logs an ERROR, and the segment is **archived anyway**: the lines are real, and skipping it would lose them from the cold tier.
   - **Abort marker:** the staged file is discarded.
   - **Orphans:** a staged segment with no record for `orphan-timeout` (15m) is discarded with a WARN. Its producer died and will replay it in full from its checkpoint, or the source is gone.
   - **Offset commits:**
@@ -110,7 +110,7 @@ P6a replaces the WAL with a Kafka topic, with the sinks as consumer groups (ADR-
 - **Task:** keep T3 (a stalled sink pauses sources, no loss) with Kafka.
 - **Action:**
   - **`KafkaWalCapacity`** implements the `WalCapacity` port.
-    - Every 10s (`AdminClient`), it computes each routed group's lag in records: end offsets − committed offsets, summed over partitions.
+    - Every 5s (`AdminClient`, on its own thread, so a push asking whether the WAL is full never waits on Kafka), it computes each routed group's lag in records: end offsets − committed offsets, summed over partitions. If Kafka can't be asked, the last measurement stands.
     - Full above `high-watermark` × `max-lag-records`; free again below the low watermark. Same hysteresis, same `paused: WAL_FULL` and 429s as today.
     - `max-lag-records` defaults to 100M, ~2.8 days at the target's 36M lines a day.
     - At startup, `retention.ms` below twice that time, a finite `retention.bytes`, or `cleanup.policy=compact` fail startup (or only warn, with `argus.kafka.check-topic=warn`).
@@ -328,6 +328,7 @@ argus.instance.id=                         # P6b; the pod name in a StatefulSet
 | Archive staging fills the disk (many concurrent open segments) | Bounded by concurrent runs × segment size (D3); `min-free-bytes` applies to the staging dir; orphans expire |
 | A segment's lines and its marker in different partitions | Same key → same partition with the default partitioner; the key is fixed per source; a test asserts it on both brokers |
 | Redpanda differs from Kafka (admin API, configs) | Every broker test runs on both; differences recorded in CLAUDE.md |
+| The archive index (`ArchiveIndex`, the keys of a source's latest archived segment) is on the consumer's local staging disk | Enough with one instance. In P6b a partition can move to another instance, which wouldn't see it: a replayed segment with a different end could then leave its earlier copy's objects (duplicate rows). P6b moves the index where every instance reads it (the object store) |
 | Rebalances during long Parquet uploads evict the archive consumer | Uploads run while the consumer is `pause`d and keeps polling; `max.poll.interval.ms` 10m |
 | Cross-instance duplicates for un-keyed pushes or reshuffles | D12's affinity; documented; at-least-once is guardrail 3's contract |
 | Template v2 on a cluster with v1 indices | Fields only added; today's and later indices get v2; old days keep v1 and lack `source_instance` (searchable as before) |
@@ -342,4 +343,26 @@ argus.instance.id=                         # P6b; the pod name in a StatefulSet
 - **SASL / IAM for Amazon MSK; Schema Registry** if other teams consume `argus-wal`.
 
 ## 9. Results
-To be filled in by steps 7 and 13.
+
+### P6a
+`KafkaWalIT` and `HotTierIT -Dargus.load.wal=kafka` (tag `load`): the application in its own 256MB JVM on the host (a 10-core laptop), pushed to over HTTP, writing to one Apache Kafka 3.8 (KRaft) or Redpanda 24.2 container (one broker, replication 1, 6 partitions) and archiving to a filesystem store. Host only: the broker advertises a host port that a containerised server couldn't reach, so the 2-CPU container runs of earlier phases weren't repeated here.
+
+| Check | Apache Kafka 3.8 | Redpanda 24.2 |
+|---|---|---|
+| **T1**: 1M lines pushed by 8 clients as fast as accepted, to fully ingested; the local WAL under the same load in the same run | **131.9k lines/s** (local WAL 125.6k); peak heap 248MB | **130.1k lines/s** (local WAL 131.7k); peak heap 252MB |
+| **T3, broker paused 60s** under 2,000 lines/s of keyed pushes | 120,400 lines accepted into the spools during the outage (no 429s); all 180,800 archived exactly once, caught up 16.8s after the broker returned | 120,000 accepted during the outage; all 180,800 archived exactly once, 17.0s after |
+| **T3, archive store unwritable 30s** under 4,000 lines/s, `max-lag-records` 50,000 (high watermark 40,000) | Lag watermark reached: 156 pushes got 429 `WAL_FULL`, 60,800 lines accepted during the outage (of 120,000 offered); all 180,400 archived exactly once, 16.4s after | 160 429 `WAL_FULL`, 61,200 accepted; all 180,400 archived once, 17.2s after |
+| **T4**: `kill -9` mid-push (2MB segments), 400,000 keyed lines, restart | Killed with 117,000 archived; afterwards exactly 400,000 rows, none twice | Killed with 100,000 archived; exactly 400,000 rows |
+
+Hot tier with Kafka as the WAL (Apache Kafka, OpenSearch 2.17, host):
+
+| Check | Result |
+|---|---|
+| **T5**: 4,150 lines/s pushed for 2 minutes, a probe line every second, from its 202 to `GET /api/v2/search` finding it | **p50 9.9s, p99 22.3s, max 23.3s** (117 of 117 probes); local WAL on the host in P5: p99 17.7s. Peak heap 206MB |
+| OpenSearch paused 60s under 2,000 lines/s, with a filesystem archive | Push went on (120,300 lines acknowledged during the outage) and so did archiving (24 segments); the index held exactly the 200,800 acknowledged lines 29.9s after the engine returned |
+| `kill -9` while indexing, 160,000 keyed lines | Killed with 40,900 indexed; afterwards exactly 160,000 documents |
+
+Notes:
+- Throughput is the same as the local WAL's within run-to-run noise: the producer batches and compresses, and the cost moves from fsyncing segment files to Kafka's acknowledgements.
+- The T1 Kafka runs reached 248–252MB of the 256MB test heap (the local WAL 222–237MB): the 32MB producer buffer (D7) fills under an unthrottled push. The production heap (2.4GB) leaves ample room; D7's ≈75MB holds.
+- During the broker outage nothing was archived (the topic was unreachable) but nothing was refused either: the spools (2GB) absorbed 60s at 2,000 lines/s.

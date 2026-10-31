@@ -65,11 +65,23 @@ class HotTierIT {
   private static final int RATE = Integer.getInteger("argus.load.hot-rate", 4_150);
   private static final int SECONDS = Integer.getInteger("argus.load.hot-seconds", 120);
   private static final int OUTAGE_SECONDS = Integer.getInteger("argus.load.outage-seconds", 60);
+
+  /** {@code -Dargus.load.wal=kafka}: the same checks with Kafka as the WAL (P6a, host only). */
+  private static final boolean KAFKA =
+      "kafka".equalsIgnoreCase(System.getProperty("argus.load.wal"));
+
+  private static final String WAL = KAFKA ? "kafka" : "local";
+
   private static final int STREAMS = 4;
   private static final int BATCH_LINES = 100;
   private static final ObjectMapper JSON = new ObjectMapper().registerModule(new JavaTimeModule());
 
   @TempDir Path work;
+
+  @org.junit.jupiter.api.BeforeEach
+  void kafkaOnTheHostOnly() {
+    Assumptions.assumeFalse(KAFKA && PushLoad.inDocker(), "Kafka as the WAL: host only");
+  }
 
   private static String engineUrlForServer() {
     return PushLoad.inDocker()
@@ -97,6 +109,9 @@ class HotTierIT {
             "--argus.hot.index-prefix=" + prefix,
             "--argus.hot.replicas=0",
             "--argus.sink.local.compression=zstd"));
+    if (KAFKA) {
+      args.addAll(KafkaWalIT.kafkaArgs(work));
+    }
     args.addAll(List.of(extra));
     return args;
   }
@@ -274,7 +289,9 @@ class HotTierIT {
             .toArray();
     double seconds = SECONDS;
     System.out.printf(
-        "Hot tier freshness (T5): engine=%s cpus=%s rate=%d seconds=%d pushedLines=%d"
+        "Hot tier freshness (T5): wal="
+            + WAL
+            + " engine=%s cpus=%s rate=%d seconds=%d pushedLines=%d"
             + " linesPerSecond=%.0f probes=%d found=%d p50ms=%d p99ms=%d maxms=%d peakHeapMB=%s"
             + " maxHeapMB=%s%n",
         FLAVOR,
@@ -355,7 +372,9 @@ class HotTierIT {
     Map<String, String> heap = server.stop();
 
     System.out.printf(
-        "Hot tier outage: engine=%s cpus=%s rate=%d outageSeconds=%d linesAcked=%d"
+        "Hot tier outage: wal="
+            + WAL
+            + " engine=%s cpus=%s rate=%d outageSeconds=%d linesAcked=%d"
             + " ackedDuringOutage=%d segmentsArchivedDuringOutage=%d indexed=%d"
             + " caughtUpSecondsAfterOutage=%.1f peakHeapMB=%s maxHeapMB=%s%n",
         FLAVOR,
@@ -425,8 +444,11 @@ class HotTierIT {
     restarted.stop();
 
     System.out.printf(
-        "Hot tier crash: engine=%s lines=%d indexedAtKill=%d indexed=%d%n",
-        FLAVOR, expected, indexedAtKill, settled);
+        "Hot tier crash: wal=" + WAL + " engine=%s lines=%d indexedAtKill=%d indexed=%d%n",
+        FLAVOR,
+        expected,
+        indexedAtKill,
+        settled);
     assertEquals(expected, indexed);
     assertEquals(expected, settled, "a re-indexed line overwrote itself");
   }
