@@ -1,9 +1,9 @@
 package dev.dinesh.argus.archive;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import dev.dinesh.argus.archive.WalSegments.Segment;
 import dev.dinesh.argus.tenant.TenantIds;
 import dev.dinesh.argus.utils.DurableFiles;
+import dev.dinesh.argus.wal.WalSegments.Segment;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;

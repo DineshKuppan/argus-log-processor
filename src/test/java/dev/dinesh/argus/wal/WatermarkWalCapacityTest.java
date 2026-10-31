@@ -1,4 +1,4 @@
-package dev.dinesh.argus.archive;
+package dev.dinesh.argus.wal;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -11,7 +11,9 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -95,9 +97,24 @@ class WatermarkWalCapacityTest {
     long size = segment.toFile().length();
     WalProperties limits = new WalProperties(DataSize.ofBytes(size), 1.0, 0.5);
 
-    assertTrue(new WatermarkWalCapacity(new WalSegments(root), limits).isFull());
-    new WalSegments(root).markArchived(new WalSegments(root).pending().get(0));
-    assertFalse(new WatermarkWalCapacity(new WalSegments(root), limits).isFull());
+    WalSegments segments = new WalSegments(root, Set.of(WalSink.ARCHIVE), false);
+    assertTrue(new WatermarkWalCapacity(segments, limits).isFull());
+    segments.acknowledge(segments.pending().get(0), WalSink.ARCHIVE);
+    assertFalse(new WatermarkWalCapacity(segments, limits).isFull());
+  }
+
+  @Test
+  void aSegmentCountsUntilEverySinkHasAcknowledgedIt(@TempDir Path root) throws Exception {
+    Path segment =
+        new WalFixture(root, LocalSinkProperties.Compression.NONE)
+            .segment("acme", "app", 0, 0, 50, Instant.EPOCH);
+    WalProperties limits = new WalProperties(DataSize.ofBytes(segment.toFile().length()), 1.0, 0.5);
+    WalSegments segments = new WalSegments(root, EnumSet.of(WalSink.ARCHIVE, WalSink.HOT), true);
+
+    segments.acknowledge(segments.pending().get(0), WalSink.ARCHIVE);
+    assertTrue(new WatermarkWalCapacity(segments, limits).isFull(), "the hot sink is behind");
+    segments.acknowledge(segments.pending().get(0), WalSink.HOT);
+    assertFalse(new WatermarkWalCapacity(segments, limits).isFull());
   }
 
   @Test

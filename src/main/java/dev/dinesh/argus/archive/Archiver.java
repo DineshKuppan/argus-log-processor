@@ -7,11 +7,13 @@ import com.fasterxml.jackson.databind.ObjectReader;
 import com.github.luben.zstd.ZstdIOException;
 import com.github.luben.zstd.ZstdInputStream;
 import dev.dinesh.argus.archive.ArchiveIndex.Entry;
-import dev.dinesh.argus.archive.WalSegments.Segment;
 import dev.dinesh.argus.config.ArchiveProperties;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.sink.EventTimePartition;
+import dev.dinesh.argus.wal.WalSegments;
+import dev.dinesh.argus.wal.WalSegments.Segment;
+import dev.dinesh.argus.wal.WalSink;
 import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -200,7 +202,7 @@ public class Archiver implements SmartLifecycle {
     int archived = 0;
     int skipped = 0;
     int unreadable = 0;
-    for (Segment segment : wal.pending()) {
+    for (Segment segment : wal.pending(WalSink.ARCHIVE)) {
       if (Thread.currentThread().isInterrupted()) {
         break;
       }
@@ -327,7 +329,7 @@ public class Archiver implements SmartLifecycle {
    */
   public double oldestPendingSeconds() {
     try {
-      List<Segment> pending = wal.pending(); // oldest first
+      List<Segment> pending = wal.pending(WalSink.ARCHIVE); // oldest first
       if (pending.isEmpty()) {
         return 0;
       }
@@ -460,12 +462,11 @@ public class Archiver implements SmartLifecycle {
     }
   }
 
+  /**
+   * Deleted once every routed sink has acknowledged it, or kept and marked ({@link WalSegments}).
+   */
   private void finish(Segment segment) throws IOException {
-    if (props.deleteAfterUpload()) {
-      wal.delete(segment);
-    } else {
-      wal.markArchived(segment);
-    }
+    wal.acknowledge(segment, WalSink.ARCHIVE);
   }
 
   /** A crash can leave staging files behind; nothing else uses them. */

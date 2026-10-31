@@ -6,15 +6,14 @@ import dev.dinesh.argus.archive.FileSystemObjectStore;
 import dev.dinesh.argus.archive.GcsObjectStore;
 import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
-import dev.dinesh.argus.archive.WalSegments;
-import dev.dinesh.argus.archive.WatermarkWalCapacity;
 import dev.dinesh.argus.metrics.ArgusMetrics;
+import dev.dinesh.argus.wal.WalSegments;
 import java.io.IOException;
 import java.nio.file.Path;
 import org.springframework.beans.factory.ObjectProvider;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 
@@ -24,10 +23,15 @@ import software.amazon.awssdk.services.s3.S3AsyncClient;
  * before P2. Blank must mean none here because {@link ArchiveProperties} binds it to {@code NONE}.
  */
 @Configuration
-@ConditionalOnExpression(
-    "!'${argus.archive.store:none}'.trim().isEmpty()"
-        + " && !'${argus.archive.store:none}'.trim().equalsIgnoreCase('none')")
+@Conditional(ArchiveConfig.Enabled.class)
 public class ArchiveConfig {
+
+  /** {@code argus.archive.store} names a store (not blank, not {@code none}). */
+  static final class Enabled extends StoreCondition {
+    Enabled() {
+      super("argus.archive.store");
+    }
+  }
 
   /** Closed by Spring on shutdown (inferred {@code close()}). */
   @Bean
@@ -76,24 +80,14 @@ public class ArchiveConfig {
     };
   }
 
-  /** Ingest waits on this before each segment (P2 D7): the archive is what drains the WAL. */
-  @Bean
-  WatermarkWalCapacity walCapacity(LocalSinkProperties wal, WalProperties limits) {
-    return new WatermarkWalCapacity(new WalSegments(wal.root()), limits);
-  }
-
   @Bean
   Archiver archiver(
       ObjectStore archiveStore,
       ArchiveProperties props,
-      LocalSinkProperties wal,
+      WalSegments wal,
       ObjectMapper mapper,
       ObjectProvider<ArgusMetrics> metrics) {
     return new Archiver(
-        archiveStore,
-        new WalSegments(wal.root()),
-        props,
-        mapper,
-        metrics.getIfAvailable(ArgusMetrics::noop));
+        archiveStore, wal, props, mapper, metrics.getIfAvailable(ArgusMetrics::noop));
   }
 }

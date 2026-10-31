@@ -1,4 +1,4 @@
-package dev.dinesh.argus.archive;
+package dev.dinesh.argus.wal;
 
 import dev.dinesh.argus.sink.EventTimePartition;
 import dev.dinesh.argus.sink.LocalVolumeSink;
@@ -6,6 +6,7 @@ import dev.dinesh.argus.tenant.TenantIds;
 import dev.dinesh.argus.utils.DurableFiles;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
@@ -15,25 +16,31 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
 import lombok.extern.slf4j.Slf4j;
 
 /**
- * The committed segments {@link LocalVolumeSink} wrote, read as the WAL the archiver drains. Only
- * committed {@code .ndjson} and {@code .ndjson.zst} files are listed: they appear by atomic rename,
- * so a listed segment is always complete. Uncommitted output under {@code _staging} never matches.
+ * The committed segments {@link LocalVolumeSink} wrote, read as the WAL its routed sinks drain
+ * ({@code P5_PLAN.md} D1, ADR-7). Only committed {@code .ndjson} and {@code .ndjson.zst} files are
+ * listed: they appear by atomic rename, so a listed segment is always complete. Uncommitted output
+ * under {@code _staging} never matches.
+ *
+ * <p>Each {@link WalSink} acknowledges a segment with its marker; the last acknowledgement deletes
+ * the segment and its markers, unless segments are kept ({@code delete-after-upload=false}, or no
+ * archive store: the segments are then the cold output). One instance per WAL volume, shared by its
+ * sinks: deletion is decided under its lock.
  */
 @Slf4j
 public final class WalSegments {
 
-  static final String ARCHIVED_SUFFIX = ".archived";
-
   /**
    * A segment that can't be parsed is renamed with this suffix: kept for inspection, not retried.
    */
-  static final String UNREADABLE_SUFFIX = ".unreadable";
+  public static final String UNREADABLE_SUFFIX = ".unreadable";
 
   /** {@code tenant=T/dt=D/source=S/gen=G/START-END.ndjson}, as LocalVolumeSink names segments. */
   private static final Pattern SEGMENT =
@@ -46,13 +53,33 @@ public final class WalSegments {
   static final int SCAN_ATTEMPTS = 3;
 
   private final Path root;
+  private final Set<WalSink> routed;
+  private final boolean deleteAcknowledged;
 
+  /** The archive as the only sink, deleting archived segments: the P2 setup. */
   public WalSegments(Path root) {
+    this(root, Set.of(WalSink.ARCHIVE), true);
+  }
+
+  /**
+   * @param routed the sinks that consume this WAL; at least one
+   * @param deleteAcknowledged delete a segment once every routed sink has acknowledged it
+   */
+  public WalSegments(Path root, Set<WalSink> routed, boolean deleteAcknowledged) {
+    if (routed.isEmpty()) {
+      throw new IllegalArgumentException("A WAL needs at least one sink");
+    }
     this.root = root.toAbsolutePath().normalize();
+    this.routed = Set.copyOf(routed);
+    this.deleteAcknowledged = deleteAcknowledged;
   }
 
   public Path root() {
     return root;
+  }
+
+  public Set<WalSink> routed() {
+    return routed;
   }
 
   /**
@@ -97,11 +124,23 @@ public final class WalSegments {
   }
 
   /**
-   * Committed segments not yet archived, oldest first. A walk that races the archiver's deletes is
-   * retried, so the list is complete (the WAL watermarks size it); only after {@value
-   * #SCAN_ATTEMPTS} such races is a partial list returned.
+   * Committed segments some routed sink hasn't acknowledged, oldest first: what the watermarks
+   * measure.
    */
   public List<Segment> pending() throws IOException {
+    return list(segment -> routed.stream().anyMatch(sink -> !acknowledged(segment, sink)));
+  }
+
+  /** Committed segments {@code sink} hasn't acknowledged, oldest first. */
+  public List<Segment> pending(WalSink sink) throws IOException {
+    return list(segment -> !acknowledged(segment, sink));
+  }
+
+  /**
+   * A walk that races a sink's deletes is retried, so the list is complete (the WAL watermarks size
+   * it); only after {@value #SCAN_ATTEMPTS} such races is a partial list returned.
+   */
+  private List<Segment> list(Predicate<Segment> wanted) throws IOException {
     for (int attempt = 1; ; attempt++) {
       List<Segment> segments = new ArrayList<>();
       try (Stream<Path> files =
@@ -113,7 +152,7 @@ public final class WalSegments {
         files.forEach(
             file -> {
               Segment segment = parse(file);
-              if (segment != null && !Files.exists(marker(segment))) {
+              if (segment != null && wanted.test(segment)) {
                 segments.add(segment);
               }
             });
@@ -139,16 +178,45 @@ public final class WalSegments {
     return Files.exists(segment.file());
   }
 
-  /** Removes an archived segment from the WAL. */
-  public void delete(Segment segment) throws IOException {
-    Files.deleteIfExists(segment.file());
+  /** Bytes on disk of {@code segments}; one deleted since it was listed counts 0. */
+  public static long bytes(List<Segment> segments) {
+    long total = 0;
+    for (Segment segment : segments) {
+      try {
+        total += Files.size(segment.file());
+      } catch (IOException e) {
+        // acknowledged (deleted) since the listing
+      }
+    }
+    return total;
   }
 
-  /** Keeps an archived segment in the WAL, marked so it isn't archived again. */
-  public void markArchived(Segment segment) throws IOException {
-    Path marker = marker(segment);
+  public boolean acknowledged(Segment segment, WalSink sink) {
+    return Files.exists(marker(segment, sink));
+  }
+
+  /**
+   * Records that {@code sink} is done with the segment; the last routed sink to do so deletes it
+   * (when segments aren't kept). The segment goes before its markers: a crash in between leaves
+   * markers without a segment, which nothing lists.
+   */
+  public synchronized void acknowledge(Segment segment, WalSink sink) throws IOException {
+    if (!routed.contains(sink)) {
+      throw new IllegalArgumentException(sink + " is not routed on this WAL");
+    }
+    Path marker = marker(segment, sink);
     if (!Files.exists(marker)) {
-      Files.createFile(marker);
+      try {
+        Files.createFile(marker);
+      } catch (FileAlreadyExistsException e) {
+        // acknowledged twice: same outcome
+      }
+    }
+    if (deleteAcknowledged && routed.stream().allMatch(s -> acknowledged(segment, s))) {
+      Files.deleteIfExists(segment.file());
+      for (WalSink s : routed) {
+        Files.deleteIfExists(marker(segment, s));
+      }
     }
   }
 
@@ -163,8 +231,8 @@ public final class WalSegments {
     return name.endsWith(".ndjson") || name.endsWith(".ndjson" + LocalVolumeSink.ZSTD_SUFFIX);
   }
 
-  private static Path marker(Segment segment) {
-    return segment.file().resolveSibling(segment.file().getFileName() + ARCHIVED_SUFFIX);
+  private static Path marker(Segment segment, WalSink sink) {
+    return segment.file().resolveSibling(segment.file().getFileName() + sink.markerSuffix());
   }
 
   private Segment parse(Path file) {

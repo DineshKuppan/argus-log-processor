@@ -1,4 +1,4 @@
-package dev.dinesh.argus.archive;
+package dev.dinesh.argus.wal;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
@@ -17,27 +17,28 @@ import java.util.Map;
 import org.springframework.util.unit.DataSize;
 
 /** Writes real WAL segments with {@link LocalVolumeSink}, as ingest does. */
-final class WalFixture {
+public final class WalFixture {
 
-  static final ObjectMapper MAPPER =
+  public static final ObjectMapper MAPPER =
       new ObjectMapper()
           .registerModule(new JavaTimeModule())
           .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
 
   private final LocalVolumeSink sink;
 
-  WalFixture(Path root) {
+  public WalFixture(Path root) {
     this(root, LocalSinkProperties.Compression.NONE);
   }
 
-  WalFixture(Path root, LocalSinkProperties.Compression compression) {
+  public WalFixture(Path root, LocalSinkProperties.Compression compression) {
     this.sink =
         new LocalVolumeSink(
             new LocalSinkProperties(root, DataSize.ofBytes(0), compression), MAPPER);
   }
 
   /** Commits {@code records} lines at offsets {@code start, start+10, …}; returns the file. */
-  Path segment(String tenant, String source, int gen, long start, int records, Instant firstTime)
+  public Path segment(
+      String tenant, String source, int gen, long start, int records, Instant firstTime)
       throws IOException {
     List<Instant> times = new ArrayList<>();
     for (int i = 0; i < records; i++) {
@@ -47,7 +48,7 @@ final class WalFixture {
   }
 
   /** One line per event time (null: none), at offsets {@code start, start+10, …}. */
-  Path segment(String tenant, String source, int gen, long start, List<Instant> times)
+  public Path segment(String tenant, String source, int gen, long start, List<Instant> times)
       throws IOException {
     List<LogEnvelope> envelopes = new ArrayList<>();
     for (int i = 0; i < times.size(); i++) {

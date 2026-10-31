@@ -8,6 +8,9 @@ import dev.dinesh.argus.archive.Archiver.Outcome;
 import dev.dinesh.argus.archive.Archiver.Pass;
 import dev.dinesh.argus.config.ArchiveProperties;
 import dev.dinesh.argus.config.LocalSinkProperties;
+import dev.dinesh.argus.wal.WalFixture;
+import dev.dinesh.argus.wal.WalSegments;
+import dev.dinesh.argus.wal.WalSink;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -62,7 +65,11 @@ class ArchiverTest {
 
   private Archiver archiver(ObjectStore store, ArchiveProperties props) throws IOException {
     Files.createDirectories(props.stagingDir());
-    return new Archiver(store, new WalSegments(walRoot), props, WalFixture.MAPPER);
+    return new Archiver(
+        store,
+        new WalSegments(walRoot, Set.of(WalSink.ARCHIVE), props.deleteAfterUpload()),
+        props,
+        WalFixture.MAPPER);
   }
 
   private Archiver archiver(ObjectStore store) throws IOException {
@@ -200,7 +207,7 @@ class ArchiverTest {
     assertEquals(new Pass(0, 0, 0, 0), archiver.runOnce());
 
     assertTrue(Files.exists(segment));
-    assertTrue(Files.exists(Path.of(segment + WalSegments.ARCHIVED_SUFFIX)));
+    assertTrue(Files.exists(Path.of(segment + WalSink.ARCHIVE.markerSuffix())));
     assertEquals(1, keys().size());
   }
 
