@@ -85,6 +85,17 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Bad data | A segment that isn't valid NDJSON is set aside as `.unreadable`. An event time that microseconds can't hold is archived as null and kept in `argus.timestamp` |
 | Lean dependencies | Parquet needs only the shaded `hadoop-client-api`, with no Hadoop runtime and no Avro; GCS needs only Google's auth library (6MB) instead of `google-cloud-storage` (43MB) |
 
+## Kafka as the WAL (optional)
+| Feature | Details |
+|---|---|
+| Kafka or Redpanda as the WAL | `argus.wal.store=kafka`: committed segments go to a topic, one record per line keyed by tenant and source, then a commit marker; the checkpoint advances only once Kafka has acknowledged the marker. A lost node loses at most the push spools' last `flush-interval` |
+| Sinks as consumer groups | `argus-archive` rebuilds each segment and archives it with the unchanged P2 archiver (the same object keys as the local WAL); `argus-hot` indexes records as they arrive. Each commits offsets only for what its sink has, so a restart or rebalance re-reads the rest |
+| Lag watermarks | Kafka deletes by retention, not acknowledgement: ingest pauses (429 `WAL_FULL`) when a sink's lag passes 80% of `max-lag-records`, before unarchived lines could expire |
+| Safe topic | Startup refuses a compacted topic, retention under 7 days, deletion by size or records over the topic's limit; `create-topics=true` creates a safe one |
+| Broker outages | Writers block (backpressure) for up to `max-outage` (10m); pushes keep landing in their spools meanwhile, then everything is delivered once |
+| Switching stores | At startup, local segments not yet archived or indexed are sent to the topic first |
+| Tested brokers | Apache Kafka 3.8 (KRaft) and Redpanda 24.2 |
+
 ## Suppression
 | Feature | Details |
 |---|---|
