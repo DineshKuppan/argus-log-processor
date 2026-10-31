@@ -6,7 +6,7 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
-### P4: live tail, metrics and producers' canonical lines (unmerged)
+### P4: live tail, metrics and producers' canonical lines: [#10](https://github.com/DineshKuppan/argus-log-processor/pull/10) (2026-10-30)
 Plan and results: [`P4_PLAN.md`](docs/architecture/P4_PLAN.md).
 
 #### Added

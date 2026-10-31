@@ -16,8 +16,9 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | **P2b** | GCS, WAL watermarks, WAL compression | ✅ Done (#7) |
 | **P3a** | HTTP push ingest, quotas, suppression on push | ✅ Done (#8) |
 | **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ✅ Done (#9) |
-| **P4** | Live tail, metrics, producers' canonical lines | ✅ Done |
-| **P5** | OpenSearch hot tier, optional Kafka | ⏭ Next |
+| **P4** | Live tail, metrics, producers' canonical lines | ✅ Done (#10) |
+| **P5** | OpenSearch / Elasticsearch hot tier, search API | 📝 Planned ([`P5_PLAN.md`](docs/architecture/P5_PLAN.md)) |
+| **P6** | Optional Kafka buffer, suppression by key, shared tail | Later |
 
 ## Acceptance criteria
 
@@ -34,9 +35,13 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | T9 | Cost | Cold tier ≤3TiB at 7 years (≥8x compression) | ✅ 14.6x on synthetic data; re-measure on real logs |
 
 ## Next: P5
-Hot search tier.
-- `OpenSearchSink` with ILM and tuned mappings, under a multi-sink router that acknowledges each WAL segment per sink (T5).
-- Optional Kafka buffer, with suppression partitioned by key (and a tail shared by every instance).
+Hot search tier ([`P5_PLAN.md`](docs/architecture/P5_PLAN.md)).
+- A `HotIndexer` as a second consumer of the WAL: each sink acknowledges each segment, and the last acknowledgement deletes it (ADR-7).
+- Daily indices per event day on OpenSearch 2.7+ or Elasticsearch 7.17 / 8.x, a shared index with routing plus dedicated indices for configured tenants, `flattened` / `flat_object` attributes, retention by Argus (14 days).
+- `GET /api/v2/search`: time-bounded, tenant-filtered on the server, `search_after` paging.
+- T5: p99 ingest-to-searchable ≤30s, with a 10s stream flush while a hot store is configured.
+
+Then P6: the optional Kafka buffer, with suppression partitioned by key and a tail shared by every instance.
 
 ## Open items
 - **Re-measure T9 on real logs.** The 14.6x comes from `DataSeeder`, whose vocabulary is small. Real logs will compress less.
@@ -49,12 +54,12 @@ Hot search tier.
 - **One archiver per WAL volume.** Several instances sharing one volume isn't supported.
 - **Push from real agents:** the push tests use an HTTP client; run Fluent Bit and Vector against Argus, including how they react to 429 and `Retry-After`.
 - **Exactly-once for agents:** Fluent Bit's and Vector's HTTP outputs send only static headers, so they can't send a per-batch `Idempotency-Key`; their retries are at-least-once.
-- **Push freshness:** pushed lines wait up to `argus.push.flush-interval` (1 minute) before a run; P5's hot tier (T5, ≤30s) needs a shorter interval. `observedTimestamp` is the run's time, not the receive time.
+- **Push freshness:** pushed lines wait up to `argus.push.flush-interval` (1 minute) before a run; P5's hot tier (T5, ≤30s) uses a 10s flush while a hot store is configured (P5_PLAN D7). `observedTimestamp` is the run's time, not the receive time.
 - **Exports against the real services:** Coralogix is tested against a protocol stub only; run an export against a Coralogix account, and against a production-sized Elasticsearch / OpenSearch index.
 - **Exactly-once Elasticsearch exports across an expired point in time:** hits sharing the last exported timestamp can be exported twice. A stable unique sort field (when the index has one) would make it exact.
 - **Byte-range replay:** a replay re-reads a whole file (`fromBeginning`) or an export's time range; there is no "re-ingest offsets X–Y of this file".
 - **Tail warm-up:** a restart empties the tail rings; pre-fill them from the newest WAL segments so a reconnect resumes instead of getting `reset`.
-- **Tail across instances:** each instance tails only what it ingests; a shared tail needs a Redis Stream or Kafka topic per tenant (P5).
+- **Tail across instances:** each instance tails only what it ingests; a shared tail needs a Redis Stream or Kafka topic per tenant (P6).
 - **Dead tail connections behind proxies:** a proxy that keeps a closed client's server side open holds its tail slot until `max-duration` (seen with Docker Desktop's port proxy); add an idle limit or reclaim the oldest slot at the tenant's limit.
 - **Browser tail clients:** `EventSource` can't send the API key header; a fetch-based SSE client is needed (or short-lived tail tokens).
 - **Virtual threads for tail connections** once the build is on Java 24+ (JEP 491; [`P4_PLAN.md`](docs/architecture/P4_PLAN.md) D3).

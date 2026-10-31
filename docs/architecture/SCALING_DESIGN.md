@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). **P4 implemented** (SSE live tail with per-tenant rings, Micrometer / Prometheus metrics, a parser for producers' canonical lines; see [`P4_PLAN.md`](P4_PLAN.md)). P5 is design only. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). **P4 implemented** (SSE live tail with per-tenant rings, Micrometer / Prometheus metrics, a parser for producers' canonical lines; see [`P4_PLAN.md`](P4_PLAN.md)). **P5 planned** (OpenSearch / Elasticsearch hot tier with per-sink WAL acknowledgements and a search API; see [`P5_PLAN.md`](P5_PLAN.md)); Kafka moves to P6. Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents
@@ -409,6 +409,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **T:** Isolation without shard explosion.
 - **A:** Index per tenant (strong isolation, many shards) vs. shared index + routing + filtered aliases (efficient, weaker isolation) vs. a hybrid.
   **Choice:** Hybrid. Tenants above a size threshold (e.g. >1GB/day) get dedicated indices; all others share one index with routing.
+  **Refined in P5** ([`P5_PLAN.md`](P5_PLAN.md) D3, D4): dedicated tenants are configured (`argus.hot.dedicated-tenants`), not measured; indices are daily per event day (`<prefix>-YYYY.MM.DD-shared`, `…-t-<tenant>`), so a re-indexed line always lands in the same index; Argus deletes indices past retention instead of ILM / ISM policies, one implementation for both engines. Searches always add the caller's tenant filter on the server.
 - **R:** Shard count stays below the cluster's per-node guidance; a cross-tenant query returns 0 rows in tests.
 
 ### ADR-5: Checkpoint store
@@ -417,6 +418,13 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **A:** Atomic-rename file per source (trivial, enough for one writer) vs. RocksDB (fast at scale, but a native dependency) vs. Kafka committed offsets (only for Kafka sources).
   **Choice:** File-based now; Kafka-native offsets for `KafkaSource`.
 - **R:** Kill -9 during processing → restart resumes at the last acknowledged offset, with no gaps and only idempotent duplicates.
+
+### ADR-7: Several sinks on one WAL
+- **S:** Since P2 the committed local segments are a WAL with one consumer (the archiver), which deletes a segment once it is archived. P5 adds a hot tier (OpenSearch / Elasticsearch).
+- **T:** Two sinks that fail, retry and catch up independently; no line lost or duplicated; the WAL bound (watermarks) still holds; guardrail 3 (delete only after every routed sink acknowledges).
+- **A:** Dual-write from the pipeline's writer, checkpointing after both acknowledge (the slowest sink paces ingest; the P0 checkpoint protocol changes) vs. a router that reads each segment once and feeds both (the sinks advance together) vs. **independent consumers of the committed WAL, each acknowledging each segment** (a marker per sink; the last acknowledgement deletes the segment).
+  **Choice:** independent consumers: Kafka consumer groups' shape on a local log, so P6 can swap the WAL for a topic. Watermarks count segments some routed sink hasn't acknowledged, so a hot-tier outage pauses ingest only at the high watermark, as an archive outage does.
+- **R:** With the engine paused under push load, ingest and archiving continue; afterwards the index holds exactly the acknowledged lines (`HotOutageIT`, [`P5_PLAN.md`](P5_PLAN.md) §5).
 
 ### ADR-6: Java version
 - **S:** Java 17 (pom).
@@ -450,7 +458,8 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 | **P2** | `ParquetArchiveWriter`, `S3Sink`, `GcsSink`, WAL + watermarks, Resilience4j | Phase 1 / 3 | T3, T9 |
 | **P3** | P3a: HTTP push ingest via a durable spool (429 backpressure), `QuotaService`, suppression on push. P3b: ES / Coralogix export sources, replay lane | Phase 2 | T8, tenant isolation tests |
 | **P4** | Live tail (SSE), canonical log lines (Argus's own + ingesting producers'), Micrometer metrics | Phase 3 | T7 |
-| **P5** | `OpenSearchSink` hot tier with ILM and mappings; optional Kafka buffer + partition-by-key suppression; HPA on consumer lag | Phase 2 / 3, Deployment | T5 |
+| **P5** | Hot tier (OpenSearch / Elasticsearch) as a second WAL consumer (ADR-7), daily indices with tuned mappings and retention, `GET /api/v2/search` | Phase 2 / 3 | T5 |
+| **P6** | Optional Kafka buffer + partition-by-key suppression, a tail shared across instances; HPA on consumer lag | Phase 3, Deployment | — |
 
 ### Verification approach per phase
 - **Unit:** each adapter against its port contract (shared contract test per port, so adapters are substitutable, per LSP).
