@@ -5,15 +5,14 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import dev.dinesh.argus.config.ExportProperties;
+import dev.dinesh.argus.engine.SearchEngineClient;
+import dev.dinesh.argus.engine.SearchEngineClient.Flavor;
+import dev.dinesh.argus.engine.SearchEngineClient.Response;
 import java.io.IOException;
-import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
 
@@ -33,40 +32,28 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public final class ElasticsearchExportSource implements ExportSource {
 
-  enum Flavor {
-    ELASTICSEARCH,
-    OPENSEARCH
-  }
-
   private static final String CONTEXT_MISSING = "search_context_missing_exception";
   private static final int ERROR_CHARS = 300;
   private static final String ES_DATE_FORMAT = "strict_date_optional_time_nanos";
   private static final String OS_DATE_FORMAT = "strict_date_optional_time";
 
   private final ExportProperties.Source settings;
-  private final HttpClient http;
+  private final SearchEngineClient client;
   private final ObjectMapper mapper;
-  private final String base;
-  private final String authorization;
-  private volatile Flavor flavor;
 
   public ElasticsearchExportSource(
       ExportProperties.Source settings, HttpClient http, ObjectMapper mapper) {
     this.settings = settings;
-    this.http = http;
     this.mapper = mapper;
-    String url = settings.url().toString();
-    this.base = url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
-    if (settings.apiKey() != null && !settings.apiKey().isBlank()) {
-      this.authorization = "ApiKey " + settings.apiKey();
-    } else if (settings.username() != null && !settings.username().isBlank()) {
-      String pair =
-          settings.username() + ":" + (settings.password() == null ? "" : settings.password());
-      this.authorization =
-          "Basic " + Base64.getEncoder().encodeToString(pair.getBytes(StandardCharsets.UTF_8));
-    } else {
-      this.authorization = null;
-    }
+    this.client =
+        new SearchEngineClient(
+            settings.url(),
+            settings.apiKey(),
+            settings.username(),
+            settings.password(),
+            settings.requestTimeout(),
+            http,
+            mapper);
   }
 
   @Override
@@ -80,7 +67,7 @@ public final class ElasticsearchExportSource implements ExportSource {
   @Override
   public String describe() {
     return "elasticsearch "
-        + base
+        + client.base()
         + " index="
         + settings.index()
         + " timestamp="
@@ -95,7 +82,7 @@ public final class ElasticsearchExportSource implements ExportSource {
             ? mapper.createObjectNode().put("from", query.from().toString())
             : cursor.position().deepCopy();
     String pit = cursor == null || cursor.session() == null ? openPit(f) : cursor.session();
-    HttpResponse<String> response = search(f, query, position, pit);
+    Response response = search(f, query, position, pit);
     if (contextMissing(response)) {
       log.info("Export source {}: point in time expired; opening a new one", settings.name());
       pit = openPit(f);
@@ -146,7 +133,7 @@ public final class ElasticsearchExportSource implements ExportSource {
         body.put("id", cursor.session());
         path = "/_pit";
       }
-      send(request(path).method("DELETE", json(body)));
+      client.json("DELETE", path, body);
     } catch (IOException e) {
       log.debug(
           "Export source {}: closing a point in time failed: {}", settings.name(), e.toString());
@@ -156,19 +143,10 @@ public final class ElasticsearchExportSource implements ExportSource {
   }
 
   Flavor flavor() throws IOException, InterruptedException {
-    Flavor f = flavor;
-    if (f == null) {
-      JsonNode root = parse(send(request("/").GET()), "GET /");
-      f =
-          "opensearch".equals(root.path("version").path("distribution").asText())
-              ? Flavor.OPENSEARCH
-              : Flavor.ELASTICSEARCH;
-      flavor = f;
-    }
-    return f;
+    return client.flavor();
   }
 
-  private HttpResponse<String> search(Flavor f, Query query, ObjectNode position, String pit)
+  private Response search(Flavor f, Query query, ObjectNode position, String pit)
       throws IOException, InterruptedException {
     ObjectNode body = mapper.createObjectNode();
     body.put("size", settings.pageSize());
@@ -196,7 +174,7 @@ public final class ElasticsearchExportSource implements ExportSource {
     if (position.has("after")) {
       body.set("search_after", position.get("after"));
     }
-    return send(request("/_search").POST(json(body)));
+    return client.json("POST", "/_search", body);
   }
 
   private String openPit(Flavor f) throws IOException, InterruptedException {
@@ -206,9 +184,7 @@ public final class ElasticsearchExportSource implements ExportSource {
         f == Flavor.OPENSEARCH
             ? "/" + index + "/_search/point_in_time?keep_alive=" + keepAlive
             : "/" + index + "/_pit?keep_alive=" + keepAlive;
-    JsonNode body =
-        parse(
-            send(request(path).POST(HttpRequest.BodyPublishers.noBody())), "open a point in time");
+    JsonNode body = parse(client.send("POST", path, null, null), "open a point in time");
     JsonNode id = body.get(f == Flavor.OPENSEARCH ? "pit_id" : "id");
     if (id == null || id.asText().isEmpty()) {
       throw new IOException("Opening a point in time returned no id");
@@ -220,44 +196,27 @@ public final class ElasticsearchExportSource implements ExportSource {
     return Math.max(1, settings.keepAlive().toSeconds()) + "s";
   }
 
-  private boolean contextMissing(HttpResponse<String> response) {
-    return response.statusCode() >= 400 && response.body().contains(CONTEXT_MISSING);
+  private boolean contextMissing(Response response) {
+    return response.status() >= 400 && response.body().contains(CONTEXT_MISSING);
   }
 
   /** The body as JSON if the call succeeded; otherwise a transient or permanent failure. */
-  private JsonNode parse(HttpResponse<String> response, String what) throws IOException {
-    int status = response.statusCode();
-    if (status >= 200 && status < 300) {
+  private JsonNode parse(Response response, String what) throws IOException {
+    if (response.ok()) {
       return mapper.readTree(response.body());
     }
-    String detail = response.body();
-    detail = detail.length() > ERROR_CHARS ? detail.substring(0, ERROR_CHARS) + "…" : detail;
     String message =
-        "Export source " + settings.name() + ": " + what + " answered " + status + ": " + detail;
-    if (status == 429 || status >= 500) {
+        "Export source "
+            + settings.name()
+            + ": "
+            + what
+            + " answered "
+            + response.status()
+            + ": "
+            + response.excerpt(ERROR_CHARS);
+    if (response.transientFailure()) {
       throw new IOException(message);
     }
     throw new PermanentExportException(message);
-  }
-
-  private HttpRequest.Builder request(String path) {
-    HttpRequest.Builder builder =
-        HttpRequest.newBuilder(URI.create(base + path))
-            .timeout(settings.requestTimeout())
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-    if (authorization != null) {
-      builder.header("Authorization", authorization);
-    }
-    return builder;
-  }
-
-  private HttpRequest.BodyPublisher json(JsonNode body) throws IOException {
-    return HttpRequest.BodyPublishers.ofByteArray(mapper.writeValueAsBytes(body));
-  }
-
-  private HttpResponse<String> send(HttpRequest.Builder request)
-      throws IOException, InterruptedException {
-    return http.send(request.build(), HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
   }
 }
