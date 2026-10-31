@@ -37,7 +37,7 @@ Argus keeps every line, but the only ways to read them back are the live tail (n
   - **Acknowledgement:** an empty marker file per sink next to the segment, `<segment>.archived` (the existing marker, so upgrades keep their state) and `<segment>.indexed`, created with `DurableFiles`. After writing its marker, a sink calls `WalSegments.release(segment)`, which (under one lock per WAL) deletes the segment and its markers once every routed sink has acknowledged it. With `delete-after-upload=false`, or without an archive store (the segments are then the cold output), segments are never deleted, only marked.
   - **Capacity:** `WatermarkWalCapacity` counts the bytes of segments that some routed sink hasn't acknowledged. A hot-tier outage therefore grows the WAL and, after the high watermark (24GB, about 2.4 days at 10GB/day), pauses ingest with 429s, exactly as an archive outage does today. How long that takes depends on the WAL's compression: NDJSON envelopes are ~4x the raw input (40GB/day at the target), so 24GB is ~14 hours; with `argus.sink.local.compression=zstd` (~10x smaller than NDJSON) it is ~6 days. P5 recommends `zstd` with a hot store, as P2 does with an archive store. That follows guardrail 3; the alternative (skip the hot copy past a lag limit, since the cold tier has it) is noted in §8.
   - **Superseded segments** (a crash between a segment's commit and its checkpoint; P2 §3): the replacement has the same start offset and the same `eventId`s for the same lines, so the hot sink just indexes it again (`_id` overwrites). The hot sink needs nothing like `ArchiveIndex`.
-- **Result:** each sink has its own lag (`argus_wal_pending_bytes{sink}`), backoff and canonical lines. Ingest pauses only when the WAL bound is reached, whichever sink is behind.
+- **Result:** each sink has its own lag (`argus_wal_sink_pending_bytes{sink}`), backoff and canonical lines. Ingest pauses only when the WAL bound is reached, whichever sink is behind.
 
 ### D2. Indexing: one `HotIndexer` thread, `_bulk` with `op_type=index` and `_id = eventId`
 - **Situation:** every WAL line is a `LogEnvelope` with a deterministic `eventId` (guardrail 3). 4,150 lines/s at ~300 bytes is ~1.2MB/s; one node of either engine indexes tens of MB/s.
@@ -194,7 +194,7 @@ argus.search.timeout=10s
 | `argus_hot_documents_total` | counter | `tenant`, `outcome` (`indexed`, `rejected`, `outside_retention`) |
 | `argus_hot_bulk_seconds` | timer | `outcome` |
 | `argus_hot_segments_total` | counter | `outcome` |
-| `argus_wal_pending_bytes` | gauge | `sink` (`archive`, `hot`); the existing untagged `argus_wal_pending` stays (the watermark's measure: not acknowledged by every sink) |
+| `argus_wal_sink_pending_bytes` | gauge | `sink` (`archive`, `hot`); the existing untagged `argus_wal_pending_bytes` stays (the watermark's measure: not acknowledged by every sink). A tagged and an untagged meter can't share a Prometheus name |
 | `argus_hot_lag_seconds` | gauge | Age of the oldest segment the hot sink hasn't acknowledged |
 | `argus_search_requests_seconds` | timer | `tenant`, `outcome` |
 
@@ -249,4 +249,16 @@ argus.search.timeout=10s
 
 ## 9. Results
 
-To be filled in after step 7.
+`HotTierIT` (tag `load`): the application in its own 256MB JVM, pushed to over HTTP, indexing into an OpenSearch 2.17 or Elasticsearch 8.15 container (512MB engine heap, one node, no replicas). "2 CPUs" is `-Dargus.load.docker-cpus=2`: Argus in a container with 2 CPUs and 4GB (the engine runs beside it, as the design's separate cluster); "host" is a 10-core laptop.
+
+| Check | Result |
+|---|---|
+| **T5**: push at 4,150 lines/s for 2 minutes, a probe line every second; from its 202 to `GET /api/v2/search` finding it (polled every 250ms) | **2 CPUs, OpenSearch: p50 11.8s, p99 20.1s, max 21.1s** (119 of 119 probes); host, Elasticsearch: p50 9.6s, p99 17.8s; host, OpenSearch: p50 9.8s, p99 17.7s. Peak heap 218MB of 256MB |
+| Engine paused 60s under 2,000 lines/s of pushes, with a filesystem archive (2 CPUs, OpenSearch) | Push went on (120,400 lines acknowledged during the outage) and so did archiving (24 segments); the index held exactly the 200,800 acknowledged lines 31.6s after the engine returned (20s of that still under load), and no more 3s later |
+| `kill -9` while indexing (host, OpenSearch), 160,000 lines with `Idempotency-Key`s | Killed with 41,222 indexed; after the restart exactly 160,000 documents, none twice |
+| Mapping disk saving: 200,000 lines, the engine's default dynamic mapping vs D5's, after a force-merge | **OpenSearch 65.6% smaller** (119.0MB → 41.0MB); **Elasticsearch 37.4% smaller** (65.5MB → 41.0MB) |
+
+- **T5 is met with a third of the budget to spare:** the 10s flush is most of the latency (p50 ≈ half a flush interval + run + bulk + the 5s refresh), as D7's budget predicted; the tail (p99 20s) is a full flush plus a refresh.
+- **The design's "~35%" holds, and depends on the engine:** OpenSearch's dynamic mapping indexes every string twice (`text` plus a `keyword` sub-field) with the default codec, so the strict mapping saves two thirds; Elasticsearch 8's defaults are leaner, and the saving is a little over a third. Synthetic lines repeat a small vocabulary, so re-measure on real logs.
+- **ADR-7 holds under an outage:** the archive kept draining while the hot tier was down, and nothing was lost or duplicated in the index once it caught up. A paused engine holds bulk requests until `request-timeout`; the outage test used 5s (default 30s) so the indexer backs off promptly.
+- **Not measured:** a file job's freshness (the T7-style file probe needs the file inside the 2-CPU container; files commit at 500MB segments and at the end of each run, so a file job is searchable once its run or segment commits), searches under concurrent load (each probe search took milliseconds), and the hot tier on a managed cluster.

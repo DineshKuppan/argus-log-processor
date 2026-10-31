@@ -41,6 +41,18 @@ public final class EngineContainers {
     return "http://" + c.getHost() + ":" + c.getMappedPort(9200);
   }
 
+  /** The engine's port on the host (as {@code host.docker.internal:port} from other containers). */
+  public static synchronized int port(Flavor flavor) {
+    url(flavor);
+    return STARTED.get(flavor).getMappedPort(9200);
+  }
+
+  /** For {@code docker pause} / {@code unpause} in outage tests. */
+  public static synchronized String containerId(Flavor flavor) {
+    url(flavor);
+    return STARTED.get(flavor).getContainerId();
+  }
+
   public static SearchEngineClient client(Flavor flavor) {
     return new SearchEngineClient(
         URI.create(url(flavor)),
