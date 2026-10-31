@@ -11,6 +11,7 @@ import dev.dinesh.argus.config.ArchiveProperties;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.sink.EventTimePartition;
+import dev.dinesh.argus.utils.Backoff;
 import dev.dinesh.argus.wal.WalSegments;
 import dev.dinesh.argus.wal.WalSegments.Segment;
 import dev.dinesh.argus.wal.WalSink;
@@ -29,7 +30,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.SmartLifecycle;
@@ -80,7 +80,6 @@ public class Archiver implements SmartLifecycle {
   /** Bounds the objects a segment of out-of-order data is split into. */
   static final int MAX_OBJECTS_PER_SEGMENT = 24;
 
-  private static final int MAX_BACKOFF_DOUBLINGS = 30;
   private static final int READ_BUFFER = 256 * 1024;
   private static final long STOP_TIMEOUT_SECONDS = 30;
 
@@ -116,6 +115,19 @@ public class Archiver implements SmartLifecycle {
     this.props = props;
     this.mapper = mapper;
     this.envelopes = mapper.readerFor(LogEnvelope.class);
+  }
+
+  /** The WAL this archiver drains (with Kafka, the consumer's staging root, P6 D3). */
+  public Path walRoot() {
+    return wal.root();
+  }
+
+  /**
+   * Removes staged Parquet files a crash left. {@link #start} does it; a caller that drives {@link
+   * #archive} itself (the Kafka archive consumer) calls it first.
+   */
+  public void prepare() throws IOException {
+    cleanStaging();
   }
 
   @Override
@@ -223,12 +235,7 @@ public class Archiver implements SmartLifecycle {
    * random wait between 50% and 100% of that.
    */
   Duration backoff(int failures) {
-    long initial = props.retryInitial().toMillis();
-    long max = props.retryMax().toMillis();
-    int doublings = Math.min(Math.max(failures - 1, 0), MAX_BACKOFF_DOUBLINGS);
-    long base = initial > (max >> doublings) ? max : Math.min(max, initial << doublings);
-    long half = Math.max(base / 2, 1);
-    return Duration.ofMillis(half + ThreadLocalRandom.current().nextLong(half + 1));
+    return Backoff.jittered(props.retryInitial(), props.retryMax(), failures);
   }
 
   /** One object of a segment, staged locally; named once its byte range is known. */
@@ -242,7 +249,8 @@ public class Archiver implements SmartLifecycle {
     }
   }
 
-  Outcome archive(Segment segment) {
+  /** Archives one committed segment, then acknowledges it ({@link WalSink#ARCHIVE}). */
+  public Outcome archive(Segment segment) {
     long started = System.nanoTime();
     List<Part> parts = new ArrayList<>();
     Outcome outcome = null;
