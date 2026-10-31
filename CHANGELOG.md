@@ -27,6 +27,7 @@ Plan and results: [`P5_PLAN.md`](docs/architecture/P5_PLAN.md).
 - **T5 (2 CPUs, 4,150 lines/s pushed, OpenSearch):** from the 202 to the search API finding the line, p50 11.8s, p99 20.1s (≤30s). Elasticsearch on the host: p99 17.8s.
 - **Hot-tier outage (60s, 2 CPUs):** push and archiving went on; afterwards the index held exactly the 200,800 acknowledged lines. **`kill -9` while indexing:** exactly 160,000 documents for 160,000 lines.
 - **Mapping:** 65.6% smaller on disk than OpenSearch's default dynamic mapping, 37.4% than Elasticsearch's (200,000 synthetic lines).
+- **Earlier load tests after the per-sink WAL change:** T1 push 133k lines/s end to end (two runs; a first run during container shutdown gave 111k); T3 push backpressure: 218 429s, the WAL drained 20.7s after the outage, all 1M lines archived; T3 file ingest: paused 48s at the watermark during a 30s outage, then all 5.4M lines archived; T4 `kill -9`: none of 400,000 lines lost or split.
 
 ### P4: live tail, metrics and producers' canonical lines: [#10](https://github.com/DineshKuppan/argus-log-processor/pull/10) (2026-10-30)
 Plan and results: [`P4_PLAN.md`](docs/architecture/P4_PLAN.md).
