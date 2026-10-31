@@ -6,9 +6,11 @@ import dev.dinesh.argus.hot.HotIndexer;
 import dev.dinesh.argus.hot.HotIndices;
 import dev.dinesh.argus.hot.HotTemplates;
 import dev.dinesh.argus.metrics.ArgusMetrics;
+import dev.dinesh.argus.search.SearchService;
 import dev.dinesh.argus.wal.WalSegments;
 import java.io.IOException;
 import java.net.http.HttpClient;
+import java.time.Clock;
 import java.time.Duration;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
@@ -74,5 +76,15 @@ public class HotConfig {
       ObjectProvider<ArgusMetrics> metrics) {
     return new HotIndexer(
         hotClient, wal, indices, props, metrics.getIfAvailable(ArgusMetrics::noop));
+  }
+
+  @Bean
+  SearchService searchService(
+      SearchEngineClient hotClient,
+      HotIndices indices,
+      SearchProperties props,
+      ObjectProvider<ArgusMetrics> metrics) {
+    return new SearchService(
+        hotClient, indices, props, metrics.getIfAvailable(ArgusMetrics::noop), Clock.systemUTC());
   }
 }

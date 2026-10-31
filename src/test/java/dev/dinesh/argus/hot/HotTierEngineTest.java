@@ -7,11 +7,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import dev.dinesh.argus.config.HotProperties;
+import dev.dinesh.argus.config.SearchProperties;
 import dev.dinesh.argus.engine.EngineContainers;
 import dev.dinesh.argus.engine.SearchEngineClient;
 import dev.dinesh.argus.engine.SearchEngineClient.Flavor;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
+import dev.dinesh.argus.search.SearchHit;
+import dev.dinesh.argus.search.SearchQuery;
+import dev.dinesh.argus.search.SearchResult;
+import dev.dinesh.argus.search.SearchService;
 import dev.dinesh.argus.wal.WalFixture;
 import dev.dinesh.argus.wal.WalSegments;
 import dev.dinesh.argus.wal.WalSink;
@@ -224,5 +229,160 @@ class HotTierEngineTest {
     assertEquals(50, count(client, indices.pattern(), "{\"query\":{\"match_all\":{}}}"));
     assertEquals(
         50, count(client, indices.pattern(), "{\"query\":{\"term\":{\"tenant_id\":\"acme\"}}}"));
+  }
+
+  private static SearchService search(SearchEngineClient client, HotIndices indices) {
+    return new SearchService(
+        client,
+        indices,
+        SearchProperties.defaults(),
+        ArgusMetrics.noop(),
+        Clock.fixed(NOW, ZoneOffset.UTC));
+  }
+
+  private static SearchQuery query(
+      String tenant, String q, String level, List<String> attr, Integer size) {
+    return SearchQuery.parse(
+        tenant,
+        "2026-10-31T00:00:00Z",
+        "2026-11-01T11:00:00Z",
+        q,
+        level,
+        null,
+        null,
+        attr,
+        size,
+        Instant.parse("2026-10-18T00:00:00Z"),
+        SearchProperties.defaults());
+  }
+
+  private static List<String> ids(SearchResult result) {
+    return result.hits().stream().map(SearchHit::eventId).toList();
+  }
+
+  @ParameterizedTest
+  @EnumSource(Flavor.class)
+  void aTenantNeverFindsAnotherTenantsLines(Flavor flavor) throws Exception {
+    SearchEngineClient client = EngineContainers.client(flavor);
+    HotProperties props = props(flavor, prefix(), List.of());
+    HotIndices indices = new HotIndices(props);
+    new HotTemplates(client, indices, props).install();
+    bulk(
+        client,
+        indices,
+        List.of(
+            line("acme", "a1", NOW.minusSeconds(60), "payment failed", Map.of("order", "o-1")),
+            line(
+                "globex",
+                "g1",
+                NOW.minusSeconds(30),
+                "payment failed secret",
+                Map.of("order", "o-1")),
+            line(
+                "globex",
+                "g2",
+                NOW.minusSeconds(20),
+                "tenant_id acme",
+                Map.of("tenant_id", "acme"))));
+    SearchService search = search(client, indices);
+
+    assertEquals(
+        List.of("a1"), ids(search.search(query("acme", "payment", null, null, null), null)));
+    assertEquals(List.of(), ids(search.search(query("acme", "secret", null, null, null), null)));
+    assertEquals(
+        List.of("a1"),
+        ids(search.search(query("acme", null, null, List.of("order:o-1"), null), null)));
+    assertEquals(
+        List.of(),
+        ids(search.search(query("acme", null, null, List.of("tenant_id:acme"), null), null)),
+        "an attribute named tenant_id is globex's own attribute");
+    assertEquals(
+        List.of(),
+        ids(search.search(query("acme", "tenant_id:globex | *", null, null, null), null)));
+    assertEquals(
+        List.of("g2", "g1"), ids(search.search(query("globex", null, null, null, null), null)));
+  }
+
+  @ParameterizedTest
+  @EnumSource(Flavor.class)
+  void pagesCoverLinesSharingATimestampExactlyOnce(Flavor flavor) throws Exception {
+    SearchEngineClient client = EngineContainers.client(flavor);
+    HotProperties props = props(flavor, prefix(), List.of());
+    HotIndices indices = new HotIndices(props);
+    new HotTemplates(client, indices, props).install();
+    List<LogEnvelope> lines = new java.util.ArrayList<>();
+    for (int i = 0; i < 7; i++) {
+      lines.add(
+          line("acme", "e" + i, NOW.minusSeconds(i < 5 ? 10 : i), "same second " + i, Map.of()));
+    }
+    bulk(client, indices, lines);
+    SearchService search = search(client, indices);
+    SearchQuery query = query("acme", null, null, null, 3);
+
+    List<String> seen = new java.util.ArrayList<>();
+    String cursor = null;
+    int pages = 0;
+    do {
+      SearchResult page = search.search(query, cursor);
+      seen.addAll(ids(page));
+      cursor = page.next();
+      pages++;
+    } while (cursor != null && pages < 10);
+
+    assertEquals(7, seen.size(), seen.toString());
+    assertEquals(7, seen.stream().distinct().count());
+    assertEquals(
+        List.of("e5", "e6", "e4", "e3", "e2", "e1", "e0"),
+        seen,
+        "newest first, ties by event_id desc");
+  }
+
+  @ParameterizedTest
+  @EnumSource(Flavor.class)
+  void filtersAndADedicatedTenantsOwnIndices(Flavor flavor) throws Exception {
+    SearchEngineClient client = EngineContainers.client(flavor);
+    String prefix = prefix();
+    HotProperties shared = props(flavor, prefix, List.of());
+    HotProperties dedicated = props(flavor, prefix, List.of("bigco"));
+    new HotTemplates(client, new HotIndices(shared), shared).install();
+    // Yesterday bigco shared the index; today it has its own.
+    bulk(
+        client,
+        new HotIndices(shared),
+        List.of(line("bigco", "old", Instant.parse("2026-10-31T12:00:00Z"), "warm up", Map.of())));
+    LogEnvelope info =
+        new LogEnvelope(
+            "info",
+            "bigco",
+            NOW.minusSeconds(5),
+            NOW,
+            "INFO",
+            9,
+            "all good",
+            null,
+            null,
+            null,
+            null,
+            new LogEnvelope.Source("web", 0, 0, "json"));
+    bulk(
+        client,
+        new HotIndices(dedicated),
+        List.of(
+            line("bigco", "new", NOW.minusSeconds(10), "disk full", Map.of("http_status", 507)),
+            info));
+    assertTrue(client.get("/" + prefix + "-2026.11.01-t-bigco").ok());
+    SearchService search = search(client, new HotIndices(dedicated));
+
+    assertEquals(
+        List.of("info", "new", "old"),
+        ids(search.search(query("bigco", null, null, null, null), null)));
+    assertEquals(
+        List.of("new", "old"), ids(search.search(query("bigco", null, "error", null, null), null)));
+    assertEquals(
+        List.of("new"),
+        ids(search.search(query("bigco", "disk", null, List.of("http_status:507"), null), null)));
+    SearchHit hit = search.search(query("bigco", "disk", null, null, null), null).hits().get(0);
+    assertEquals(507, hit.attributes().get("http_status"), "types from _source");
+    assertEquals("api", hit.resource().get("service.name"));
   }
 }

@@ -31,6 +31,7 @@ class ArchiveConfigTest {
     ArchiveProperties.class,
     HotProperties.class,
     LocalSinkProperties.class,
+    SearchProperties.class,
     WalProperties.class
   })
   static class Base {
