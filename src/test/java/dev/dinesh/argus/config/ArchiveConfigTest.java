@@ -8,6 +8,7 @@ import dev.dinesh.argus.archive.FileSystemObjectStore;
 import dev.dinesh.argus.archive.GcsObjectStore;
 import dev.dinesh.argus.archive.ObjectStore;
 import dev.dinesh.argus.archive.S3ObjectStore;
+import dev.dinesh.argus.hot.HotIndexer;
 import dev.dinesh.argus.sink.WalCapacity;
 import dev.dinesh.argus.wal.WalSegments;
 import dev.dinesh.argus.wal.WalSink;
@@ -41,7 +42,7 @@ class ArchiveConfigTest {
 
   private ApplicationContextRunner runner() {
     return new ApplicationContextRunner()
-        .withUserConfiguration(Base.class, WalConfig.class, ArchiveConfig.class)
+        .withUserConfiguration(Base.class, WalConfig.class, ArchiveConfig.class, HotConfig.class)
         .withPropertyValues(
             "argus.sink.local.root=" + dir.resolve("wal"),
             "argus.archive.staging-dir=" + dir.resolve("staging"));
@@ -56,17 +57,19 @@ class ArchiveConfigTest {
               assertThat(context).doesNotHaveBean(Archiver.class);
               assertThat(context).doesNotHaveBean(ObjectStore.class);
               assertThat(context).doesNotHaveBean(WalCapacity.class);
+              assertThat(context).doesNotHaveBean(HotIndexer.class);
             });
   }
 
   @Test
   void theWalIsRoutedToEveryConfiguredSink() {
     runner()
-        .withPropertyValues("argus.hot.store=opensearch", "argus.hot.url=http://localhost:9200")
+        .withPropertyValues("argus.hot.store=opensearch", "argus.hot.url=http://127.0.0.1:1")
         .run(
             context -> {
               assertThat(context).hasNotFailed();
               assertThat(context).doesNotHaveBean(Archiver.class);
+              assertThat(context).hasSingleBean(HotIndexer.class); // unreachable: only warns
               WalSegments wal = context.getBean(WalSegments.class);
               assertThat(wal.routed()).containsExactly(WalSink.HOT);
               assertThat(context).hasSingleBean(WalCapacity.class);
@@ -74,7 +77,7 @@ class ArchiveConfigTest {
     runner()
         .withPropertyValues(
             "argus.hot.store=elasticsearch",
-            "argus.hot.url=http://localhost:9200",
+            "argus.hot.url=http://127.0.0.1:1",
             "argus.archive.store=filesystem",
             "argus.archive.filesystem.root=" + dir.resolve("archive"))
         .run(

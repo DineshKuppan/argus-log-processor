@@ -1,6 +1,7 @@
 package dev.dinesh.argus.config;
 
 import dev.dinesh.argus.archive.Archiver;
+import dev.dinesh.argus.hot.HotIndexer;
 import dev.dinesh.argus.ingest.IngestJobService;
 import dev.dinesh.argus.ingest.ReplayLane;
 import dev.dinesh.argus.ingest.StreamRegistry;
@@ -55,6 +56,7 @@ public class MetricsConfig {
       ObjectProvider<WatermarkWalCapacity> wal,
       ObjectProvider<WalSegments> walSegments,
       ObjectProvider<Archiver> archiver,
+      ObjectProvider<HotIndexer> hotIndexer,
       SuppressionStore suppressionStore,
       QuotaStore quotaStore,
       TailHub tail) {
@@ -97,6 +99,12 @@ public class MetricsConfig {
               Gauge.builder("argus.archive.oldest.pending", a, Archiver::oldestPendingSeconds)
                   .baseUnit("seconds")
                   .description("Age of the oldest WAL segment not yet archived; 0 when none")
+                  .register(registry));
+      hotIndexer.ifAvailable(
+          h ->
+              Gauge.builder("argus.hot.lag", h, HotIndexer::lagSeconds)
+                  .baseUnit("seconds")
+                  .description("Age of the oldest WAL segment not yet indexed; 0 when none")
                   .register(registry));
       if (suppressionStore instanceof RedisSuppressionStore redis) {
         FunctionCounter.builder(

@@ -10,15 +10,25 @@ import dev.dinesh.argus.config.HotProperties;
 import dev.dinesh.argus.engine.EngineContainers;
 import dev.dinesh.argus.engine.SearchEngineClient;
 import dev.dinesh.argus.engine.SearchEngineClient.Flavor;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
+import dev.dinesh.argus.wal.WalFixture;
+import dev.dinesh.argus.wal.WalSegments;
+import dev.dinesh.argus.wal.WalSink;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -185,5 +195,34 @@ class HotTierEngineTest {
     assertTrue(client.get("/" + p + "-2026.10.18-shared").ok(), "the oldest day kept");
     assertTrue(client.get("/" + p + "-2026.10.01-shared-copy").ok(), "not a name it parses");
     assertEquals(List.of(), new HotRetention(client, indices).runOnce(NOW));
+  }
+
+  @ParameterizedTest
+  @EnumSource(Flavor.class)
+  void aSegmentIndexedTwiceIsStoredOnce(Flavor flavor, @TempDir Path wal) throws Exception {
+    SearchEngineClient client = EngineContainers.client(flavor);
+    HotProperties props = props(flavor, prefix(), List.of());
+    HotIndices indices = new HotIndices(props);
+    Path segment =
+        new WalFixture(wal).segment("acme", "app", 0, 0, 50, Instant.parse("2026-10-31T12:00:00Z"));
+    WalSegments segments = new WalSegments(wal, Set.of(WalSink.HOT), false);
+    HotIndexer indexer =
+        new HotIndexer(
+            client,
+            segments,
+            indices,
+            props,
+            ArgusMetrics.noop(),
+            Clock.fixed(NOW, ZoneOffset.UTC),
+            Duration.ofMillis(10));
+
+    assertTrue(indexer.runOnce());
+    Files.delete(Path.of(segment + WalSink.HOT.markerSuffix())); // as if the marker was lost
+    assertTrue(indexer.runOnce());
+
+    client.send("POST", "/" + indices.pattern() + "/_refresh", null, null);
+    assertEquals(50, count(client, indices.pattern(), "{\"query\":{\"match_all\":{}}}"));
+    assertEquals(
+        50, count(client, indices.pattern(), "{\"query\":{\"term\":{\"tenant_id\":\"acme\"}}}"));
   }
 }

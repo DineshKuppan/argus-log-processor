@@ -1,6 +1,7 @@
 package dev.dinesh.argus.ingest;
 
 import dev.dinesh.argus.checkpoint.CheckpointStore;
+import dev.dinesh.argus.config.HotProperties;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.PushProperties;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
@@ -66,8 +67,17 @@ public class StreamRunner implements SmartLifecycle {
       CheckpointStore checkpoints,
       SourceLeases leases,
       PushProperties push,
-      IngestProperties ingest) {
-    this(streams, pipeline, checkpoints, leases, push, ingest, System::nanoTime);
+      IngestProperties ingest,
+      HotProperties hot) {
+    this(
+        streams,
+        pipeline,
+        checkpoints,
+        leases,
+        push,
+        ingest,
+        System::nanoTime,
+        flushInterval(push, hot));
   }
 
   StreamRunner(
@@ -78,14 +88,35 @@ public class StreamRunner implements SmartLifecycle {
       PushProperties push,
       IngestProperties ingest,
       LongSupplier nanoTime) {
+    this(streams, pipeline, checkpoints, leases, push, ingest, nanoTime, push.flushInterval());
+  }
+
+  private StreamRunner(
+      StreamRegistry streams,
+      IngestPipeline pipeline,
+      CheckpointStore checkpoints,
+      SourceLeases leases,
+      PushProperties push,
+      IngestProperties ingest,
+      LongSupplier nanoTime,
+      Duration flushInterval) {
     this.streams = streams;
     this.pipeline = pipeline;
     this.checkpoints = checkpoints;
     this.leases = leases;
     this.segmentBytes = ingest.segmentBytes().toBytes();
-    this.flushIntervalNanos = push.flushInterval().toNanos();
+    this.flushIntervalNanos = flushInterval.toNanos();
     this.maxConcurrentRuns = push.maxConcurrentRuns();
     this.nanoTime = nanoTime;
+  }
+
+  /**
+   * With a hot store, lines wait at most {@code argus.hot.flush-interval} for their run, so they
+   * are searchable within T5's 30s ({@code P5_PLAN.md} D7).
+   */
+  static Duration flushInterval(PushProperties push, HotProperties hot) {
+    Duration flush = push.flushInterval();
+    return hot.enabled() && hot.flushInterval().compareTo(flush) < 0 ? hot.flushInterval() : flush;
   }
 
   @Override

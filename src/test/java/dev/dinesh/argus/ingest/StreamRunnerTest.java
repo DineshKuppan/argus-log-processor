@@ -8,6 +8,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import dev.dinesh.argus.checkpoint.FileCheckpointStore;
+import dev.dinesh.argus.config.HotProperties;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.LocalSinkProperties;
 import dev.dinesh.argus.config.PushProperties;
@@ -15,6 +16,7 @@ import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.parser.ParserRegistry;
 import dev.dinesh.argus.sink.LocalVolumeSink;
 import java.io.IOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -56,6 +58,44 @@ class StreamRunnerTest {
     if (registry != null) {
       registry.close();
     }
+  }
+
+  @Test
+  void aHotStoreShortensTheFlushIntervalButNeverLengthensIt() {
+    PushProperties minute =
+        new PushProperties(
+            dir.resolve("spool"), null, 0, 0, Duration.ofMinutes(1), null, null, 0, 0, 0, null);
+    PushProperties fiveSeconds =
+        new PushProperties(
+            dir.resolve("spool"), null, 0, 0, Duration.ofSeconds(5), null, null, 0, 0, 0, null);
+    HotProperties none =
+        new HotProperties(
+            null, null, null, null, null, null, null, null, 0, 0, null, null, null, 0, null, null,
+            null, null);
+    HotProperties hot =
+        new HotProperties(
+            HotProperties.Store.OPENSEARCH,
+            URI.create("http://localhost:9200"),
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            0,
+            0,
+            null,
+            null,
+            null,
+            0,
+            null,
+            null,
+            null,
+            null);
+
+    assertEquals(Duration.ofMinutes(1), StreamRunner.flushInterval(minute, none));
+    assertEquals(Duration.ofSeconds(10), StreamRunner.flushInterval(minute, hot));
+    assertEquals(Duration.ofSeconds(5), StreamRunner.flushInterval(fiveSeconds, hot));
   }
 
   private void start(long segmentBytes, long rotateBytes) throws IOException {
