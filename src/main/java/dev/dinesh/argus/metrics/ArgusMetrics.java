@@ -13,6 +13,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class ArgusMetrics {
 
+  private static final long BLOCKED_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+
   public static final String PREFIX = "argus.";
   public static final String TENANT = "tenant";
 
@@ -124,6 +126,26 @@ public class ArgusMetrics {
     registry
         .timer("argus.hot.bulk", "outcome", ok ? "ok" : "failed")
         .record(nanos, TimeUnit.NANOSECONDS);
+  }
+
+  /**
+   * A WAL record send that waited for room in the producer's buffer ({@code P6_PLAN.md} D5); sends
+   * that didn't wait (under 1ms) aren't recorded, so the timer counts only backpressure.
+   */
+  public void kafkaSendBlocked(long nanos) {
+    if (nanos >= BLOCKED_NANOS) {
+      registry.timer("argus.kafka.send.blocked").record(nanos, TimeUnit.NANOSECONDS);
+    }
+  }
+
+  /**
+   * A WAL segment on the topic: {@code side} {@code producer} (committed, aborted) or {@code
+   * archive} (archived, orphaned, ...).
+   */
+  public void kafkaSegment(String side, String outcome) {
+    registry
+        .counter("argus.kafka.segments", "side", side, "outcome", outcome.toLowerCase(Locale.ROOT))
+        .increment();
   }
 
   /** One search request ({@code P5_PLAN.md} D6). */
