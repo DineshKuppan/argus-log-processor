@@ -1,6 +1,6 @@
 # Argus Scaling Design: High-Volume, Multi-Source Log Processing
 
-> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). **P4 implemented** (SSE live tail with per-tenant rings, Micrometer / Prometheus metrics, a parser for producers' canonical lines; see [`P4_PLAN.md`](P4_PLAN.md)). **P5 implemented** (OpenSearch / Elasticsearch hot tier as a second WAL consumer with per-sink acknowledgements, daily indices with tuned mappings and retention, `GET /api/v2/search`; see [`P5_PLAN.md`](P5_PLAN.md)); Kafka moves to P6, which is design only. Implementation follows the phased roadmap in §12.
+> Status: **P0 implemented** (streaming file ingest, checkpoints, local sink; see [`P0_PLAN.md`](P0_PLAN.md)). **P1 implemented**: P1a (parser registry, format detection, `LogEnvelope`) and P1b (10s suppression API with local and Redis stores, streaming aggregation); see [`P1_PLAN.md`](P1_PLAN.md). **Hardening implemented** (v1 path restriction, API-key tenancy end to end; see [`HARDENING_PLAN.md`](HARDENING_PLAN.md)). **P2 implemented** (Parquet + ZSTD archive to a filesystem/PVC, S3 or GCS; the local segments as a zstd-compressed WAL whose watermarks pause ingest; see [`P2_PLAN.md`](P2_PLAN.md)). **P3a implemented** (HTTP push ingest through a durable per-stream spool, `Idempotency-Key`, per-tenant ingest quotas, suppression on push; see [`P3_PLAN.md`](P3_PLAN.md)). **P3b implemented** (Elasticsearch / OpenSearch and Coralogix export sources into stream spools, and the replay lane; see [`P3_PLAN.md`](P3_PLAN.md) §8). **P4 implemented** (SSE live tail with per-tenant rings, Micrometer / Prometheus metrics, a parser for producers' canonical lines; see [`P4_PLAN.md`](P4_PLAN.md)). **P5 implemented** (OpenSearch / Elasticsearch hot tier as a second WAL consumer with per-sink acknowledgements, daily indices with tuned mappings and retention, `GET /api/v2/search`; see [`P5_PLAN.md`](P5_PLAN.md)); **P6 planned** (Kafka as the WAL with the sinks as consumer groups, then several instances sharing it; see [`P6_PLAN.md`](P6_PLAN.md)). Implementation follows the phased roadmap in §12.
 > Inputs: [`PLAN.md`](../../PLAN.md) (target distributed architecture, functional requirements), [`SKILL.md`](../../SKILL.md) (format matrix, `LogEnvelope` pipeline), and the centralized-logging interview brief (10s suppression, multi-tenancy, search).
 
 ## Contents
@@ -286,7 +286,7 @@ flowchart LR
 ### Ingestion phase
 - The local WAL is the durable buffer.
 - Each sink (archive, hot tier) reads the committed WAL on its own and acknowledges each segment; the last acknowledgement deletes it (ADR-7). The source checkpoint advances at the local commit, as since P2, so a sink outage grows the WAL instead of stalling sources.
-- When Kafka is introduced (PLAN.md §1.4), it replaces the WAL as the buffer and each tier becomes an independent consumer group.
+- With `argus.wal.store=kafka` (P6, ADR-8), a topic replaces the local WAL as the buffer and each tier becomes a consumer group.
 
 ### Hot tier (days 1–14): OpenSearch / Elasticsearch
 > Built in P5 ([`P5_PLAN.md`](P5_PLAN.md)): daily indices per event day deleted by Argus after 14 days (instead of ILM / ISM, D4), `attributes` as `flattened` / `flat_object` under a strict mapping (D5), indexed from the WAL as an independent consumer (ADR-7). The measured disk saving is in P5_PLAN §9.
@@ -394,6 +394,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **T:** <1ms decisions, correct per tenant, survives an instance restart via warm-up.
 - **A:** Local Caffeine (fastest, single owner required) vs. Redis `SET NX PX` (shared, ~0.3–1ms network round trip, a single point of failure) vs. partition-by-key + local cache (fast and correct, but needs keyed routing).
   **Choice:** Caffeine on a single node now. Partition-by-key once Kafka arrives. Redis `SET NX PX` as a fallback when routing by key isn't possible. Fail open.
+  **Update (P6, [`P6_PLAN.md`](P6_PLAN.md) D11):** partition-by-key is dropped. Since P3a, suppression decides at receive time, inside the push request and the check API, before any buffer; routing by key would move it after Kafka. Several instances use the Redis store, pipelined to one round trip per request.
 - **R:** In a unit test, the same key twice within 10s → second is DENY; at 10.001s → ALLOW. Load test: 50k decisions/s with p99 <1ms locally.
 
 ### ADR-3: Cold archive format
@@ -425,6 +426,13 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 - **A:** Dual-write from the pipeline's writer, checkpointing after both acknowledge (the slowest sink paces ingest; the P0 checkpoint protocol changes) vs. a router that reads each segment once and feeds both (the sinks advance together) vs. **independent consumers of the committed WAL, each acknowledging each segment** (a marker per sink; the last acknowledgement deletes the segment).
   **Choice:** independent consumers: Kafka consumer groups' shape on a local log, so P6 can swap the WAL for a topic. Watermarks count segments some routed sink hasn't acknowledged, so a hot-tier outage pauses ingest only at the high watermark, as an archive outage does.
 - **R:** With the engine paused under push load, ingest and archiving continue; afterwards the index holds exactly the acknowledged lines (`HotOutageIT`, [`P5_PLAN.md`](P5_PLAN.md) §5).
+
+### ADR-8: Kafka as the WAL
+- **S:** The WAL is the committed local segments (P2), drained by independent per-sink consumers (ADR-7). A lost disk loses unacknowledged segments, and one node's CPU caps ingest and the sinks together.
+- **T:** Put the WAL in Kafka without changing the checkpoint protocol (P0), the archive's object keys (P2) or the sinks' idempotency; bounded memory; optional (`local` stays the default).
+- **A:** Kafka as a third consumer of the local WAL (nothing gained) vs. one record per segment or batch (oversized records, segments don't fit) vs. **one record per line keyed by source, with a commit marker per segment** vs. the same with Kafka transactions (an open 500MB segment would hold the partition's last stable offset, stalling every `read_committed` consumer for up to a minute).
+  **Choice:** one record per line plus markers, idempotent producer, no transactions. The archive consumer reassembles segments in local staging and runs the P2 archiver unchanged; the hot consumer indexes records as they arrive. Lag watermarks replace WAL bytes, because Kafka deletes by retention, not by acknowledgement.
+- **R:** T1, T3, T4 and T5 on Apache Kafka and Redpanda; the archive's keys identical to the local WAL's for the same input ([`P6_PLAN.md`](P6_PLAN.md) §5).
 
 ### ADR-6: Java version
 - **S:** Java 17 (pom).
@@ -459,7 +467,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 | **P3** | P3a: HTTP push ingest via a durable spool (429 backpressure), `QuotaService`, suppression on push. P3b: ES / Coralogix export sources, replay lane | Phase 2 | T8, tenant isolation tests |
 | **P4** | Live tail (SSE), canonical log lines (Argus's own + ingesting producers'), Micrometer metrics | Phase 3 | T7 |
 | **P5** | Hot tier (OpenSearch / Elasticsearch) as a second WAL consumer (ADR-7), daily indices with tuned mappings and retention, `GET /api/v2/search` | Phase 2 / 3 | T5 |
-| **P6** | Optional Kafka buffer + partition-by-key suppression, a tail shared across instances; HPA on consumer lag | Phase 3, Deployment | — |
+| **P6** | P6a: Kafka as the WAL (ADR-8), the archive and hot tier as consumer groups. P6b: several instances (instance ids in identities, a shared tail, Redis suppression pipelined), autoscaling on consumer lag | Phase 3, Deployment | T1, T3, T4, T5 on Kafka; T7 across instances |
 
 ### Verification approach per phase
 - **Unit:** each adapter against its port contract (shared contract test per port, so adapters are substitutable, per LSP).

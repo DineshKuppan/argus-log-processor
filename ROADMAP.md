@@ -34,11 +34,10 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | T8 | Replay | Replay any range without starving live ingest | ✅ 2 CPUs: live push p99 unchanged within noise during a 1GB replay at 8MB/s (3–8x worse without the lane) |
 | T9 | Cost | Cold tier ≤3TiB at 7 years (≥8x compression) | ✅ 14.6x on synthetic data; re-measure on real logs |
 
-## Next: P6
-Kafka, optional (the design's Phase 3).
-- Kafka as the buffer: the archive and the hot tier become consumer groups (ADR-7 is that shape on the local WAL).
-- Suppression partitioned by key, and a live tail shared by every instance.
-- HPA on consumer lag, once several instances share the work.
+## Next: P6 ([`P6_PLAN.md`](docs/architecture/P6_PLAN.md))
+Kafka, optional (the design's Phase 3), in two PRs.
+- **P6a:** Kafka as the WAL (ADR-8): one record per line plus a commit marker per segment; the archive and the hot tier become consumer groups; lag watermarks; T1, T3, T4, T5 on Apache Kafka and Redpanda.
+- **P6b:** several instances: an instance id in every source's identity, consumer groups across instances, a live tail shared through a tail topic, Redis suppression pipelined per request (not partitioned by key: suppression decides at receive time), autoscaling on consumer lag (KEDA / HPA manifests).
 
 ## Open items
 - **Re-measure T9 on real logs.** The 14.6x comes from `DataSeeder`, whose vocabulary is small. Real logs will compress less.
