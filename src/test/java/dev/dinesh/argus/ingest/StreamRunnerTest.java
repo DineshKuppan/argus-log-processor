@@ -202,6 +202,23 @@ class StreamRunnerTest {
   }
 
   @Test
+  void drainIngestsEverySpoolBeforeItsFlushIntervalAndStopsScanning() throws IOException {
+    start(1L << 30, 1L << 30);
+    runner.start();
+    PushStream app = append(json(1), json(2));
+    PushStream web = registry.getOrCreate("acme", "web");
+    byte[] line = (json(3) + "\n").getBytes(StandardCharsets.UTF_8);
+    web.spool().append(line, line.length, null, AT);
+    assertFalse(runner.due(app), "not yet due");
+
+    assertTrue(runner.drain(Duration.ofSeconds(30)));
+
+    assertEquals(0, app.spool().pendingBytes());
+    assertEquals(0, web.spool().pendingBytes());
+    assertEquals(3, outputLines());
+  }
+
+  @Test
   void aStreamIsDueAtOnceWhenASegmentsWorthIsWaiting() throws IOException {
     start(100, 1L << 30);
     PushStream stream = append(json(1));

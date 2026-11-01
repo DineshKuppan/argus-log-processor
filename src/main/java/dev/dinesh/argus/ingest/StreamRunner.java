@@ -173,6 +173,60 @@ public class StreamRunner implements SmartLifecycle {
     return running;
   }
 
+  /**
+   * Ingests every stream's spool to its end, ignoring {@code flush-interval}, until nothing is left
+   * or {@code timeout} passes (P6 D12: on shutdown, so the lines are in the WAL before the instance
+   * goes). Runs on the calling thread, after the scheduled runs are stopped.
+   *
+   * @return true if every spool was drained
+   */
+  public boolean drain(Duration timeout) {
+    long deadline = System.nanoTime() + timeout.toNanos();
+    synchronized (this) {
+      if (running) {
+        scanner.shutdownNow();
+      }
+    }
+    while (System.nanoTime() < deadline) {
+      long before = pendingBytes();
+      if (before == 0) {
+        break;
+      }
+      for (PushStream stream : streams.all()) {
+        if (System.nanoTime() >= deadline) {
+          break;
+        }
+        stream.retryNotBeforeNanos = 0;
+        if (stream.spool().pendingBytes() > 0) {
+          runNow(stream); // empty if a scheduled run still holds the stream: the next round
+        }
+      }
+      if (pendingBytes() == before) {
+        if (streams.all().stream().noneMatch(st -> st.scheduled.get())) {
+          break; // no run in progress made the rest wait: they failed, and fail again
+        }
+        try {
+          Thread.sleep(100);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          break;
+        }
+      }
+    }
+    long left = pendingBytes();
+    if (left > 0) {
+      log.warn(
+          "Drain stopped with {} spooled bytes not yet ingested; they are ingested at the next"
+              + " start",
+          left);
+    }
+    return left == 0;
+  }
+
+  private long pendingBytes() {
+    return streams.all().stream().mapToLong(s -> s.spool().pendingBytes()).sum();
+  }
+
   /** Starts a run for every due stream that has none queued or running. */
   void scan() {
     for (PushStream stream : streams.all()) {

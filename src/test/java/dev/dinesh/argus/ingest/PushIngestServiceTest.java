@@ -273,6 +273,19 @@ class PushIngestServiceTest {
   }
 
   @Test
+  void aDrainingInstanceRefusesPushesWithA503Reason() throws Exception {
+    PushIngestService service = service();
+    service.push(request("acme", "before\n"));
+
+    assertTrue(service.drain(Duration.ofSeconds(1)), "nothing was in progress");
+    PushRejectedException e =
+        assertThrows(PushRejectedException.class, () -> service.push(request("acme", "after\n")));
+    assertEquals(PushRejectedException.Reason.DRAINING, e.reason());
+    assertEquals(1, e.retryAfterSeconds());
+    assertEquals("before\n", spooled("acme"));
+  }
+
+  @Test
   void acceptedLinesAreTailedOnceSpooledAfterSuppression() throws IOException {
     PushIngestService service = service();
     service.push(

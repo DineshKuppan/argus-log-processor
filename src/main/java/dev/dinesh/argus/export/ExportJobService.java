@@ -11,6 +11,7 @@ import dev.dinesh.argus.ingest.IngestJob.State;
 import dev.dinesh.argus.ingest.IngestJobService.JobSlotsBusyException;
 import dev.dinesh.argus.ingest.IngestJobService.WalFullException;
 import dev.dinesh.argus.ingest.IngestPipeline;
+import dev.dinesh.argus.ingest.JobIds;
 import dev.dinesh.argus.ingest.Lane;
 import dev.dinesh.argus.ingest.PushStream;
 import dev.dinesh.argus.ingest.ReplayLane;
@@ -201,7 +202,7 @@ public class ExportJobService {
               .filter(s -> s.identity().equals(identity) && !request.fromBeginning());
       job =
           new ExportJob(
-              UUID.randomUUID().toString(),
+              JobIds.next(pipeline.instanceId()),
               tenantId,
               named.name(),
               streamId,
@@ -257,6 +258,11 @@ public class ExportJobService {
   }
 
   /** The tenant's job; another tenant's job id is reported as absent. */
+  /** Why {@code jobId} isn't here, if another instance started it (D12); else null. */
+  public String elsewhere(String jobId) {
+    return JobIds.elsewhere(jobId, pipeline.instanceId());
+  }
+
   public Optional<ExportJob> find(String tenantId, String jobId) {
     return Optional.ofNullable(jobs.get(jobId)).filter(j -> j.tenantId().equals(tenantId));
   }

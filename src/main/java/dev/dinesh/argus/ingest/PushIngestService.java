@@ -22,6 +22,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -108,6 +109,7 @@ public class PushIngestService {
   private final PushProperties props;
   private final int maxLineBytes;
   private final Semaphore requestSlots;
+  private volatile boolean draining;
   private final Set<String> keysInFlight = ConcurrentHashMap.newKeySet();
   private final ArgusMetrics metrics;
 
@@ -219,6 +221,23 @@ public class PushIngestService {
     }
   }
 
+  /**
+   * Refuses new pushes (503 + {@code Retry-After: 1}) and waits up to {@code timeout} for those in
+   * progress to finish, so every acknowledged line is in a spool before the spools are drained (P6
+   * D12).
+   *
+   * @return true if none was still in progress
+   */
+  public boolean drain(Duration timeout) throws InterruptedException {
+    draining = true;
+    int slots = props.maxConcurrentRequests();
+    if (!requestSlots.tryAcquire(slots, timeout.toMillis(), TimeUnit.MILLISECONDS)) {
+      return false;
+    }
+    requestSlots.release(slots);
+    return true;
+  }
+
   private PushResult admitAndSpool(PushRequest request, Instant receivedAt, Counts counts)
       throws IOException {
     String tenantId = TenantIds.requireValid(request.tenantId());
@@ -226,6 +245,10 @@ public class PushIngestService {
     String key = validKey(request.idempotencyKey());
     LogParser requested = parsers.resolve(request.format(), request.pattern()).orElse(null);
     // Cheapest checks first, all before the body is read.
+    if (draining) {
+      throw new PushRejectedException(
+          Reason.DRAINING, 1, "This instance is shutting down; retry (another instance takes it)");
+    }
     if (!requestSlots.tryAcquire()) {
       throw new PushRejectedException(
           Reason.BUSY,

@@ -23,7 +23,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.SynchronousQueue;
@@ -200,7 +199,7 @@ public class IngestJobService {
 
     IngestJob job =
         new IngestJob(
-            UUID.randomUUID().toString(),
+            JobIds.next(pipeline.instanceId()),
             tenantId,
             sourceId,
             realPath,
@@ -236,6 +235,11 @@ public class IngestJobService {
   }
 
   /** The tenant's job; another tenant's job id is reported as absent, not as forbidden. */
+  /** Why {@code jobId} isn't here, if another instance started it (D12); else null. */
+  public String elsewhere(String jobId) {
+    return JobIds.elsewhere(jobId, pipeline.instanceId());
+  }
+
   public Optional<IngestJob> find(String tenantId, String jobId) {
     return Optional.ofNullable(jobs.get(jobId)).filter(j -> j.tenantId().equals(tenantId));
   }

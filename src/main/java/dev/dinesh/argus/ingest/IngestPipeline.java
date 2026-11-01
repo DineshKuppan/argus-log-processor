@@ -219,6 +219,11 @@ public class IngestPipeline {
     this.tail = tail;
   }
 
+  /** {@code argus.instance.id}, or null for a single instance. */
+  public String instanceId() {
+    return instanceId;
+  }
+
   /** True while the WAL is above its high watermark: new jobs would only wait. */
   public boolean walFull() {
     return walCapacity.isFull();
