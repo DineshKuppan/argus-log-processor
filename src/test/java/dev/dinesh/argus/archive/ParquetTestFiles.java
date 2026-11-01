@@ -17,7 +17,7 @@ import org.apache.parquet.io.RecordReader;
 import org.apache.parquet.schema.MessageType;
 
 /** Reads archive files back without Hadoop, for assertions. */
-final class ParquetTestFiles {
+public final class ParquetTestFiles {
 
   /** Hadoop-free reads: the default codec factory needs Hadoop's runtime. */
   static final ParquetReadOptions OPTIONS =
@@ -27,7 +27,7 @@ final class ParquetTestFiles {
 
   private ParquetTestFiles() {}
 
-  static List<Group> rows(Path file) throws IOException {
+  public static List<Group> rows(Path file) throws IOException {
     List<Group> rows = new ArrayList<>();
     try (ParquetFileReader reader = ParquetFileReader.open(new LocalInputFile(file), OPTIONS)) {
       MessageType schema = reader.getFooter().getFileMetaData().getSchema();

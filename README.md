@@ -16,7 +16,11 @@ A Spring Boot service that ingests, parses, filters, aggregates and archives log
 
 ## What's new
 
-- **Hot search tier and the search API (P5).**
+- **Kafka or Redpanda as the WAL (P6a).**
+  - With `argus.wal.store=kafka`, committed segments go to a Kafka topic instead of the node's disk, so losing the node loses at most the push spools' last few seconds. The archive and the hot tier consume it as groups; the archive's object keys don't change.
+  - Ingest pauses with 429 `WAL_FULL` when a sink falls far enough behind that Kafka's retention could delete lines it hasn't stored; a broker outage is backpressure, absorbed by the push spools.
+  - 130–132k lines/s pushed end to end at a 256MB heap, the same as the local WAL. A 60s broker outage, an archive outage and a `kill -9` lost and duplicated nothing, on Apache Kafka 3.8 and Redpanda 24.2. Pushed lines are searchable in 22.3s (p99).
+- **Hot search tier and the search API (P5, PR #11).**
   - With `argus.hot.store=opensearch|elasticsearch`, every line is also indexed into OpenSearch 2.7+ or Elasticsearch 7.17+ and kept for 14 days; `GET /api/v2/search` finds a tenant's lines by time range, text, level, source, service and attributes.
   - The hot tier reads the WAL on its own, as the archive does: either can be down without stopping the other, and a segment leaves the WAL only once both have it. Re-indexing (after a crash, a retry or an outage) never duplicates a line: each document's id is its `eventId`.
   - Tenancy is enforced by the server: the tenant filter comes from the API key and sits beside, never inside, the caller's query.
@@ -270,6 +274,18 @@ argus.sink.local.compression=zstd
 - **S3-compatible stores:** set `s3.endpoint`, `s3.path-style=true` and, if the store rejects the AWS SDK's checksums, `s3.checksums=when-required`.
 - **Backpressure:** when more than 80% of `argus.wal.max-bytes` (30GB) is waiting for upload, ingest pauses (job status `paused: WAL_FULL`) and new jobs get 429. It resumes below 60%.
 
+### 11. Kafka as the WAL (optional)
+```properties
+argus.wal.store=kafka
+argus.kafka.bootstrap-servers=kafka-0.kafka:9092,kafka-1.kafka:9092
+argus.kafka.topic=argus-wal              # created with argus.kafka.create-topics=true, else must exist
+# argus.kafka.properties.security.protocol=SASL_SSL, sasl.*, ssl.* (from the environment)
+```
+- Committed segments go to a Kafka topic (Apache Kafka 3.x or Redpanda) instead of the local disk, so a lost node loses at most the push spools' last `flush-interval`. The archive and the hot tier consume it as groups `argus-archive` and `argus-hot`; the archive's object keys are the same as with the local WAL.
+- Ingest pauses when a sink's consumer lag passes 80% of `argus.kafka.max-lag-records` (100M), before Kafka's retention could delete lines it hasn't archived. Startup refuses a topic that is compacted, keeps less than 7 days or deletes by size.
+- A broker outage blocks the writers (backpressure) for up to `argus.kafka.max-outage` (10m); pushes keep landing in their spools meanwhile.
+- Switching from the local WAL: restart with `argus.wal.store=kafka`; segments not yet archived or indexed are sent to the topic first.
+
 ## API
 
 Every endpoint needs an API key: 401 without one. Request bodies are JSON.
@@ -309,13 +325,14 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 491 tests; Redis, S3, GCS, Elasticsearch and OpenSearch tests need Docker
+mvn test                                         # 534 tests; Redis, S3, GCS, Elasticsearch, OpenSearch, Kafka and Redpanda tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
 mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
                                                  # decisions, push throughput / isolation, push backpressure, kill -9 during push,
                                                  # T8 replay isolation, T7 live tail, T5 hot-tier freshness, a hot-tier outage and
                                                  # kill -9 while indexing (-Dargus.load.docker-cpus=2 runs the server in a 2-CPU
-                                                 # container)
+                                                 # container); Kafka as the WAL (KafkaWalIT, host only: T1, broker and archive outages,
+                                                 # kill -9; -Dargus.load.kafka-broker=redpanda; HotTierIT with -Dargus.load.wal=kafka)
 ```
 
 ## License

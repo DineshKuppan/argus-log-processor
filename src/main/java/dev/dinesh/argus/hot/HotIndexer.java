@@ -1,23 +1,19 @@
 package dev.dinesh.argus.hot;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.luben.zstd.ZstdIOException;
 import com.github.luben.zstd.ZstdInputStream;
 import dev.dinesh.argus.config.HotProperties;
 import dev.dinesh.argus.engine.SearchEngineClient;
-import dev.dinesh.argus.engine.SearchEngineClient.Response;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
+import dev.dinesh.argus.utils.Backoff;
 import dev.dinesh.argus.wal.WalSegments;
 import dev.dinesh.argus.wal.WalSegments.Segment;
 import dev.dinesh.argus.wal.WalSink;
 import java.io.BufferedInputStream;
 import java.io.BufferedReader;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -27,24 +23,21 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.LocalDate;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.context.SmartLifecycle;
 
 /**
  * Indexes committed WAL segments into the hot tier ({@code P5_PLAN.md} D2): one thread, oldest
- * segment first, each line a {@code _bulk} {@code index} action with {@code _id = eventId}, so a
- * retry, a re-run after a crash or a superseded segment's replacement overwrites rather than
- * duplicates. A segment is acknowledged ({@link WalSink#HOT}) once each of its lines was indexed,
- * rejected by the engine (permanent; the cold tier keeps it) or older than the retention. Any other
- * failure stops the pass and backs off, like the {@code Archiver}; within the same process a failed
- * segment resumes at its last acknowledged bulk.
+ * segment first, each line a {@code _bulk} {@code index} action with {@code _id = eventId} ({@link
+ * HotBulkWriter}), so a retry, a re-run after a crash or a superseded segment's replacement
+ * overwrites rather than duplicates. A segment is acknowledged ({@link WalSink#HOT}) once each of
+ * its lines was indexed, rejected by the engine (permanent; the cold tier keeps it) or older than
+ * the retention. Any other failure stops the pass and backs off, like the {@code Archiver}; within
+ * the same process a failed segment resumes at its last acknowledged bulk.
  */
 @Slf4j
 public class HotIndexer implements SmartLifecycle {
@@ -60,34 +53,22 @@ public class HotIndexer implements SmartLifecycle {
   }
 
   /** Item retries within a segment for 429 / 5xx items, waiting 1s, 2s, 4s. */
-  static final int ITEM_ATTEMPTS = 4;
+  static final int ITEM_ATTEMPTS = HotBulkWriter.ITEM_ATTEMPTS;
 
-  private static final Duration RETENTION_EVERY = Duration.ofHours(1);
-  private static final int MAX_BACKOFF_DOUBLINGS = 30;
   private static final int READ_BUFFER = 64 * 1024;
-  private static final int ERROR_CHARS = 300;
   private static final long STOP_TIMEOUT_SECONDS = 30;
-  private static final String FILTER =
-      "filter_path=errors,items.*.status,items.*.error.type,items.*.error.reason";
 
-  private final SearchEngineClient client;
+  private final HotBulkWriter writer;
   private final WalSegments wal;
-  private final HotIndices indices;
-  private final HotTemplates templates;
-  private final HotRetention retention;
   private final HotProperties props;
-  private final ObjectMapper mapper;
   private final ObjectReader envelopes;
   private final ArgusMetrics metrics;
   private final Clock clock;
-  private final Duration itemRetryBase;
 
   private volatile boolean running;
   private ScheduledExecutorService worker;
 
   // Read and written only by the worker thread.
-  private boolean prepared;
-  private Instant lastRetention = Instant.MIN;
   private int consecutiveFailures;
   private Path resumeFile;
   private long resumeLines;
@@ -109,17 +90,12 @@ public class HotIndexer implements SmartLifecycle {
       ArgusMetrics metrics,
       Clock clock,
       Duration itemRetryBase) {
-    this.client = client;
+    this.writer = new HotBulkWriter(client, indices, props, metrics, clock, itemRetryBase);
     this.wal = wal;
-    this.indices = indices;
-    this.templates = new HotTemplates(client, indices, props);
-    this.retention = new HotRetention(client, indices);
     this.props = props;
-    this.mapper = client.mapper();
-    this.envelopes = mapper.readerFor(LogEnvelope.class);
+    this.envelopes = client.mapper().readerFor(LogEnvelope.class);
     this.metrics = metrics;
     this.clock = clock;
-    this.itemRetryBase = itemRetryBase;
   }
 
   @Override
@@ -136,7 +112,11 @@ public class HotIndexer implements SmartLifecycle {
             });
     running = true;
     worker.execute(this::loop);
-    log.info("Hot indexer started: {} → {} ({})", wal.root(), client.base(), indices.pattern());
+    log.info(
+        "Hot indexer started: {} → {} ({})",
+        wal.root(),
+        writer.client().base(),
+        writer.indices().pattern());
   }
 
   @Override
@@ -192,20 +172,7 @@ public class HotIndexer implements SmartLifecycle {
    * oldest first, stopping at the first failure. True if the pass completed.
    */
   public boolean runOnce() throws IOException, InterruptedException {
-    if (!prepared) {
-      HotTemplates.requireSupported(client.engine(), props.store());
-      templates.install();
-      prepared = true;
-    }
-    Instant now = clock.instant();
-    if (Duration.between(lastRetention, now).compareTo(RETENTION_EVERY) >= 0) {
-      try {
-        retention.runOnce(now);
-        lastRetention = now;
-      } catch (IOException e) {
-        log.warn("Hot tier retention failed; retrying next pass: {}", e.toString());
-      }
-    }
+    writer.maintain();
     for (Segment segment : wal.pending(WalSink.HOT)) {
       if (Thread.currentThread().isInterrupted()) {
         throw new InterruptedException();
@@ -229,20 +196,9 @@ public class HotIndexer implements SmartLifecycle {
     }
   }
 
-  /** Counts for one segment, for its canonical line. */
-  private static final class Tally {
-    long lines;
-    long indexed;
-    long rejected;
-    long skipped;
-    int bulks;
-    int retries;
-    String firstRejection;
-  }
-
   Outcome index(Segment segment) throws InterruptedException {
     long start = System.nanoTime();
-    Tally tally = new Tally();
+    HotBulkWriter.Tally tally = new HotBulkWriter.Tally();
     Outcome outcome = Outcome.FAILED;
     Throwable error = null;
     long resumeAt = segment.file().equals(resumeFile) ? resumeLines : 0;
@@ -276,7 +232,7 @@ public class HotIndexer implements SmartLifecycle {
           segment.startOffset(),
           segment.endOffset(),
           outcome,
-          tally.lines,
+          tally.lines + resumeAt,
           resumeAt,
           tally.indexed,
           tally.rejected,
@@ -292,37 +248,31 @@ public class HotIndexer implements SmartLifecycle {
     return outcome;
   }
 
-  private Outcome indexLines(Segment segment, long resumeAt, Tally tally)
+  private Outcome indexLines(Segment segment, long resumeAt, HotBulkWriter.Tally tally)
       throws IOException, InterruptedException {
     Instant now = clock.instant();
-    LocalDate oldestKept = indices.oldestKept(now);
-    Bulk bulk = new Bulk();
+    HotBulkWriter.Bulk bulk = writer.newBulk();
+    long lines = 0;
     try (BufferedReader reader = open(segment)) {
       String line;
       while ((line = reader.readLine()) != null) {
         if (line.isBlank()) {
           continue;
         }
-        tally.lines++;
-        if (tally.lines <= resumeAt) {
+        lines++;
+        if (lines <= resumeAt) {
           continue;
         }
-        LogEnvelope e = envelopes.readValue(line);
-        LocalDate day = HotIndices.day(e, now);
-        if (day.isBefore(oldestKept)) {
-          tally.skipped++;
-        } else {
-          bulk.add(action(e, day), HotDocument.of(e, now, mapper));
-        }
+        bulk.add(envelopes.readValue(line), now, tally);
         if (bulk.full()) {
-          send(bulk, tally);
-          remember(segment, tally.lines);
-          bulk = new Bulk();
+          writer.send(bulk, tally);
+          remember(segment, lines);
+          bulk = writer.newBulk();
         }
       }
     }
     if (!bulk.isEmpty()) {
-      send(bulk, tally);
+      writer.send(bulk, tally);
     }
     return Outcome.INDEXED;
   }
@@ -330,125 +280,6 @@ public class HotIndexer implements SmartLifecycle {
   private void remember(Segment segment, long lines) {
     resumeFile = segment.file();
     resumeLines = lines;
-  }
-
-  private ObjectNode action(LogEnvelope e, LocalDate day) {
-    ObjectNode action = mapper.createObjectNode();
-    ObjectNode meta = action.putObject("index");
-    meta.put("_index", indices.index(e.tenantId(), day));
-    meta.put("_id", e.eventId());
-    String routing = indices.routing(e.tenantId());
-    if (routing != null) {
-      meta.put("routing", routing);
-    }
-    return action;
-  }
-
-  /** One {@code _bulk} body: action and document lines, kept per item for retries. */
-  private final class Bulk {
-    final List<byte[]> items = new ArrayList<>();
-    long bytes;
-
-    void add(ObjectNode action, ObjectNode doc) throws IOException {
-      ByteArrayOutputStream item = new ByteArrayOutputStream(512);
-      mapper.writeValue(item, action);
-      item.write('\n');
-      mapper.writeValue(item, doc);
-      item.write('\n');
-      byte[] b = item.toByteArray();
-      items.add(b);
-      bytes += b.length;
-    }
-
-    boolean full() {
-      return items.size() >= props.bulkMaxDocs() || bytes >= props.bulkMaxBytes().toBytes();
-    }
-
-    boolean isEmpty() {
-      return items.isEmpty();
-    }
-
-    byte[] body(List<byte[]> subset) {
-      ByteArrayOutputStream out = new ByteArrayOutputStream((int) Math.min(bytes, 1 << 30));
-      for (byte[] item : subset) {
-        out.writeBytes(item);
-      }
-      return out.toByteArray();
-    }
-  }
-
-  /**
-   * Sends the bulk; 429 / 5xx items are retried up to {@link #ITEM_ATTEMPTS} times, other item
-   * errors are counted as rejected. Throws if the request fails, or items still fail after the
-   * retries.
-   */
-  private void send(Bulk bulk, Tally tally) throws IOException, InterruptedException {
-    List<byte[]> items = bulk.items;
-    for (int attempt = 1; ; attempt++) {
-      long start = System.nanoTime();
-      Response response;
-      try {
-        response =
-            client.send("POST", "/_bulk?" + FILTER, bulk.body(items), SearchEngineClient.NDJSON);
-      } catch (IOException e) {
-        metrics.hotBulk(false, System.nanoTime() - start);
-        throw e;
-      }
-      metrics.hotBulk(response.ok(), System.nanoTime() - start);
-      tally.bulks++;
-      if (!response.ok()) {
-        throw new IOException(
-            "_bulk answered " + response.status() + ": " + response.excerpt(ERROR_CHARS));
-      }
-      JsonNode body;
-      try {
-        body = mapper.readTree(response.body());
-      } catch (JsonProcessingException e) {
-        // The engine's (or a proxy's) fault, not the segment's: never set the segment aside for it.
-        throw new IOException(
-            "_bulk answered " + response.status() + " that isn't JSON: " + response.excerpt(80), e);
-      }
-      if (!body.path("errors").asBoolean(false)) {
-        tally.indexed += items.size();
-        return;
-      }
-      JsonNode results = body.path("items");
-      if (results.size() != items.size()) {
-        throw new IOException(
-            "_bulk answered " + results.size() + " results for " + items.size() + " items");
-      }
-      List<byte[]> retry = new ArrayList<>();
-      for (int i = 0; i < items.size(); i++) {
-        JsonNode result = results.get(i).elements().next();
-        int status = result.path("status").asInt(500);
-        if (status >= 200 && status < 300) {
-          tally.indexed++;
-        } else if (status == 429 || status >= 500) {
-          retry.add(items.get(i));
-        } else {
-          tally.rejected++;
-          if (tally.firstRejection == null) {
-            tally.firstRejection =
-                result.path("error").path("type").asText()
-                    + ": "
-                    + truncate(result.path("error").path("reason").asText());
-          }
-        }
-      }
-      if (retry.isEmpty()) {
-        return;
-      }
-      if (attempt >= ITEM_ATTEMPTS) {
-        throw new IOException(retry.size() + " items still failing after " + attempt + " attempts");
-      }
-      tally.retries += retry.size();
-      Thread.sleep(itemRetryBase.toMillis() << (attempt - 1));
-      items = retry;
-    }
-  }
-
-  private static String truncate(String text) {
-    return text.length() > ERROR_CHARS ? text.substring(0, ERROR_CHARS) + "…" : text;
   }
 
   private Outcome setAside(Segment segment) {
@@ -474,11 +305,6 @@ public class HotIndexer implements SmartLifecycle {
 
   /** As the archiver's: {@code retry-initial × 2^(n-1)} capped at {@code retry-max}, jittered. */
   Duration backoff(int failures) {
-    long initial = props.retryInitial().toMillis();
-    long max = props.retryMax().toMillis();
-    int doublings = Math.min(Math.max(failures - 1, 0), MAX_BACKOFF_DOUBLINGS);
-    long base = initial > (max >> doublings) ? max : Math.min(max, initial << doublings);
-    long half = Math.max(base / 2, 1);
-    return Duration.ofMillis(half + ThreadLocalRandom.current().nextLong(half + 1));
+    return Backoff.jittered(props.retryInitial(), props.retryMax(), failures);
   }
 }

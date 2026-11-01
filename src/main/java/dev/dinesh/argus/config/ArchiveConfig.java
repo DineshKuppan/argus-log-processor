@@ -80,7 +80,9 @@ public class ArchiveConfig {
     };
   }
 
+  /** Drains the local WAL; with Kafka the archive consumer drives an archiver instead. */
   @Bean
+  @ConditionalOnProperty(name = SinkConfig.LOCAL_WAL, havingValue = "local", matchIfMissing = true)
   Archiver archiver(
       ObjectStore archiveStore,
       ArchiveProperties props,

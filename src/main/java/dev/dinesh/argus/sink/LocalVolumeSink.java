@@ -23,7 +23,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Component;
 
 /**
  * Writes segments as NDJSON files on a local or Kubernetes-mounted volume:
@@ -39,7 +38,6 @@ import org.springframework.stereotype.Component;
  * successive files at the same path (rotation, truncation), whose offsets restart at 0.
  */
 @Slf4j
-@Component
 public class LocalVolumeSink implements LogSink {
 
   private static final String PART_SUFFIX = ".ndjson.part";

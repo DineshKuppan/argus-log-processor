@@ -6,7 +6,33 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
-### P5: hot search tier and the search API (unmerged)
+### P6a: Kafka as the WAL (unmerged)
+Plan and results: [`P6_PLAN.md`](docs/architecture/P6_PLAN.md).
+
+#### Added
+- **`argus.wal.store=kafka`** (default `local`): committed segments go to a Kafka topic (`argus.kafka.*`) instead of the local volume. `KafkaSink` writes one record per line, keyed `<tenant>/<source>`, then a commit marker per segment; the source checkpoint advances only once the marker is acknowledged (ADR-8). No transactions, so lines are visible at once.
+- **The sinks as consumer groups:** `argus-archive` rebuilds each segment in local staging and archives it with the unchanged P2 archiver, so the cold tier's keys are the same as with the local WAL; `argus-hot` indexes records as they arrive. Each commits offsets only for what its sink has.
+- **Lag watermarks:** ingest pauses (429 `WAL_FULL`, `paused: WAL_FULL`) when a sink's consumer lag passes `argus.wal.high-watermark` × `argus.kafka.max-lag-records` (100M), measured off the request path. Startup refuses topic settings that could delete lines the sinks don't have.
+- A broker outage blocks the writers for up to `argus.kafka.max-outage` (10m); pushes keep landing in their spools.
+- `WalForwarder`: switching from the local WAL sends its unacknowledged segments to the topic at startup.
+- Metrics: `argus_kafka_lag_records{group}`, `argus_kafka_lag_age_seconds{group}`, `argus_kafka_segments_total{side,outcome}`, `argus_kafka_send_blocked_seconds`, and kafka-clients' own producer metrics.
+- Broker tests on Apache Kafka 3.8 and Redpanda 24.2 (Testcontainers); `KafkaWalIT` (tag `load`); `HotTierIT -Dargus.load.wal=kafka`.
+
+#### Changed
+- `HotBulkWriter` holds the `_bulk` code `HotIndexer` had, shared with the hot consumer; one backoff helper for the archiver, indexer and consumers. A non-JSON `_bulk` answer fails the pass instead of setting a segment aside (from #11's review).
+- `LocalVolumeSink` is created by `SinkConfig` (only with the local WAL); `WalConfig`, the `Archiver` bean and the `HotIndexer` bean exist only with `argus.wal.store=local`.
+
+#### Fixed (in review, before merge)
+- The archive consumer could archive a partial copy of a segment over its complete one: after a restart or rebalance it resumes at a committed offset that another source's open segment can hold inside an already archived segment. Commit markers now carry `argus-first` (the Kafka offset of the segment's first line), and a copy staged from past it is dropped.
+- An archive outage longer than `orphan-timeout` expired the open segments of the held partitions and let the commit pass their first lines. The orphan clock now stops while the consumer holds its partitions, and `orphan-timeout` must be longer than `max-outage`.
+
+#### Measured
+- **T1:** 131.9k lines/s pushed to Apache Kafka, 130.1k to Redpanda, the same as the local WAL in the same runs (125.6k / 131.7k), at a 256MB heap.
+- **T3:** a 60s broker outage under 2,000 lines/s was absorbed by the spools (no 429s), then all 180,800 lines were archived exactly once; an unwritable archive store paused ingest at the lag watermark (156–160 429 `WAL_FULL`), then all 180,400 lines were archived once. Both brokers.
+- **T4:** `kill -9` mid-push: exactly 400,000 rows archived for 400,000 lines, both brokers.
+- **T5 on Kafka:** p50 9.9s, p99 22.3s from the 202 to the search API finding the line (host, OpenSearch). A 60s engine outage and a `kill -9` while indexing lost and duplicated nothing.
+
+### P5: hot search tier and the search API: [#11](https://github.com/DineshKuppan/argus-log-processor/pull/11) (2026-11-01)
 Plan and results: [`P5_PLAN.md`](docs/architecture/P5_PLAN.md).
 
 #### Added

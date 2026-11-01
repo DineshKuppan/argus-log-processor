@@ -6,18 +6,21 @@ import dev.dinesh.argus.wal.WatermarkWalCapacity;
 import java.util.EnumSet;
 import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Conditional;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * The WAL and its routed sinks ({@code P5_PLAN.md} D1, ADR-7), when an archive or a hot store
- * drains it. Without either, the local segments are the output and nothing here exists ({@link
+ * The local WAL and its routed sinks ({@code P5_PLAN.md} D1, ADR-7), when an archive or a hot store
+ * drains it ({@link KafkaConfig} for {@code argus.wal.store=kafka}). Without either, the local
+ * segments are the output and nothing here exists ({@link
  * dev.dinesh.argus.sink.WalCapacity#UNBOUNDED}).
  */
 @Slf4j
 @Configuration
 @Conditional(WalConfig.Drained.class)
+@ConditionalOnProperty(name = SinkConfig.LOCAL_WAL, havingValue = "local", matchIfMissing = true)
 public class WalConfig {
 
   /** True when {@code argus.archive.store} or {@code argus.hot.store} names a store. */
