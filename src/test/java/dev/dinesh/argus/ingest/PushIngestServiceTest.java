@@ -252,6 +252,40 @@ class PushIngestServiceTest {
   }
 
   @Test
+  void copiesAcrossSuppressionBatchesAreSuppressedAndTheRestKeptInOrder() throws IOException {
+    PushIngestService service = service(push(1 << 20, 3000, 4, 1L << 30, 3), 1L << 20);
+    StringBuilder body = new StringBuilder();
+    StringBuilder kept = new StringBuilder();
+    int lines = 2 * PushIngestService.SUPPRESS_BATCH + 500;
+    for (int i = 0; i < lines; i++) {
+      String line = "{\"i\":" + i + ",\"msg\":\"m" + (i % 900) + "\"}\n";
+      body.append(line);
+      if (i < 900) {
+        kept.append(line);
+      }
+    }
+
+    PushResult result = service.push(request("acme", body.toString()));
+
+    assertEquals(900, result.accepted());
+    assertEquals(lines - 900, result.suppressed());
+    assertEquals(kept.toString(), spooled("acme"));
+  }
+
+  @Test
+  void aDrainingInstanceRefusesPushesWithA503Reason() throws Exception {
+    PushIngestService service = service();
+    service.push(request("acme", "before\n"));
+
+    assertTrue(service.drain(Duration.ofSeconds(1)), "nothing was in progress");
+    PushRejectedException e =
+        assertThrows(PushRejectedException.class, () -> service.push(request("acme", "after\n")));
+    assertEquals(PushRejectedException.Reason.DRAINING, e.reason());
+    assertEquals(1, e.retryAfterSeconds());
+    assertEquals("before\n", spooled("acme"));
+  }
+
+  @Test
   void acceptedLinesAreTailedOnceSpooledAfterSuppression() throws IOException {
     PushIngestService service = service();
     service.push(

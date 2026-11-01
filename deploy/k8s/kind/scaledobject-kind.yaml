@@ -1,0 +1,25 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: argus
+spec:
+  maxReplicaCount: 3
+  pollingInterval: 5
+  cooldownPeriod: 60
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+        scaleDown:
+          stabilizationWindowSeconds: 60
+          policies:
+            - {type: Pods, value: 1, periodSeconds: 30}
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka.argus.svc.cluster.local:9092
+        consumerGroup: argus-archive
+        topic: argus-wal
+        lagThreshold: "20000"
+        offsetResetPolicy: earliest

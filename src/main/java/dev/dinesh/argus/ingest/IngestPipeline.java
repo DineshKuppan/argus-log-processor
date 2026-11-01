@@ -4,6 +4,7 @@ import dev.dinesh.argus.checkpoint.CheckpointStore;
 import dev.dinesh.argus.checkpoint.ResumePoint;
 import dev.dinesh.argus.checkpoint.ResumePoint.Reason;
 import dev.dinesh.argus.config.IngestProperties;
+import dev.dinesh.argus.config.InstanceProperties;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.parser.FormatDetector;
@@ -133,6 +134,7 @@ public class IngestPipeline {
   private final WalCapacity walCapacity;
   private final ArgusMetrics metrics;
   private final TailHub tail;
+  private final String instanceId;
 
   /** Without an archive store nothing drains the WAL, so there is no WAL limit to wait for. */
   @Autowired
@@ -143,7 +145,8 @@ public class IngestPipeline {
       CheckpointStore checkpoints,
       ObjectProvider<WalCapacity> walCapacity,
       ObjectProvider<ArgusMetrics> metrics,
-      ObjectProvider<TailHub> tail) {
+      ObjectProvider<TailHub> tail,
+      ObjectProvider<InstanceProperties> instance) {
     this(
         props,
         parsers,
@@ -151,7 +154,8 @@ public class IngestPipeline {
         checkpoints,
         walCapacity.getIfAvailable(() -> WalCapacity.UNBOUNDED),
         metrics.getIfAvailable(ArgusMetrics::noop),
-        tail.getIfAvailable());
+        tail.getIfAvailable(),
+        instance.getIfAvailable(() -> InstanceProperties.NONE).id());
   }
 
   public IngestPipeline(
@@ -189,6 +193,23 @@ public class IngestPipeline {
       WalCapacity walCapacity,
       ArgusMetrics metrics,
       TailHub tail) {
+    this(props, parsers, sink, checkpoints, walCapacity, metrics, tail, null);
+  }
+
+  /**
+   * @param instanceId {@code argus.instance.id}, joined to every line's identity; null for a single
+   *     instance (P6 D8)
+   */
+  public IngestPipeline(
+      IngestProperties props,
+      ParserRegistry parsers,
+      LogSink sink,
+      CheckpointStore checkpoints,
+      WalCapacity walCapacity,
+      ArgusMetrics metrics,
+      TailHub tail,
+      String instanceId) {
+    this.instanceId = instanceId;
     this.props = props;
     this.parsers = parsers;
     this.sink = sink;
@@ -196,6 +217,11 @@ public class IngestPipeline {
     this.walCapacity = walCapacity;
     this.metrics = metrics;
     this.tail = tail;
+  }
+
+  /** {@code argus.instance.id}, or null for a single instance. */
+  public String instanceId() {
+    return instanceId;
   }
 
   /** True while the WAL is above its high watermark: new jobs would only wait. */
@@ -313,7 +339,7 @@ public class IngestPipeline {
               template,
               parsers.chain(primary, props.keepUnparsed()),
               request.tenantId(),
-              new EnvelopeFactory(request.tenantId(), sourceId, resume.generation()),
+              new EnvelopeFactory(request.tenantId(), sourceId, resume.generation(), instanceId),
               progress,
               cancel,
               request.readLimit(),

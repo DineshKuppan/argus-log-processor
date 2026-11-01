@@ -161,6 +161,15 @@ public final class GcsObjectStore implements ObjectStore {
     return keys;
   }
 
+  /** Text objects only: the body is read as UTF-8 (the archive index is JSON). */
+  @Override
+  public byte[] get(String key) throws IOException {
+    URI uri = URI.create(objectUrl(ObjectKeys.requireValid(key)) + "?alt=media");
+    HttpResponse<String> response =
+        withRetries("get " + key, () -> send(request(uri).GET(), 200, 404));
+    return response.statusCode() == 404 ? null : response.body().getBytes(StandardCharsets.UTF_8);
+  }
+
   @Override
   public void delete(String key) throws IOException {
     URI uri = URI.create(objectUrl(ObjectKeys.requireValid(key)));

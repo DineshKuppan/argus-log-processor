@@ -1,0 +1,24 @@
+# The kind check (P6_PLAN.md D13, §9): the base with one-broker Kafka, S3Mock and Redis in the
+# cluster, small pods, 6 partitions (so at most 3 consumers per group here), a low lag threshold
+# and no ingress (kind has no ingress controller by default). See ../README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: argus
+resources:
+  - ../base
+  - backing-services.yaml
+patches:
+  - path: statefulset-small.yaml
+  - path: scaledobject-kind.yaml
+  - target: {kind: Ingress, name: argus}
+    patch: |-
+      $patch: delete
+      apiVersion: networking.k8s.io/v1
+      kind: Ingress
+      metadata:
+        name: argus
+configMapGenerator:
+  - name: argus-config
+    behavior: merge
+    files:
+      - application-k8s.properties

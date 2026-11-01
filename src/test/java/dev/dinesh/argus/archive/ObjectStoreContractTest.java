@@ -2,6 +2,7 @@ package dev.dinesh.argus.archive;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -77,6 +78,16 @@ abstract class ObjectStoreContractTest {
         Set.copyOf(store.list(base + "s/gen=0/1-")));
     assertEquals(4, store.list(base + "s/").size());
     assertTrue(store.list(base + "missing/").isEmpty());
+  }
+
+  @Test
+  void getReturnsTheObjectOrNullWhenMissing() throws Exception {
+    store.put(base + "tenant=a/_archive/source=s/gen=0.json", file("{\"startOffset\":0}"));
+
+    assertArrayEquals(
+        "{\"startOffset\":0}".getBytes(StandardCharsets.UTF_8),
+        store.get(base + "tenant=a/_archive/source=s/gen=0.json"));
+    assertNull(store.get(base + "tenant=a/_archive/source=s/gen=1.json"));
   }
 
   @Test

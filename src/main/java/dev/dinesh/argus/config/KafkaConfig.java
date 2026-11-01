@@ -9,11 +9,13 @@ import dev.dinesh.argus.hot.HotIndices;
 import dev.dinesh.argus.kafka.ArchiveConsumer;
 import dev.dinesh.argus.kafka.HotConsumer;
 import dev.dinesh.argus.kafka.KafkaSink;
+import dev.dinesh.argus.kafka.KafkaTailBus;
 import dev.dinesh.argus.kafka.KafkaWal;
 import dev.dinesh.argus.kafka.KafkaWalCapacity;
 import dev.dinesh.argus.kafka.WalForwarder;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.sink.LogSink;
+import dev.dinesh.argus.tail.TailHub;
 import dev.dinesh.argus.wal.WalSegments;
 import dev.dinesh.argus.wal.WalSink;
 import io.micrometer.core.instrument.Gauge;
@@ -27,6 +29,7 @@ import java.util.EnumSet;
 import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Conditional;
@@ -45,8 +48,13 @@ import org.springframework.core.env.Environment;
 public class KafkaConfig {
 
   @Bean(destroyMethod = "close")
-  KafkaWal kafkaWal(KafkaProperties props) {
-    KafkaWal wal = new KafkaWal(props);
+  KafkaWal kafkaWal(KafkaProperties props, InstanceProperties instance) {
+    if (!instance.isSet()) {
+      log.warn(
+          "argus.instance.id is not set: run a single instance, or give each its own id (D8);"
+              + " two instances without ids overwrite each other's lines");
+    }
+    KafkaWal wal = new KafkaWal(props, instance.id());
     try {
       wal.ensureTopic();
     } catch (IOException e) {
@@ -60,7 +68,7 @@ public class KafkaConfig {
 
   @Bean
   LogSink kafkaSink(KafkaWal wal, ObjectMapper mapper, ObjectProvider<ArgusMetrics> metrics) {
-    return new KafkaSink(wal, mapper, metrics.getIfAvailable(ArgusMetrics::noop));
+    return new KafkaSink(wal, mapper, metrics.getIfAvailable(ArgusMetrics::noop), wal.instance());
   }
 
   private static boolean archiveRouted(Environment env) {
@@ -101,7 +109,7 @@ public class KafkaConfig {
     WalSegments staging =
         new WalSegments(Files.createDirectories(props.stagingDir()), Set.of(WalSink.ARCHIVE), true);
     return new ArchiveConsumer(
-        wal, props, new Archiver(archiveStore, staging, archive, mapper, m), m);
+        wal, props, new Archiver(archiveStore, staging, archive, mapper, m, true), m);
   }
 
   @Bean
@@ -119,6 +127,14 @@ public class KafkaConfig {
     return new HotConsumer(wal, props, writer, m);
   }
 
+  /** The live tail shared by every instance (D10), unless {@code tail-topic=none}. */
+  @Bean
+  @ConditionalOnExpression("!'${argus.kafka.tail-topic:argus-tail}'.equalsIgnoreCase('none')")
+  KafkaTailBus kafkaTailBus(
+      KafkaWal wal, TailHub hub, ObjectMapper mapper, ObjectProvider<ArgusMetrics> metrics) {
+    return new KafkaTailBus(wal, hub, mapper, metrics.getIfAvailable(ArgusMetrics::noop));
+  }
+
   /** Sends what a local WAL still holds (D6); finds nothing when there is none. */
   @Bean
   @Conditional(WalConfig.Drained.class)
@@ -128,6 +144,7 @@ public class KafkaConfig {
       KafkaProperties props,
       LogSink kafkaSink,
       ObjectMapper mapper,
+      InstanceProperties instance,
       Environment env) {
     Set<WalSink> routed = EnumSet.noneOf(WalSink.class);
     if (archiveRouted(env)) {
@@ -138,7 +155,7 @@ public class KafkaConfig {
     }
     boolean delete = routed.contains(WalSink.ARCHIVE) && archive.deleteAfterUpload();
     return new WalForwarder(
-        new WalSegments(local.root(), routed, delete),
+        new WalSegments(local.root(), routed, delete, instance.id()),
         kafkaSink,
         mapper,
         props.retryInitial(),

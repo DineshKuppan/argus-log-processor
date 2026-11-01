@@ -162,6 +162,48 @@ class HotTierEngineTest {
 
   @ParameterizedTest
   @EnumSource(Flavor.class)
+  void upgradingFromTheV1TemplateAddsItsFieldsToTodaysIndex(Flavor flavor) throws Exception {
+    SearchEngineClient client = EngineContainers.client(flavor);
+    HotProperties props = props(flavor, prefix(), List.of());
+    HotIndices indices = new HotIndices(props);
+    HotTemplates templates = new HotTemplates(client, indices, props);
+    // What an Argus before P6b installed: no source_instance, version 1.
+    var v1 = templates.template(client.flavor());
+    ((com.fasterxml.jackson.databind.node.ObjectNode) v1.at("/template/mappings/properties"))
+        .remove("source_instance");
+    v1.with("_meta").put("argus_template_version", 1);
+    assertTrue(client.json("PUT", "/_index_template/" + indices.prefix(), v1).ok());
+    assertFalse(
+        bulk(client, indices, List.of(line("acme", "a", NOW, "x", Map.of())))
+            .get("errors")
+            .asBoolean());
+
+    templates.install();
+
+    LogEnvelope e = line("acme", "b", NOW, "from an instance", Map.of());
+    LogEnvelope fromInstance =
+        new LogEnvelope(
+            e.eventId(),
+            e.tenantId(),
+            e.timestamp(),
+            e.observedTimestamp(),
+            e.severityText(),
+            e.severityNumber(),
+            e.body(),
+            e.traceId(),
+            e.spanId(),
+            e.resource(),
+            e.attributes(),
+            new LogEnvelope.Source("app", 0, 0, "json", "argus-1"));
+    JsonNode result = bulk(client, indices, List.of(fromInstance));
+    assertFalse(result.get("errors").asBoolean(), result.toString());
+    String index = indices.index("acme", LocalDate.of(2026, 11, 1));
+    assertEquals(
+        1, count(client, index, "{\"query\":{\"term\":{\"source_instance\":\"argus-1\"}}}"));
+  }
+
+  @ParameterizedTest
+  @EnumSource(Flavor.class)
   void theConfiguredStoreMustMatchTheCluster(Flavor flavor) throws Exception {
     SearchEngineClient client = EngineContainers.client(flavor);
     HotProperties.Store other =

@@ -1,0 +1,42 @@
+# Mounted at /config and read as an extra Spring config location. Credentials (API key hashes are
+# safe here; S3/GCS/Kafka SASL credentials are not) come from a Secret or the workload identity.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argus-config
+data:
+  application-k8s.properties: |
+    # P6b: the pod name (argus-0, argus-1, ...) is the instance id, set from the downward API.
+    argus.wal.store=kafka
+    argus.kafka.bootstrap-servers=kafka:9092
+    argus.kafka.topic=argus-wal
+    argus.kafka.tail-topic=argus-tail
+    argus.kafka.partitions=12
+    argus.kafka.replication-factor=3
+    argus.kafka.staging-dir=/data/kafka-staging
+
+    argus.ingest.checkpoint-dir=/data/checkpoints
+    argus.ingest.allowed-roots=/data/in
+    argus.sink.local.root=/data/wal
+    argus.sink.local.compression=zstd
+    argus.push.spool-dir=/data/spool
+
+    argus.archive.store=s3
+    argus.archive.prefix=argus
+    argus.archive.s3.bucket=argus-archive
+    argus.archive.s3.region=eu-west-1
+    argus.archive.staging-dir=/data/parquet
+
+    # Exact suppression across instances needs Redis (D11); the local store suppresses per instance.
+    argus.suppression.store=redis
+    argus.quota.store=redis
+    spring.data.redis.host=redis
+
+    # Drain on SIGTERM within terminationGracePeriodSeconds (120s): pushes 503, spools ingested.
+    argus.instance.drain-timeout=90s
+    server.shutdown=graceful
+    spring.lifecycle.timeout-per-shutdown-phase=20s
+
+    # The key "demo-key"; replace with your tenants' hashes: printf %s "$KEY" | shasum -a 256
+    argus.tenancy.api-keys[0].tenant=demo
+    argus.tenancy.api-keys[0].key-sha256=c48a01f49fd0f2cc404bc3cbbc80e91457a3d41bb429a695243de4c61794155c

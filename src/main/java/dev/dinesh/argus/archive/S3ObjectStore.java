@@ -11,12 +11,15 @@ import java.util.concurrent.ExecutionException;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.core.async.AsyncRequestBody;
+import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3AsyncClientBuilder;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
+import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.multipart.MultipartConfiguration;
 
@@ -112,6 +115,24 @@ public final class S3ObjectStore implements ObjectStore {
         client.listObjectsV2Paginator(request).contents().subscribe(o -> keys.add(o.key())),
         "list " + prefix);
     return keys;
+  }
+
+  @Override
+  public byte[] get(String key) throws IOException {
+    GetObjectRequest request =
+        GetObjectRequest.builder().bucket(bucket).key(ObjectKeys.requireValid(key)).build();
+    try {
+      return client.getObject(request, AsyncResponseTransformer.toBytes()).get().asByteArray();
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new IOException("Interrupted: get " + key + " in " + describe(), e);
+    } catch (ExecutionException | CompletionException e) {
+      Throwable cause = e.getCause() != null ? e.getCause() : e;
+      if (cause instanceof NoSuchKeyException) {
+        return null;
+      }
+      throw new IOException("Failed to get " + key + " in " + describe() + ": " + cause, cause);
+    }
   }
 
   @Override

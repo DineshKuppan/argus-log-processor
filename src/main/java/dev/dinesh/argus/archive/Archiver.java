@@ -108,10 +108,28 @@ public class Archiver implements SmartLifecycle {
       ArchiveProperties props,
       ObjectMapper mapper,
       ArgusMetrics metrics) {
+    this(store, wal, props, mapper, metrics, false);
+  }
+
+  /**
+   * @param indexInStore keep the {@link ArchiveIndex} in the object store instead of next to the
+   *     WAL: with Kafka as the WAL, a source's segments are archived by whichever instance owns its
+   *     partition (P6 D8)
+   */
+  public Archiver(
+      ObjectStore store,
+      WalSegments wal,
+      ArchiveProperties props,
+      ObjectMapper mapper,
+      ArgusMetrics metrics,
+      boolean indexInStore) {
     this.store = store;
     this.metrics = metrics;
     this.wal = wal;
-    this.index = new ArchiveIndex(wal.root(), mapper);
+    this.index =
+        indexInStore
+            ? new ArchiveIndex(store, props.prefix(), props.stagingDir(), mapper)
+            : new ArchiveIndex(wal.root(), mapper);
     this.props = props;
     this.mapper = mapper;
     this.envelopes = mapper.readerFor(LogEnvelope.class);

@@ -55,6 +55,7 @@ public final class WalSegments {
   private final Path root;
   private final Set<WalSink> routed;
   private final boolean deleteAcknowledged;
+  private final String instance;
 
   /** The archive as the only sink, deleting archived segments: the P2 setup. */
   public WalSegments(Path root) {
@@ -66,6 +67,15 @@ public final class WalSegments {
    * @param deleteAcknowledged delete a segment once every routed sink has acknowledged it
    */
   public WalSegments(Path root, Set<WalSink> routed, boolean deleteAcknowledged) {
+    this(root, routed, deleteAcknowledged, null);
+  }
+
+  /**
+   * @param instance {@code argus.instance.id} of the instance that wrote this WAL, or null (P6 D8):
+   *     a WAL volume belongs to one instance, so its segments carry that instance
+   */
+  public WalSegments(Path root, Set<WalSink> routed, boolean deleteAcknowledged, String instance) {
+    this.instance = instance;
     if (routed.isEmpty()) {
       throw new IllegalArgumentException("A WAL needs at least one sink");
     }
@@ -92,7 +102,19 @@ public final class WalSegments {
       int generation,
       long startOffset,
       long endOffset,
-      FileTime modified) {
+      FileTime modified,
+      String instance) {
+
+    public Segment(
+        Path file,
+        String tenantId,
+        String sourceId,
+        int generation,
+        long startOffset,
+        long endOffset,
+        FileTime modified) {
+      this(file, tenantId, sourceId, generation, startOffset, endOffset, modified, null);
+    }
 
     public boolean compressed() {
       return file.getFileName().toString().endsWith(LocalVolumeSink.ZSTD_SUFFIX);
@@ -100,7 +122,8 @@ public final class WalSegments {
 
     /**
      * Key of the archived object holding this segment's lines from byte {@code from} up to {@code
-     * to}: {@code tenant=T/dt=D/hour=H/source=S/gen=G/FROM-TO.parquet}. A segment whose lines span
+     * to}: {@code tenant=T/dt=D/hour=H/source=S/gen=G/FROM-TO.parquet}, with {@code instance=I/}
+     * before {@code gen} when the segment has an instance (P6 D8). A segment whose lines span
      * several hours becomes several objects whose ranges tile {@code [startOffset, endOffset)}, so
      * names stay offset-derived and a re-upload replaces, never duplicates.
      *
@@ -113,6 +136,7 @@ public final class WalSegments {
           + EventTimePartition.dayAndHour(eventTime)
           + "/source="
           + sourceId
+          + (instance == null ? "" : "/instance=" + instance)
           + "/gen="
           + generation
           + "/"
@@ -250,7 +274,8 @@ public final class WalSegments {
           Integer.parseInt(m.group(3)),
           Long.parseLong(m.group(4)),
           Long.parseLong(m.group(5)),
-          Files.getLastModifiedTime(file));
+          Files.getLastModifiedTime(file),
+          instance);
     } catch (NumberFormatException | IOException e) {
       log.debug("Skipping {}: not a readable WAL segment", file, e);
       return null;

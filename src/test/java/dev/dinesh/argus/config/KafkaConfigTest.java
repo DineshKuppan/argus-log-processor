@@ -32,6 +32,7 @@ class KafkaConfigTest {
   @EnableConfigurationProperties({
     ArchiveProperties.class,
     HotProperties.class,
+    InstanceProperties.class,
     KafkaProperties.class,
     LocalSinkProperties.class,
     SearchProperties.class,
@@ -60,7 +61,8 @@ class KafkaConfigTest {
             "argus.archive.store=filesystem",
             "argus.archive.filesystem.root=" + dir.resolve("archive"),
             "argus.hot.store=opensearch",
-            "argus.hot.url=http://127.0.0.1:1");
+            "argus.hot.url=http://127.0.0.1:1",
+            "argus.kafka.tail-topic=none");
   }
 
   @Test

@@ -61,6 +61,10 @@ public final class KafkaWal implements AutoCloseable {
   public static final String LINES = "argus-lines";
   public static final String FIRST = "argus-first";
   public static final String VERSION = "argus-v";
+
+  /** {@code argus.instance.id} of the writer (P6 D8); absent for a single instance. */
+  public static final String INSTANCE = "argus-inst";
+
   public static final String COMMIT = "commit";
   public static final String ABORT = "abort";
 
@@ -76,16 +80,30 @@ public final class KafkaWal implements AutoCloseable {
   private final KafkaProperties props;
   private final Producer<byte[], byte[]> producer;
   private final Admin admin;
+  private final String instance;
   private volatile boolean topicReady;
 
   public KafkaWal(KafkaProperties props) {
+    this(props, null);
+  }
+
+  /**
+   * @param instance {@code argus.instance.id}, appended to every client id (P6 D8, D9), or null
+   */
+  public KafkaWal(KafkaProperties props, String instance) {
     this(
         props,
-        new KafkaProducer<>(producerConfig(props)),
-        Admin.create(common(props, "argus-admin")));
+        new KafkaProducer<>(producerConfig(props, clientId("argus-wal-producer", instance))),
+        Admin.create(common(props, clientId("argus-admin", instance))),
+        instance);
   }
 
   KafkaWal(KafkaProperties props, Producer<byte[], byte[]> producer, Admin admin) {
+    this(props, producer, admin, null);
+  }
+
+  KafkaWal(KafkaProperties props, Producer<byte[], byte[]> producer, Admin admin, String instance) {
+    this.instance = instance;
     if (props.bootstrapServers() == null || props.bootstrapServers().isBlank()) {
       throw new IllegalArgumentException(
           "argus.wal.store=kafka needs argus.kafka.bootstrap-servers");
@@ -107,6 +125,20 @@ public final class KafkaWal implements AutoCloseable {
     return producer;
   }
 
+  /** {@code argus.instance.id}, or null for a single instance. */
+  public String instance() {
+    return instance;
+  }
+
+  /** {@code base}, or {@code base-<instance>}: how group members tell instances apart. */
+  public String clientId(String base) {
+    return clientId(base, instance);
+  }
+
+  private static String clientId(String base, String instance) {
+    return instance == null ? base : base + "-" + instance;
+  }
+
   private static Map<String, Object> common(KafkaProperties props, String clientId) {
     Map<String, Object> config = new HashMap<>(props.properties());
     config.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, props.bootstrapServers());
@@ -120,7 +152,11 @@ public final class KafkaWal implements AutoCloseable {
    * that is backpressure on the writer, not a failure (D5).
    */
   static Map<String, Object> producerConfig(KafkaProperties props) {
-    Map<String, Object> config = common(props, "argus-wal-producer");
+    return producerConfig(props, "argus-wal-producer");
+  }
+
+  static Map<String, Object> producerConfig(KafkaProperties props, String clientId) {
+    Map<String, Object> config = common(props, clientId);
     long outage = props.maxOutage().toMillis();
     config.put(ProducerConfig.ACKS_CONFIG, "all");
     config.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
@@ -148,6 +184,8 @@ public final class KafkaWal implements AutoCloseable {
     config.put(ConsumerConfig.GROUP_ID_CONFIG, group);
     config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
     config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    // Argus creates its topics with safe settings (D6); a broker default would not be.
+    config.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, false);
     config.put(
         ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
         CooperativeStickyAssignor.class.getName());
@@ -326,6 +364,82 @@ public final class KafkaWal implements AutoCloseable {
       return lag;
     } catch (ExecutionException e) {
       throw new IOException("Measuring Kafka consumer lag failed", e.getCause());
+    }
+  }
+
+  /**
+   * The tail topic's partition count, creating it first (1h retention, {@code partitions} as the
+   * WAL's) when it is missing and {@code create-topics} allows. Unlike the WAL topic it holds
+   * nothing that isn't elsewhere, so it isn't checked.
+   *
+   * @throws IllegalStateException it is missing and may not be created
+   */
+  public int ensureTailTopic() throws IOException {
+    String tail = props.tailTopic();
+    try {
+      try {
+        return await(admin.describeTopics(List.of(tail)).allTopicNames())
+            .get(tail)
+            .partitions()
+            .size();
+      } catch (ExecutionException e) {
+        if (!(e.getCause() instanceof UnknownTopicOrPartitionException)) {
+          throw e;
+        }
+      }
+      if (!props.createTopics()) {
+        throw new IllegalStateException(
+            "Kafka tail topic "
+                + tail
+                + " does not exist; create it or set argus.kafka.create-topics=true"
+                + " (or argus.kafka.tail-topic=none for a local tail)");
+      }
+      NewTopic topic =
+          new NewTopic(tail, props.partitions(), props.replicationFactor())
+              .configs(
+                  Map.of(
+                      TopicConfig.RETENTION_MS_CONFIG,
+                      "3600000",
+                      TopicConfig.MAX_MESSAGE_BYTES_CONFIG,
+                      Integer.toString(MAX_RECORD_BYTES)));
+      try {
+        await(admin.createTopics(List.of(topic)).all());
+      } catch (ExecutionException e) {
+        if (!(e.getCause() instanceof TopicExistsException)) {
+          throw e;
+        }
+      }
+      return props.partitions();
+    } catch (ExecutionException e) {
+      throw new IOException("Kafka tail topic " + tail + ": " + e.getCause(), e.getCause());
+    }
+  }
+
+  /**
+   * Fails while another member of {@code group} uses {@code clientId}: with {@code
+   * argus.instance.id} in client ids, two instances given the same id (D8), or this instance's
+   * previous run killed less than {@code session.timeout.ms} ago. Without an instance id, never.
+   *
+   * @throws IllegalStateException the id is in use
+   */
+  public void requireClientIdFree(String group, String clientId) throws IOException {
+    if (instance == null) {
+      return;
+    }
+    try {
+      var members = await(admin.describeConsumerGroups(List.of(group)).all()).get(group).members();
+      if (members.stream().anyMatch(m -> clientId.equals(m.clientId()))) {
+        throw new IllegalStateException(
+            "Consumer group "
+                + group
+                + " already has a member "
+                + clientId
+                + ": another instance with argus.instance.id="
+                + instance
+                + ", or this instance's previous run (it leaves within the session timeout)");
+      }
+    } catch (ExecutionException e) {
+      throw new IOException("Describing consumer group " + group + " failed", e.getCause());
     }
   }
 

@@ -175,6 +175,7 @@ public final class EnvelopeParquetWriter implements Closeable {
       int32(EnvelopeSchema.SOURCE_GENERATION, source.generation());
       int64(EnvelopeSchema.SOURCE_OFFSET, source.offset());
       string(EnvelopeSchema.SOURCE_FORMAT, source.format());
+      string(EnvelopeSchema.SOURCE_INSTANCE, source.instance());
       out.endMessage();
     }
 

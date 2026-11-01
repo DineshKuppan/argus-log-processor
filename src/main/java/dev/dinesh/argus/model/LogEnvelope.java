@@ -36,6 +36,18 @@ public record LogEnvelope(
   /**
    * @param offset byte offset of the line's first byte in the source file
    * @param format parser that produced the record
+   * @param instance the instance that ingested the line ({@code argus.instance.id}, P6 D8); null
+   *     with a single instance, and then not written, so single-instance lines are unchanged
    */
-  public record Source(String id, int generation, long offset, String format) {}
+  public record Source(
+      String id,
+      int generation,
+      long offset,
+      String format,
+      @JsonInclude(JsonInclude.Include.NON_NULL) String instance) {
+
+    public Source(String id, int generation, long offset, String format) {
+      this(id, generation, offset, format, null);
+    }
+  }
 }

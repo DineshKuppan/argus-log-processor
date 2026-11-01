@@ -43,7 +43,12 @@ import org.apache.kafka.common.header.Headers;
 final class SegmentStager {
 
   /** One segment of a source, as its records name it. */
-  record Key(String tenantId, String sourceId, int generation, long startOffset) {}
+  record Key(String tenantId, String sourceId, String instance, int generation, long startOffset) {
+
+    Key(String tenantId, String sourceId, int generation, long startOffset) {
+      this(tenantId, sourceId, null, generation, startOffset);
+    }
+  }
 
   /** A segment whose commit marker arrived: ready to archive. */
   record Ready(int partition, long firstOffset, Segment segment) {}
@@ -221,7 +226,8 @@ final class SegmentStager {
             s.key.generation(),
             s.key.startOffset(),
             end,
-            Files.getLastModifiedTime(target));
+            Files.getLastModifiedTime(target),
+            s.key.instance());
     ready = new Ready(s.partition, s.firstOffset, segment);
     return Result.COMMITTED;
   }
@@ -305,9 +311,13 @@ final class SegmentStager {
     try {
       String tenant = TenantIds.requireValid(key.substring(0, slash));
       String source = SourceOffset.requireValidSourceId(key.substring(slash + 1));
+      String instanceHeader = KafkaWal.header(headers, KafkaWal.INSTANCE);
+      String instance = instanceHeader == null ? null : TenantIds.requireValid(instanceHeader);
       int generation = Integer.parseInt(segment.substring(0, colon));
       long start = Long.parseLong(segment.substring(colon + 1));
-      return generation < 0 || start < 0 ? null : new Key(tenant, source, generation, start);
+      return generation < 0 || start < 0
+          ? null
+          : new Key(tenant, source, instance, generation, start);
     } catch (IllegalArgumentException e) {
       return null;
     }
@@ -329,7 +339,9 @@ final class SegmentStager {
         root.resolve(TenantIds.pathSegment(key.tenantId()))
             .resolve("dt=kafka")
             .resolve("source=" + key.sourceId())
-            .resolve("gen=" + key.generation());
+            .resolve(key.instance() == null ? "." : "instance=" + key.instance())
+            .resolve("gen=" + key.generation())
+            .normalize();
     Files.createDirectories(dir);
     return dir.resolve(key.startOffset() + suffix);
   }

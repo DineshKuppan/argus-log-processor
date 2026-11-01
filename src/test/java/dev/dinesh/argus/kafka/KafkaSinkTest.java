@@ -64,6 +64,51 @@ class KafkaSinkTest {
       assertEquals(KafkaWal.COMMIT, KafkaWal.header(marker.headers(), KafkaWal.TYPE));
       assertEquals("150", KafkaWal.header(marker.headers(), KafkaWal.END));
       assertEquals("5", KafkaWal.header(marker.headers(), KafkaWal.LINES));
+      assertEquals(
+          Long.toString(records.get(0).offset()),
+          KafkaWal.header(marker.headers(), KafkaWal.FIRST));
+      assertNull(KafkaWal.header(marker.headers(), KafkaWal.INSTANCE));
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(Broker.class)
+  void anInstancesRecordsCarryItsId(Broker broker) throws Exception {
+    String topic = KafkaContainers.topic();
+    try (KafkaWal wal = new KafkaWal(KafkaContainers.props(broker, topic, dir), "argus-1")) {
+      KafkaSink sink = new KafkaSink(wal, WalFixture.MAPPER, ArgusMetrics.noop(), wal.instance());
+      new WalFixture(sink).write("acme", "app", 0, 0, 2, T);
+
+      List<ConsumerRecord<byte[], byte[]>> records = KafkaContainers.readAll(broker, topic, 3);
+      for (ConsumerRecord<byte[], byte[]> r : records) {
+        assertEquals("argus-1", KafkaWal.header(r.headers(), KafkaWal.INSTANCE));
+      }
+    }
+  }
+
+  @ParameterizedTest
+  @EnumSource(Broker.class)
+  void aSecondMemberWithTheSameInstanceIdIsRefused(Broker broker) throws Exception {
+    String topic = KafkaContainers.topic();
+    String group = "g-" + topic;
+    try (KafkaWal wal = new KafkaWal(KafkaContainers.props(broker, topic, dir), "argus-1");
+        org.apache.kafka.clients.consumer.KafkaConsumer<byte[], byte[]> first =
+            new org.apache.kafka.clients.consumer.KafkaConsumer<>(
+                wal.consumerConfig(group, wal.clientId("argus-archive")))) {
+      wal.ensureTopic();
+      wal.requireClientIdFree(group, wal.clientId("argus-archive"));
+      first.subscribe(List.of(topic));
+      long deadline = System.nanoTime() + java.time.Duration.ofSeconds(30).toNanos();
+      while (first.assignment().isEmpty() && System.nanoTime() < deadline) {
+        first.poll(java.time.Duration.ofMillis(200));
+      }
+
+      IllegalStateException e =
+          assertThrows(
+              IllegalStateException.class,
+              () -> wal.requireClientIdFree(group, wal.clientId("argus-archive")));
+      assertTrue(e.getMessage().contains("argus.instance.id=argus-1"), e.getMessage());
+      wal.requireClientIdFree(group, wal.clientId("argus-hot"));
     }
   }
 

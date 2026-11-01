@@ -26,11 +26,20 @@ public final class EnvelopeFactory {
   private final String tenantId;
   private final String sourceId;
   private final int generation;
+  private final String instance;
 
   public EnvelopeFactory(String tenantId, String sourceId, int generation) {
+    this(tenantId, sourceId, generation, null);
+  }
+
+  /**
+   * @param instance {@code argus.instance.id}, or null for a single instance (P6 D8)
+   */
+  public EnvelopeFactory(String tenantId, String sourceId, int generation, String instance) {
     this.tenantId = tenantId;
     this.sourceId = sourceId;
     this.generation = generation;
+    this.instance = instance;
   }
 
   /**
@@ -66,21 +75,31 @@ public final class EnvelopeFactory {
         Fields.takeText(attributes, SPAN_ID_KEYS),
         service == null ? null : Map.of("service.name", service),
         attributes,
-        new LogEnvelope.Source(sourceId, generation, lineOffset, parsed.format()));
+        new LogEnvelope.Source(sourceId, generation, lineOffset, parsed.format(), instance));
   }
 
-  /** Same tenant, source, generation and offset always give the same id (guardrail 3). */
+  /** Same tenant, source, instance, generation and offset always give the same id (guardrail 3). */
   String eventId(long lineOffset) {
-    return eventId(tenantId, sourceId, generation, lineOffset);
+    return eventId(tenantId, sourceId, instance, generation, lineOffset);
+  }
+
+  /** {@link #eventId(String, String, String, int, long)} for a single instance. */
+  public static String eventId(String tenantId, String sourceId, int generation, long lineOffset) {
+    return eventId(tenantId, sourceId, null, generation, lineOffset);
   }
 
   /**
-   * The one definition of {@code eventId}. The Parquet archive stores only these four inputs (its
-   * {@code tenant_id}, {@code source_id}, {@code source_generation} and {@code source_offset}
-   * columns), so a reader re-derives the id with this.
+   * The one definition of {@code eventId}. The Parquet archive stores only these inputs (its {@code
+   * tenant_id}, {@code source_id}, {@code source_instance}, {@code source_generation} and {@code
+   * source_offset} columns), so a reader re-derives the id with this. Without an instance the id is
+   * the P0–P5 one, byte for byte.
    */
-  public static String eventId(String tenantId, String sourceId, int generation, long lineOffset) {
-    String key = tenantId + '\n' + sourceId + '\n' + generation + '\n' + lineOffset;
+  public static String eventId(
+      String tenantId, String sourceId, String instance, int generation, long lineOffset) {
+    String key =
+        instance == null
+            ? tenantId + '\n' + sourceId + '\n' + generation + '\n' + lineOffset
+            : tenantId + '\n' + sourceId + '\n' + instance + '\n' + generation + '\n' + lineOffset;
     return UUID.nameUUIDFromBytes(key.getBytes(StandardCharsets.UTF_8)).toString();
   }
 

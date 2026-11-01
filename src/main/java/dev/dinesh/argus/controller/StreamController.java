@@ -96,6 +96,7 @@ public class StreamController {
           case TOO_LARGE -> HttpStatus.PAYLOAD_TOO_LARGE;
           case TOO_MANY_STREAMS, SOURCE_IN_USE -> HttpStatus.CONFLICT;
           case UNSUPPORTED_ENCODING -> HttpStatus.UNSUPPORTED_MEDIA_TYPE;
+          case DRAINING -> HttpStatus.SERVICE_UNAVAILABLE;
         };
     ResponseEntity.BodyBuilder response = ResponseEntity.status(status);
     if (e.retryAfterSeconds() > 0) {

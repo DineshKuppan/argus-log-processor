@@ -245,7 +245,8 @@ public class SearchService {
             text(source, "source_id"),
             source.path("source_generation").asInt(0),
             source.path("source_offset").asLong(0),
-            text(source, "source_format")));
+            text(source, "source_format"),
+            text(source, "source_instance")));
   }
 
   private static String text(JsonNode node, String field) {

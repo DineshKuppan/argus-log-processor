@@ -35,11 +35,21 @@ public final class KafkaSink implements LogSink {
   private final KafkaWal wal;
   private final ObjectWriter writer;
   private final ArgusMetrics metrics;
+  private final byte[] instance;
 
   public KafkaSink(KafkaWal wal, ObjectMapper mapper, ArgusMetrics metrics) {
+    this(wal, mapper, metrics, null);
+  }
+
+  /**
+   * @param instance {@code argus.instance.id}, sent as {@code argus-inst} on every record so the
+   *     archive consumer keeps two instances' segments of one source id apart (P6 D8); or null
+   */
+  public KafkaSink(KafkaWal wal, ObjectMapper mapper, ArgusMetrics metrics, String instance) {
     this.wal = wal;
     this.writer = mapper.writerFor(LogEnvelope.class);
     this.metrics = metrics;
+    this.instance = instance == null ? null : KafkaWal.utf8(instance);
   }
 
   /** Nothing to remove: an uncommitted segment's records are already in the topic (D3). */
@@ -89,6 +99,9 @@ public final class KafkaSink implements LogSink {
       RecordHeaders headers = new RecordHeaders();
       headers.add(KafkaWal.VERSION, KafkaWal.utf8("1"));
       headers.add(KafkaWal.SEGMENT, segment);
+      if (instance != null) {
+        headers.add(KafkaWal.INSTANCE, instance);
+      }
       return headers;
     }
 

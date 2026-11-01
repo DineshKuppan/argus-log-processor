@@ -30,6 +30,7 @@ class ArchiveConfigTest {
   @EnableConfigurationProperties({
     ArchiveProperties.class,
     HotProperties.class,
+    InstanceProperties.class,
     LocalSinkProperties.class,
     SearchProperties.class,
     WalProperties.class

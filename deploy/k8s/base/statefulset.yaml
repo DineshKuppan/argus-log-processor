@@ -1,0 +1,67 @@
+# One pod per instance: a stable name (the instance id, D8) and its own volume for spools,
+# checkpoints and staging. Kafka holds the WAL, so losing a volume loses at most the spools'
+# last flush-interval.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: argus
+  labels: {app: argus}
+spec:
+  serviceName: argus-headless
+  replicas: 1 # KEDA owns the count (keda-scaledobject.yaml)
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: {app: argus}
+  template:
+    metadata:
+      labels: {app: argus}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9001"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: argus
+          image: argus:dev
+          ports:
+            - {name: http, containerPort: 9000}
+            - {name: management, containerPort: 9001}
+          env:
+            - name: ARGUS_INSTANCE_ID
+              valueFrom:
+                fieldRef: {fieldPath: metadata.name}
+            - name: SPRING_CONFIG_ADDITIONAL_LOCATION
+              value: file:/config/
+            - name: SPRING_PROFILES_ACTIVE
+              value: k8s
+          resources:
+            requests: {cpu: "2", memory: 4Gi}
+            limits: {memory: 4Gi}
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /livez, port: http}
+            periodSeconds: 10
+            failureThreshold: 6
+          startupProbe:
+            httpGet: {path: /livez, port: http}
+            periodSeconds: 2
+            failureThreshold: 90
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: config, mountPath: /config}
+      volumes:
+        - name: config
+          configMap: {name: argus-config}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 100Gi}

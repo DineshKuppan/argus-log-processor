@@ -31,6 +31,32 @@ class TailRingTest {
   }
 
   @Test
+  void aBusFedRingNamesEventsByPositionAndResumesOnlyWhatItCovers() throws Exception {
+    TailRing ring = new TailRing(3, 1_000_000, "p2");
+    ring.append(events(2), new long[] {10, 14});
+
+    assertEquals(List.of("p2-10", "p2-14"), ring.read(0, 10, 0).ids());
+    assertEquals(1, ring.resume("p2-10"));
+    assertEquals(1, ring.resume("p2-12"), "11-13 were other tenants' records");
+    assertEquals(2, ring.resume("p2-14"));
+    assertEquals(-1, ring.resume("p2-9"), "the ring can't show what came before 10");
+    assertEquals(-1, ring.resume("p3-10"), "another partition's ring");
+
+    ring.append(events(2), new long[] {20, 21}); // evicts 10
+    assertEquals(-1, ring.resume("p2-10"));
+    assertEquals(3, ring.resume("p2-20"));
+  }
+
+  @Test
+  void aLocalRingNamesEventsBySequence() throws Exception {
+    TailRing ring = new TailRing(3, 1_000_000);
+    ring.append(events(2));
+    List<String> ids = ring.read(0, 10, 0).ids();
+    assertEquals(List.of(ring.id() + "-0", ring.id() + "-1"), ids);
+    assertEquals(1, ring.resume(ids.get(0)));
+  }
+
+  @Test
   void anEventWeighsItsAttributesNotJustItsBody() {
     Map<String, Object> fields = new HashMap<>();
     for (int i = 0; i < 20; i++) {

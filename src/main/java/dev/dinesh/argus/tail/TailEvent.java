@@ -42,6 +42,33 @@ public record TailEvent(
   /** Cost of a value that isn't text, a map or a list (a boxed number or boolean). */
   static final int VALUE_BYTES = 32;
 
+  /**
+   * This event as received from another instance ({@link TailBus}): the weight isn't sent, so it is
+   * estimated from the JSON's length.
+   */
+  public TailEvent withWeight(int weight) {
+    return new TailEvent(
+        eventId,
+        source,
+        format,
+        offset,
+        timestamp,
+        observedTimestamp,
+        severityText,
+        severityNumber,
+        body,
+        traceId,
+        spanId,
+        resource,
+        attributes,
+        weight);
+  }
+
+  /** Estimated heap of an event parsed from {@code bytes} of JSON: two bytes a character. */
+  public static int weightOfJson(int bytes) {
+    return (int) Math.min(Integer.MAX_VALUE, OVERHEAD_BYTES + 2L * bytes);
+  }
+
   /** A line of a file job, with the {@code eventId} and offset the archive will hold. */
   public static TailEvent ofFile(LogEnvelope envelope) {
     return of(envelope, envelope.eventId(), envelope.source().offset());

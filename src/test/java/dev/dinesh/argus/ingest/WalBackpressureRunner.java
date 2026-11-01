@@ -87,6 +87,11 @@ public final class WalBackpressureRunner {
           }
 
           @Override
+          public byte[] get(String key) throws IOException {
+            return real.get(key);
+          }
+
+          @Override
           public void delete(String key) throws IOException {
             real.delete(key);
           }

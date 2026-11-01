@@ -42,6 +42,7 @@ public final class HotDocument {
   static final String SOURCE_GENERATION = "source_generation";
   static final String SOURCE_OFFSET = "source_offset";
   static final String SOURCE_FORMAT = "source_format";
+  static final String SOURCE_INSTANCE = "source_instance";
 
   private static final DateTimeFormatter MILLIS = DateTimeFormatter.ISO_INSTANT;
 
@@ -76,6 +77,7 @@ public final class HotDocument {
       doc.put(SOURCE_GENERATION, e.source().generation());
       doc.put(SOURCE_OFFSET, e.source().offset());
       putIfPresent(doc, SOURCE_FORMAT, e.source().format());
+      putIfPresent(doc, SOURCE_INSTANCE, e.source().instance());
     }
     return doc;
   }

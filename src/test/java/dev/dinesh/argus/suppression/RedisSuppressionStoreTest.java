@@ -70,6 +70,32 @@ class RedisSuppressionStoreTest {
   }
 
   @Test
+  void aBatchIsDecidedInOrderInOneRoundTrip() {
+    RedisSuppressionStore store = new RedisSuppressionStore(redis, Duration.ofSeconds(10));
+    String a = key();
+    String b = key() + "b";
+    store.acquire(b, "b"); // b's window is already open
+
+    List<SuppressionDecision> decisions =
+        store.acquireAll(List.of(a, a, b, a), List.of("a", "a", "b", "a"));
+
+    assertEquals(
+        List.of(Decision.ALLOW, Decision.DENY, Decision.DENY, Decision.DENY),
+        decisions.stream().map(SuppressionDecision::decision).toList());
+    assertEquals(2, decisions.get(3).suppressedCount());
+    assertEquals(0, store.failOpenCount());
+    // Redis' own script cache was flushed: the batch loads the script again.
+    redis.execute(
+        (org.springframework.data.redis.core.RedisCallback<Object>)
+            c -> {
+              c.scriptingCommands().scriptFlush();
+              return null;
+            });
+    assertEquals(
+        Decision.ALLOW, store.acquireAll(List.of(key() + "c"), List.of("c")).get(0).decision());
+  }
+
+  @Test
   void exactlyOneOfManyConcurrentIdenticalCallsIsAllowed() throws Exception {
     RedisSuppressionStore store = new RedisSuppressionStore(redis, Duration.ofSeconds(10));
     String key = key();

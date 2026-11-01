@@ -146,7 +146,7 @@ P6a replaces the WAL with a Kafka topic, with the sinks as consumer groups (ADR-
   - In the hot tier that overwrites documents; in the archive it overwrites objects. Either way lines are silently lost.
 - **Task:** make identities unique across instances, without changing them for single-instance deployments.
 - **Action:**
-  - `argus.instance.id` (empty by default: identities unchanged). With several instances it is required, and startup fails if consumer group members report the same id. In Kubernetes it is the StatefulSet pod name (`argus-0`, …), stable across restarts, with its own PVC for spools and checkpoints.
+  - `argus.instance.id` (empty by default: identities unchanged). With several instances it is required; a consumer won't join while its group has a member with its client id (§9 corrections). In Kubernetes it is the StatefulSet pod name (`argus-0`, …), stable across restarts, with its own PVC for spools and checkpoints.
   - When set:
     - the instance joins the identity: `eventId = UUIDv3(tenant, source, instance, generation, offset)`;
     - envelopes carry `source.instance`;
@@ -187,7 +187,7 @@ P6a replaces the WAL with a Kafka topic, with the sinks as consumer groups (ADR-
     - Every instance reads every partition (`assign`, no group, from the end) and treats a tenant as watched for 15s after its last heartbeat.
     - So `isWatched` stays a map lookup, and an unwatched tenant still costs nothing at ingest.
   - **Delivery:** each instance's tail consumer appends records to its local `TailRing`s, as taps do now. The rings, filters, rate caps and drop markers of P4 are unchanged.
-  - **Event ids** become `<partition>-<offset>`, the same on every instance. A reconnect to another instance resumes if its ring still holds that offset (a tenant's records are in one partition, in order), else `reset`, as now.
+  - **Event ids** become `p<partition>-<offset>`, the same on every instance. A reconnect to another instance resumes if its ring still holds that offset (a tenant's records are in one partition, in order), else `reset`, as now.
 - **Result:** T7 across instances. A tail outage (tail topic unavailable) drops tail lines and counts them; ingest never notices.
 
 ### D11. Suppression across instances: the Redis store, pipelined; not partitioned by key
@@ -369,3 +369,45 @@ Notes:
 - Throughput is the same as the local WAL's within run-to-run noise: the producer batches and compresses, and the cost moves from fsyncing segment files to Kafka's acknowledgements.
 - The T1 Kafka runs reached 248–252MB of the 256MB test heap (the local WAL 222–237MB): the 32MB producer buffer (D7) fills under an unthrottled push. The production heap (2.4GB) leaves ample room; D7's ≈75MB holds.
 - During the broker outage nothing was archived (the topic was unreachable) but nothing was refused either: the spools (2GB) absorbed 60s at 2,000 lines/s.
+
+### P6b
+`MultiInstanceIT` and `SuppressionAcrossInstancesIT` (tag `load`), on the host (a 10-core laptop):
+- each instance is its own 256MB server JVM, with its own volume and `argus.instance.id`;
+- all of them share one broker (6 partitions, replication 1), one tail topic, one filesystem archive store and one OpenSearch 2.17 cluster;
+- clients push each stream to one instance, as the ingress's hash would.
+
+| Check | Apache Kafka 3.8 | Redpanda 24.2 |
+|---|---|---|
+| **D9**: three instances, 6 keyed pushers (300,000 lines, 2MB segments); `kill -9` of `argus-1` once a quarter was archived, restart 10s later with its id and volume | Killed with 83,000 archived and 22,343 indexed; afterwards **exactly 300,000** rows in the archive and **300,000** documents in the hot tier | Killed with 100,000 archived and 23,579 indexed; exactly 300,000 and 300,000 |
+| **D10 / T7 across instances**: a tail open on instance 1, 100 lines pushed to instance 0, each timed from its 202 to its SSE frame | **p50 24.8ms, p99 54.3ms**, max 167.6ms | p50 27.7ms, p99 45.6ms, max 170.8ms |
+
+| Check (Redis 7.2, two instances) | Result |
+|---|---|
+| **D11**: the same 1,000 messages pushed to instance 0, then to instance 1, within the window | 1,000 accepted and 1,000 suppressed in all: each message allowed once across both |
+| **D11**: p99 of a 10,000-line push of unique messages (50 requests after 5 warm-ups) | **Redis 680.8ms** (10 pipelined round trips); the local store 53.8ms. The plan estimated 2–5s for 10,000 sequential calls |
+
+**D13, `kind`** (`deploy/k8s/kind`):
+- **Setup:** kind v0.33 (Kubernetes 1.37), KEDA 2.20.2, one-broker Kafka, S3Mock and Redis in the cluster. The pods are 768Mi each, with 6 partitions and a lag threshold of 20,000 records.
+- **Scale-up:** S3Mock was scaled to 0 with 2,000 lines/s pushed to `argus-0`. The `argus-archive` lag reached 43,014, and **KEDA scaled the StatefulSet 1 → 3 within 31s**. `argus-1` and `argus-2` each took two of the six partitions.
+- **Scale-down:** after S3Mock came back, the lag drained to 0 and **KEDA scaled back to 1 within 108s**, one pod at a time. Each removed pod logged `Instance drain finished pushesFinished=true spoolsDrained=true` once.
+- **Exactness:** the 290,000 lines the spools accepted were all archived (96 segments: 49 by `argus-0`, 24 by `argus-1`, 23 by `argus-2`), with no segment archived twice.
+- **Why 290,000, not the pusher's 300,000:** 10 batches reused the keys of a smoke test run against an earlier topic. The spool answered them as duplicates (200), so they weren't stored again.
+
+Notes:
+- **Redis suppression cost.** Pipelining makes Redis suppression affordable, but still about 10x the local store for a 10,000-line request. The cost is Redis running 10,000 Lua calls, plus the round trips through Docker Desktop's port forwarding.
+- **Kill under load.** A killed instance's pushes failed (connection refused) until its restart, then were retried with their keys and accepted once. Its partitions had moved to the other two after the session timeout. Nothing was duplicated in either tier, because of offset-derived keys and `_id = eventId`.
+
+Corrections to the decisions above, found while building and testing:
+- **D8: the archive index moved to the object store.** With Kafka, `ArchiveIndex` entries are objects under the archive prefix (`ObjectStore.get` was added to every store). With the local WAL they stay next to it. This resolves the §7 risk row.
+- **D8 and D9: duplicate instance ids wait instead of failing startup.** Client ids end in the instance id, and a consumer refuses to join while its group has a member with that client id. It logs an error and retries with backoff, so a pod restarted within the session timeout waits for its previous run to leave, rather than failing.
+  - Static membership (`group.instance.id`) was rejected. It would have detected duplicates for free, but a static member doesn't leave its group on a clean shutdown, so a scale-down would hold its partitions for the 45s session timeout.
+- **D10: ring ids are `p<partition>`, not `<partition>-<offset>`.** Event ids carry the offset (`p3-1200`). A tenant's partition is computed with the default partitioner's hash, so a ring's id is known before any line arrives.
+  - **Resume rule.** A resume succeeds only when the ring holds an event at or before the client's last position. Otherwise the client gets `reset`, because positions between could belong to other tenants or to lines the ring never saw.
+  - **Metadata warm-up.** The tail producer must fetch the topic's metadata before the first line: with `max.block.ms=0`, every send fails until it has the metadata.
+- **D12: the drain runs on `ContextClosedEvent`, not as a lifecycle bean.** Lifecycle beans at the default phase stop before the web server does, so a bean couldn't stop pushes first.
+  - It runs once, for the application context: the management server's child context publishes its own `ContextClosedEvent`.
+  - The spool drain stops when a round makes no progress and no run is still in progress, so failing runs (for example, deleted spool files) end it early instead of at the timeout.
+- **D13: two `kind` findings, both recorded in the manifests.**
+  - **KEDA needs a fully qualified broker name.** KEDA runs in its own namespace, so the scaler (and the broker's advertised listener) need `kafka.<namespace>.svc.cluster.local`.
+  - **Brokers need `auto.create.topics.enable=false`.** A producer's metadata request creates a missing topic with the broker's defaults: here `max.message.bytes` 1MB after the broker restarted while Argus was producing. Argus's topic check then refuses that topic (D6), as it should. Argus's consumers now also set `allow.auto.create.topics=false`.
+  - S3Mock 4.x reads `initialBuckets`, not the `COM_ADOBE_…` names.

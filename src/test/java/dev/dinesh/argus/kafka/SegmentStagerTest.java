@@ -54,6 +54,12 @@ class SegmentStagerTest {
     return s == null ? null : s.getBytes(StandardCharsets.UTF_8);
   }
 
+  private static RecordHeaders line(String segment, long sourceOffset, String instance) {
+    RecordHeaders h = line(segment, sourceOffset);
+    h.add(KafkaWal.INSTANCE, b(instance));
+    return h;
+  }
+
   private static RecordHeaders line(String segment, long sourceOffset) {
     RecordHeaders h = new RecordHeaders();
     h.add(KafkaWal.SEGMENT, b(segment));
@@ -171,6 +177,26 @@ class SegmentStagerTest {
 
     s.accept(0, 7, b("acme/web"), line("0:0", 0), b("whole"));
     assertEquals(Result.COMMITTED, s.accept(0, 8, b("acme/web"), commit("0:0", 10, 1, 7), null));
+  }
+
+  @Test
+  void twoInstancesSegmentsOfOneSourceIdStayApart() throws IOException {
+    SegmentStager s = stager();
+    s.accept(0, 0, b("acme/app"), line("0:0", 0, "argus-0"), b("from 0"));
+    s.accept(0, 1, b("acme/app"), line("0:0", 0, "argus-1"), b("from 1"));
+    assertEquals(2, s.open(), "not a replay: another instance's segment");
+
+    RecordHeaders marker = commit("0:0", 10, 1);
+    marker.add(KafkaWal.INSTANCE, b("argus-1"));
+    assertEquals(Result.COMMITTED, s.accept(0, 2, b("acme/app"), marker, null));
+    SegmentStager.Ready ready = s.takeReady();
+    assertEquals("argus-1", ready.segment().instance());
+    assertEquals(
+        root.resolve("tenant=acme/dt=kafka/source=app/instance=argus-1/gen=0/0-10.ndjson.zst"),
+        ready.segment().file());
+    assertEquals(List.of("from 1"), lines(ready.segment().file()));
+    assertEquals(
+        Result.INVALID, s.accept(0, 3, b("acme/app"), line("0:0", 0, "../x"), b("bad id")));
   }
 
   @Test

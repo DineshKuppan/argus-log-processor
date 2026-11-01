@@ -1,0 +1,36 @@
+# D13: scale on the sinks' consumer lag, the lag the WAL watermarks use (D5). maxReplicaCount stays
+# at or under the topic's partitions (12): more consumers than partitions sit idle (D9).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: argus
+spec:
+  scaleTargetRef:
+    kind: StatefulSet
+    name: argus
+  minReplicaCount: 1
+  maxReplicaCount: 12
+  pollingInterval: 15
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - {type: Pods, value: 1, periodSeconds: 120} # one drain at a time
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka.argus.svc.cluster.local:9092 # KEDA runs in its own namespace: a fully qualified name
+        consumerGroup: argus-archive
+        topic: argus-wal
+        lagThreshold: "500000"
+        offsetResetPolicy: earliest
+    - type: kafka
+      metadata:
+        bootstrapServers: kafka.argus.svc.cluster.local:9092 # KEDA runs in its own namespace: a fully qualified name
+        consumerGroup: argus-hot
+        topic: argus-wal
+        lagThreshold: "500000"
+        offsetResetPolicy: earliest

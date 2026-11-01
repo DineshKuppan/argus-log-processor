@@ -1,0 +1,28 @@
+# Without KEDA: an HPA on argus_kafka_lag_records through the Prometheus Adapter, which must expose
+# it as an external metric (rule: seriesQuery 'argus_kafka_lag_records', metricsQuery
+# 'max(<<.Series>>{<<.LabelMatchers>>}) by (group)'). Use instead of keda-scaledobject.yaml.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: argus
+  namespace: argus
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: argus
+  minReplicas: 1
+  maxReplicas: 12
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - {type: Pods, value: 1, periodSeconds: 120}
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: argus_kafka_lag_records
+        target:
+          type: AverageValue
+          averageValue: "500000"

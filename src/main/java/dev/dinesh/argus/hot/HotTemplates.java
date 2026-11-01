@@ -19,8 +19,11 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public final class HotTemplates {
 
-  /** Raise when the mapping or settings change, so a newer Argus replaces the template. */
-  static final int VERSION = 1;
+  /**
+   * Raise when the mapping or settings change, so a newer Argus replaces the template. 2: {@code
+   * source_instance} (P6 D8).
+   */
+  static final int VERSION = 2;
 
   private static final String META_KEY = "argus_template_version";
 
@@ -79,6 +82,9 @@ public final class HotTemplates {
       if (installed >= VERSION) {
         return;
       }
+      if (installed > 0) {
+        addFieldsToExistingIndices();
+      }
     } else if (existing.status() != 404) {
       throw new IOException(
           "Reading the index template answered "
@@ -96,6 +102,30 @@ public final class HotTemplates {
         indices.prefix(),
         VERSION,
         indices.pattern());
+  }
+
+  /**
+   * A strict mapping rejects fields it doesn't know, and today's index was created from the older
+   * template: the fields added since then are added to every existing index (adding a field is
+   * allowed; changing one isn't).
+   */
+  private void addFieldsToExistingIndices() throws IOException, InterruptedException {
+    ObjectNode added = mapper.createObjectNode();
+    keyword(added.putObject("properties"), HotDocument.SOURCE_INSTANCE, true);
+    Response put =
+        client.json(
+            "PUT",
+            "/" + indices.pattern() + "/_mapping?allow_no_indices=true&expand_wildcards=open",
+            added);
+    if (!put.ok()) {
+      throw new IOException(
+          "Adding the v"
+              + VERSION
+              + " fields to existing indices answered "
+              + put.status()
+              + ": "
+              + put.excerpt(500));
+    }
   }
 
   ObjectNode template(Flavor flavor) {
@@ -137,6 +167,7 @@ public final class HotTemplates {
     p.putObject(HotDocument.SOURCE_GENERATION).put("type", "integer").put("index", false);
     p.putObject(HotDocument.SOURCE_OFFSET).put("type", "long").put("index", false);
     keyword(p, HotDocument.SOURCE_FORMAT, true);
+    keyword(p, HotDocument.SOURCE_INSTANCE, true);
     return mappings;
   }
 

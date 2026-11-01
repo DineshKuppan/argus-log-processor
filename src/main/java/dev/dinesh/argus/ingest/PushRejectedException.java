@@ -24,7 +24,9 @@ public class PushRejectedException extends RuntimeException {
     /** The stream id is a file ingest source's id (HTTP 409). */
     SOURCE_IN_USE,
     /** A {@code Content-Encoding} other than gzip (HTTP 415). */
-    UNSUPPORTED_ENCODING
+    UNSUPPORTED_ENCODING,
+    /** The instance is shutting down; the retry goes to another one (HTTP 503, P6 D12). */
+    DRAINING
   }
 
   private final Reason reason;

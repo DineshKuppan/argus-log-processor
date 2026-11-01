@@ -16,6 +16,13 @@ A Spring Boot service that ingests, parses, filters, aggregates and archives log
 
 ## What's new
 
+- **Several instances (P6b).**
+  - Run several Argus instances on one Kafka topic. Each instance has an id (the pod name), which keeps two instances' lines apart in every tier.
+  - The archive and the hot tier share their consumer groups, and a live tail on any instance shows every instance's lines (54ms p99 across instances).
+  - Suppression with Redis is exact across instances, in one pipelined round trip per 1,000 lines.
+  - On shutdown an instance stops taking pushes (503) and ingests its spools first.
+  - `deploy/k8s` has a StatefulSet and a KEDA scaler on consumer lag; in `kind` it scaled 1 → 3 when the archive fell behind, and back down.
+  - `kill -9` of one of three instances under load lost and duplicated nothing in either tier, on Apache Kafka and Redpanda.
 - **Kafka or Redpanda as the WAL (P6a).**
   - With `argus.wal.store=kafka`, committed segments go to a Kafka topic instead of the node's disk, so losing the node loses at most the push spools' last few seconds. The archive and the hot tier consume it as groups; the archive's object keys don't change.
   - Ingest pauses with 429 `WAL_FULL` when a sink falls far enough behind that Kafka's retention could delete lines it hasn't stored; a broker outage is backpressure, absorbed by the push spools.
@@ -325,7 +332,7 @@ The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src
 ## Tests
 
 ```bash
-mvn test                                         # 534 tests; Redis, S3, GCS, Elasticsearch, OpenSearch, Kafka and Redpanda tests need Docker
+mvn test                                         # 562 tests; Redis, S3, GCS, Elasticsearch, OpenSearch, Kafka and Redpanda tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
 mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
                                                  # decisions, push throughput / isolation, push backpressure, kill -9 during push,

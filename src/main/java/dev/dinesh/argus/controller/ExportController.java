@@ -77,21 +77,26 @@ public class ExportController {
   }
 
   @GetMapping("/{jobId}")
-  public ResponseEntity<ExportJobStatus> job(
-      @CurrentTenant String tenantId, @PathVariable String jobId) {
+  public ResponseEntity<Object> job(@CurrentTenant String tenantId, @PathVariable String jobId) {
     return exports
         .find(tenantId, jobId)
-        .map(job -> ResponseEntity.ok(ExportJobStatus.of(job)))
-        .orElse(ResponseEntity.notFound().build());
+        .<ResponseEntity<Object>>map(job -> ResponseEntity.ok(ExportJobStatus.of(job)))
+        .orElseGet(() -> missing(exports.elsewhere(jobId)));
   }
 
   @DeleteMapping("/{jobId}")
-  public ResponseEntity<ExportJobStatus> cancel(
-      @CurrentTenant String tenantId, @PathVariable String jobId) {
+  public ResponseEntity<Object> cancel(@CurrentTenant String tenantId, @PathVariable String jobId) {
     return exports
         .cancel(tenantId, jobId)
-        .map(job -> ResponseEntity.accepted().body(ExportJobStatus.of(job)))
-        .orElse(ResponseEntity.notFound().build());
+        .<ResponseEntity<Object>>map(job -> ResponseEntity.accepted().body(ExportJobStatus.of(job)))
+        .orElseGet(() -> missing(exports.elsewhere(jobId)));
+  }
+
+  /** 404; naming the instance when another one started the job (P6 D12). */
+  private static ResponseEntity<Object> missing(String elsewhere) {
+    return elsewhere == null
+        ? ResponseEntity.notFound().build()
+        : ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", elsewhere));
   }
 
   @ExceptionHandler(IllegalArgumentException.class)
