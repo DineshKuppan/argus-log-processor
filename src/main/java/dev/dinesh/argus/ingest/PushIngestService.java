@@ -226,16 +226,15 @@ public class PushIngestService {
    * progress to finish, so every acknowledged line is in a spool before the spools are drained (P6
    * D12).
    *
+   * <p>The slots stay taken: a request that passed the draining check just before it was set can't
+   * then spool lines after the spools were drained.
+   *
    * @return true if none was still in progress
    */
   public boolean drain(Duration timeout) throws InterruptedException {
     draining = true;
-    int slots = props.maxConcurrentRequests();
-    if (!requestSlots.tryAcquire(slots, timeout.toMillis(), TimeUnit.MILLISECONDS)) {
-      return false;
-    }
-    requestSlots.release(slots);
-    return true;
+    return requestSlots.tryAcquire(
+        props.maxConcurrentRequests(), timeout.toMillis(), TimeUnit.MILLISECONDS);
   }
 
   private PushResult admitAndSpool(PushRequest request, Instant receivedAt, Counts counts)

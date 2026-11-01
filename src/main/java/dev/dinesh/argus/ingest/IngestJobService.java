@@ -234,12 +234,12 @@ public class IngestJobService {
     return job;
   }
 
-  /** The tenant's job; another tenant's job id is reported as absent, not as forbidden. */
   /** Why {@code jobId} isn't here, if another instance started it (D12); else null. */
   public String elsewhere(String jobId) {
     return JobIds.elsewhere(jobId, pipeline.instanceId());
   }
 
+  /** The tenant's job; another tenant's job id is reported as absent, not as forbidden. */
   public Optional<IngestJob> find(String tenantId, String jobId) {
     return Optional.ofNullable(jobs.get(jobId)).filter(j -> j.tenantId().equals(tenantId));
   }

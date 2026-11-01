@@ -25,6 +25,7 @@ import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
@@ -153,16 +154,27 @@ public final class KafkaTailBus implements TailBus, SmartLifecycle {
     }
     byte[] key = KafkaWal.utf8(tenantId);
     int partition = partition(tenantId);
+    // A full buffer (max.block.ms=0), no metadata yet or a failed delivery: the tail loses the
+    // line, not ingest. send reports those through the callback, not by throwing.
+    Callback countDrop =
+        (metadata, e) -> {
+          if (e != null) {
+            metrics.tailBusDropped(tenantId, 1);
+          }
+        };
     long dropped = 0;
     for (TailEvent event : events) {
       try {
-        p.send(new ProducerRecord<>(topic, partition, key, writer.writeValueAsBytes(event)));
+        p.send(
+            new ProducerRecord<>(topic, partition, key, writer.writeValueAsBytes(event)),
+            countDrop);
       } catch (IOException | KafkaException e) {
-        // A full buffer (max.block.ms=0) or no metadata yet: the tail loses the line, not ingest.
         dropped++;
       }
     }
-    metrics.tailBusDropped(tenantId, dropped);
+    if (dropped > 0) {
+      metrics.tailBusDropped(tenantId, dropped);
+    }
   }
 
   @Override
