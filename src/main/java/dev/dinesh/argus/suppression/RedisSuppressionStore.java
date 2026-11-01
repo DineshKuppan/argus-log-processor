@@ -1,11 +1,15 @@
 package dev.dinesh.argus.suppression;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.connection.ReturnType;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 
@@ -72,6 +76,70 @@ public final class RedisSuppressionStore implements SuppressionStore {
     return ((Number) reply.get(0)).longValue() == 1
         ? SuppressionDecision.allow(endsAt)
         : SuppressionDecision.deny(endsAt, ((Number) reply.get(2)).longValue());
+  }
+
+  /**
+   * One pipelined round trip: the script is loaded (idempotent), then run with {@code EVALSHA} once
+   * per key, in order, so a key twice in the batch is denied the second time. Any error fails the
+   * whole batch open.
+   */
+  @Override
+  public List<SuppressionDecision> acquireAll(List<String> keys, List<String> messages) {
+    if (keys.isEmpty()) {
+      return List.of();
+    }
+    byte[] script = ACQUIRE.getBytes(StandardCharsets.UTF_8);
+    byte[] windowMillis = Long.toString(window.toMillis()).getBytes(StandardCharsets.UTF_8);
+    String sha = SCRIPT.getSha1();
+    List<Object> replies;
+    try {
+      replies =
+          redis.executePipelined(
+              (RedisCallback<Object>)
+                  connection -> {
+                    connection.scriptingCommands().scriptLoad(script);
+                    for (String key : keys) {
+                      connection
+                          .scriptingCommands()
+                          .evalSha(
+                              sha,
+                              ReturnType.MULTI,
+                              1,
+                              key.getBytes(StandardCharsets.UTF_8),
+                              windowMillis);
+                    }
+                    return null;
+                  });
+    } catch (RuntimeException e) {
+      return failOpenAll(keys.size(), e);
+    }
+    if (replies == null || replies.size() != keys.size() + 1) {
+      return failOpenAll(
+          keys.size(), new IllegalStateException("Unexpected Redis pipeline reply: " + replies));
+    }
+    Instant now = clock.instant();
+    List<SuppressionDecision> decisions = new ArrayList<>(keys.size());
+    for (int i = 0; i < keys.size(); i++) {
+      if (!(replies.get(i + 1) instanceof List<?> reply) || reply.size() != 3) {
+        decisions.add(
+            failOpen(new IllegalStateException("Unexpected Redis reply: " + replies.get(i + 1))));
+        continue;
+      }
+      Instant endsAt = now.plusMillis(((Number) reply.get(1)).longValue());
+      decisions.add(
+          ((Number) reply.get(0)).longValue() == 1
+              ? SuppressionDecision.allow(endsAt)
+              : SuppressionDecision.deny(endsAt, ((Number) reply.get(2)).longValue()));
+    }
+    return decisions;
+  }
+
+  private List<SuppressionDecision> failOpenAll(int count, RuntimeException e) {
+    List<SuppressionDecision> decisions = new ArrayList<>(count);
+    for (int i = 0; i < count; i++) {
+      decisions.add(failOpen(e));
+    }
+    return decisions;
   }
 
   @Override

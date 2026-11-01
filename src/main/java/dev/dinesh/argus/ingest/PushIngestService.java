@@ -13,6 +13,7 @@ import dev.dinesh.argus.quota.QuotaDecision;
 import dev.dinesh.argus.quota.QuotaService;
 import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.source.StreamSpool;
+import dev.dinesh.argus.suppression.SuppressionDecision;
 import dev.dinesh.argus.suppression.Suppressor;
 import dev.dinesh.argus.tail.TailEvent;
 import dev.dinesh.argus.tail.TailHub;
@@ -98,6 +99,10 @@ public class PushIngestService {
   private final StreamRegistry streams;
   private final IngestPipeline pipeline;
   private final QuotaService quotas;
+
+  /** Lines whose suppression is decided in one store call. */
+  static final int SUPPRESS_BATCH = 1000;
+
   private final Suppressor suppressor;
   private final ParserRegistry parsers;
   private final PushProperties props;
@@ -314,11 +319,7 @@ public class PushIngestService {
     ParserChain chain = props.suppress() || tailed ? messageChain(stream, body) : null;
     List<ParserChain.Parsed> tailLines = tailed ? new ArrayList<>() : null;
     List<String> allowedKeys = new ArrayList<>();
-    byte[] out = body;
-    int written = 0;
-    int accepted = 0;
-    int suppressed = 0;
-    int truncated = 0;
+    Compactor lines = new Compactor(body, stream.tenantId(), tailLines, allowedKeys);
     // Compacts the accepted lines in place: what is written never overtakes what is read.
     for (int start = 0; start < body.length; ) {
       int newline = indexOf(body, (byte) '\n', start);
@@ -336,27 +337,16 @@ public class PushIngestService {
         line = new String(body, start, textLength, StandardCharsets.UTF_8);
         parsed = chain.parse(line);
       }
-      if (props.suppress() && isSuppressed(stream.tenantId(), parsed, line, allowedKeys)) {
-        suppressed++;
-        start = next;
-        continue;
-      }
-      if (tailLines != null && parsed != null) {
-        tailLines.add(parsed);
-      }
-      if (length < end - start) {
-        truncated++;
-      }
-      if (written + length + 1 > out.length) {
-        // Only the last line can lack its newline, and only it can need one more byte.
-        out = Arrays.copyOf(out, written + length + 1);
-      }
-      System.arraycopy(body, start, out, written, length);
-      written += length;
-      out[written++] = '\n';
-      accepted++;
+      lines.add(
+          start, length, end - start, parsed, props.suppress() ? message(parsed, line) : null);
       start = next;
     }
+    lines.flush();
+    byte[] out = lines.out;
+    int written = lines.written;
+    int accepted = lines.accepted;
+    int suppressed = lines.suppressed;
+    int truncated = lines.truncated;
     StreamSpool.Append append;
     try {
       append = stream.spool().append(out, written, key, receivedAt);
@@ -422,16 +412,95 @@ public class PushIngestService {
     tail.publish(stream.tenantId(), events);
   }
 
-  private boolean isSuppressed(
-      String tenantId, ParserChain.Parsed parsed, String line, List<String> allowedKeys) {
+  /** The line's message to suppress on, or null when it is too long to judge (then kept). */
+  private static String message(ParserChain.Parsed parsed, String line) {
     String message =
         parsed == null || parsed.record().getMessage() == null
             ? line
             : parsed.record().getMessage();
-    if (message.length() > Suppressor.MAX_MESSAGE_CHARS) {
-      return false; // too long to fingerprint cheaply: kept, like any line suppression can't judge
+    // Too long to fingerprint cheaply: kept, like any line suppression can't judge.
+    return message.length() > Suppressor.MAX_MESSAGE_CHARS ? null : message;
+  }
+
+  /**
+   * Compacts a request's accepted lines in place, deciding suppression {@value #SUPPRESS_BATCH}
+   * lines at a time: one store round trip per batch (one pipelined Redis call, P6 D11), while the
+   * messages held stay bounded.
+   */
+  private final class Compactor {
+    final byte[] body;
+    final String tenantId;
+    final List<ParserChain.Parsed> tailLines;
+    final List<String> allowedKeys;
+    final int[] starts = new int[SUPPRESS_BATCH];
+    final int[] lengths = new int[SUPPRESS_BATCH];
+    final int[] spans = new int[SUPPRESS_BATCH];
+    final int[] messageAt = new int[SUPPRESS_BATCH];
+    final ParserChain.Parsed[] parsed = new ParserChain.Parsed[SUPPRESS_BATCH];
+    final List<String> messages = new ArrayList<>();
+    int pending;
+    byte[] out;
+    int written;
+    int accepted;
+    int suppressed;
+    int truncated;
+
+    Compactor(
+        byte[] body,
+        String tenantId,
+        List<ParserChain.Parsed> tailLines,
+        List<String> allowedKeys) {
+      this.body = body;
+      this.out = body;
+      this.tenantId = tenantId;
+      this.tailLines = tailLines;
+      this.allowedKeys = allowedKeys;
     }
-    return !suppressor.check(tenantId, message, allowedKeys).allowed();
+
+    /**
+     * A line of {@code length} bytes kept of its {@code span}; {@code message} null: not judged.
+     */
+    void add(int start, int length, int span, ParserChain.Parsed line, String message) {
+      starts[pending] = start;
+      lengths[pending] = length;
+      spans[pending] = span;
+      parsed[pending] = line;
+      messageAt[pending] = message == null ? -1 : messages.size();
+      if (message != null) {
+        messages.add(message);
+      }
+      if (++pending == SUPPRESS_BATCH) {
+        flush();
+      }
+    }
+
+    void flush() {
+      List<SuppressionDecision> decisions =
+          messages.isEmpty() ? List.of() : suppressor.checkAll(tenantId, messages, allowedKeys);
+      for (int i = 0; i < pending; i++) {
+        if (messageAt[i] >= 0 && !decisions.get(messageAt[i]).allowed()) {
+          suppressed++;
+          continue;
+        }
+        if (tailLines != null && parsed[i] != null) {
+          tailLines.add(parsed[i]);
+        }
+        if (lengths[i] < spans[i]) {
+          truncated++;
+        }
+        if (written + lengths[i] + 1 > out.length) {
+          // Only the last line can lack its newline, and only it can need one more byte.
+          out = Arrays.copyOf(out, written + lengths[i] + 1);
+        }
+        System.arraycopy(body, starts[i], out, written, lengths[i]);
+        written += lengths[i];
+        out[written++] = '\n';
+        accepted++;
+      }
+      Arrays.fill(parsed, 0, pending, null);
+      messages.clear();
+      pending = 0;
+    }
   }
 
   private byte[] readBody(PushRequest request) throws IOException {

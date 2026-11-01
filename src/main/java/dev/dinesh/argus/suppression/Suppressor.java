@@ -2,7 +2,9 @@ package dev.dinesh.argus.suppression;
 
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.tenant.TenantIds;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
 
 /**
  * Decides whether a message may be printed: only if the same tenant has not had the same message
@@ -59,6 +61,33 @@ public class Suppressor {
       allowedKeys.add(key);
     }
     return decision;
+  }
+
+  /**
+   * {@link #check(String, String, Collection)} for many messages in one store operation: one Redis
+   * round trip for a push request's lines instead of one per line (P6 D11). Messages must be within
+   * {@link #MAX_MESSAGE_CHARS}.
+   */
+  public List<SuppressionDecision> checkAll(
+      String tenantId, List<String> messages, Collection<String> allowedKeys) {
+    TenantIds.requireValid(tenantId);
+    List<String> keys = new ArrayList<>(messages.size());
+    for (String message : messages) {
+      if (message == null || message.length() > MAX_MESSAGE_CHARS) {
+        throw new IllegalArgumentException("message is missing or too long");
+      }
+      keys.add(key(tenantId, message));
+    }
+    List<SuppressionDecision> decisions =
+        messages.isEmpty() ? List.of() : store.acquireAll(keys, messages);
+    for (int i = 0; i < decisions.size(); i++) {
+      boolean allowed = decisions.get(i).allowed();
+      metrics.suppressionDecision(tenantId, allowed);
+      if (allowedKeys != null && allowed) {
+        allowedKeys.add(keys.get(i));
+      }
+    }
+    return decisions;
   }
 
   /**
