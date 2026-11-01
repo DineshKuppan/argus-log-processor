@@ -170,9 +170,11 @@ public final class ArchiveConsumer implements SmartLifecycle {
     }
   }
 
-  private void consume() {
+  private void consume() throws IOException {
+    String clientId = wal.clientId("argus-archive");
+    wal.requireClientIdFree(KafkaProperties.ARCHIVE_GROUP, clientId);
     try (Consumer<byte[], byte[]> c =
-        consumers.apply(wal.consumerConfig(KafkaProperties.ARCHIVE_GROUP, "argus-archive"))) {
+        consumers.apply(wal.consumerConfig(KafkaProperties.ARCHIVE_GROUP, clientId))) {
       consumer = c;
       c.subscribe(List.of(wal.topic()), new Rebalance(c));
       while (running) {

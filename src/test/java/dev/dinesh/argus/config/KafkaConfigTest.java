@@ -32,6 +32,7 @@ class KafkaConfigTest {
   @EnableConfigurationProperties({
     ArchiveProperties.class,
     HotProperties.class,
+    InstanceProperties.class,
     KafkaProperties.class,
     LocalSinkProperties.class,
     SearchProperties.class,

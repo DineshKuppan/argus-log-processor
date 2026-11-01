@@ -39,7 +39,11 @@ public class WalConfig {
 
   /** One instance per WAL volume: its sinks' acknowledgements are decided under its lock. */
   @Bean
-  WalSegments walSegments(LocalSinkProperties local, ArchiveProperties archive, HotProperties hot) {
+  WalSegments walSegments(
+      LocalSinkProperties local,
+      ArchiveProperties archive,
+      HotProperties hot,
+      InstanceProperties instance) {
     Set<WalSink> routed = EnumSet.noneOf(WalSink.class);
     if (archive.store() != ArchiveProperties.Store.NONE) {
       routed.add(WalSink.ARCHIVE);
@@ -54,7 +58,7 @@ public class WalConfig {
         local.root(),
         routed,
         delete);
-    return new WalSegments(local.root(), routed, delete);
+    return new WalSegments(local.root(), routed, delete, instance.id());
   }
 
   /** Ingest waits on this before each segment (P2 D7): the sinks are what drain the WAL. */

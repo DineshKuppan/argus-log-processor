@@ -162,8 +162,10 @@ public final class HotConsumer implements SmartLifecycle {
   }
 
   private void consume() throws IOException, InterruptedException {
+    String clientId = wal.clientId("argus-hot");
+    wal.requireClientIdFree(KafkaProperties.HOT_GROUP, clientId);
     try (Consumer<byte[], byte[]> c =
-        consumers.apply(wal.consumerConfig(KafkaProperties.HOT_GROUP, "argus-hot"))) {
+        consumers.apply(wal.consumerConfig(KafkaProperties.HOT_GROUP, clientId))) {
       consumer = c;
       c.subscribe(List.of(wal.topic()), new Rebalance(c));
       while (running) {

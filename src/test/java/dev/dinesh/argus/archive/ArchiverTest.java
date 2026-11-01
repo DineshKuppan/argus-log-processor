@@ -2,12 +2,14 @@ package dev.dinesh.argus.archive;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.dinesh.argus.archive.Archiver.Outcome;
 import dev.dinesh.argus.archive.Archiver.Pass;
 import dev.dinesh.argus.config.ArchiveProperties;
 import dev.dinesh.argus.config.LocalSinkProperties;
+import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.wal.WalFixture;
 import dev.dinesh.argus.wal.WalSegments;
 import dev.dinesh.argus.wal.WalSink;
@@ -282,6 +284,56 @@ class ArchiverTest {
   }
 
   @Test
+  void anInstancesSegmentsAreKeyedUnderItAndItsColumn() throws Exception {
+    wal.segment("acme", "app", 0, 0, 2, T);
+    Files.createDirectories(dir.resolve("staging"));
+    new Archiver(
+            archive,
+            new WalSegments(walRoot, Set.of(WalSink.ARCHIVE), true, "argus-1"),
+            props(null, true),
+            WalFixture.MAPPER)
+        .runOnce();
+
+    String key = "tenant=acme/dt=2025-10-09/hour=13/source=app/instance=argus-1/gen=0/0-20.parquet";
+    assertEquals(Set.of(key), keys());
+    assertTrue(
+        Files.exists(
+            dir.resolve("wal/tenant=acme/_archive/source=app/instance=argus-1/gen=0.json")));
+  }
+
+  @Test
+  void anIndexInTheStoreLetsAnotherArchiverSupersedeTheEarlierCopy() throws Exception {
+    // As with Kafka: the replay is archived by an instance with a different staging disk.
+    ArchiveProperties props = props("argus", true);
+    Files.createDirectories(props.stagingDir());
+    wal.segment("acme", "app", 0, 0, 1, null);
+    new Archiver(
+            archive,
+            new WalSegments(walRoot, Set.of(WalSink.ARCHIVE), true),
+            props,
+            WalFixture.MAPPER,
+            ArgusMetrics.noop(),
+            true)
+        .runOnce();
+    assertNotNull(archive.get("argus/tenant=acme/_archive/source=app/gen=0.json"));
+
+    Path otherDisk = dir.resolve("other-wal");
+    new WalFixture(otherDisk).segment("acme", "app", 0, 0, Arrays.asList(null, T, T));
+    new Archiver(
+            archive,
+            new WalSegments(otherDisk, Set.of(WalSink.ARCHIVE), true),
+            props,
+            WalFixture.MAPPER,
+            ArgusMetrics.noop(),
+            true)
+        .runOnce();
+
+    assertEquals(
+        List.of("argus/" + ACME_APP_13 + "0-30.parquet"),
+        archive.list("argus/tenant=acme/dt=").stream().toList());
+  }
+
+  @Test
   void aSegmentReplacedDuringItsUploadIsCleanedUpByItsReplacement() throws Exception {
     Path segment = wal.segment("acme", "app", 0, 0, 2, null);
     AtomicBoolean replayed = new AtomicBoolean();
@@ -405,6 +457,11 @@ class ArchiverTest {
     @Override
     public List<String> list(String prefix) throws IOException {
       return delegate.list(prefix);
+    }
+
+    @Override
+    public byte[] get(String key) throws IOException {
+      return delegate.get(key);
     }
 
     @Override

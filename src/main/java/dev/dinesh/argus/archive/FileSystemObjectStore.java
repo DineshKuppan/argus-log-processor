@@ -67,6 +67,15 @@ public final class FileSystemObjectStore implements ObjectStore {
   }
 
   @Override
+  public byte[] get(String key) throws IOException {
+    try {
+      return Files.readAllBytes(resolve(key));
+    } catch (NoSuchFileException e) {
+      return null;
+    }
+  }
+
+  @Override
   public void delete(String key) throws IOException {
     Files.deleteIfExists(resolve(key));
   }

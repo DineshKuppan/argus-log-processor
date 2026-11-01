@@ -132,6 +132,38 @@ class EnvelopeParquetWriterTest {
   }
 
   @Test
+  void theInstanceIsAColumnAndPartOfTheDerivedEventId() throws IOException {
+    LogEnvelope e = envelope(Instant.EPOCH, null, null);
+    LogEnvelope fromInstance =
+        new LogEnvelope(
+            EnvelopeFactory.eventId("acme", "app", "argus-1", 2, 4096),
+            e.tenantId(),
+            e.timestamp(),
+            e.observedTimestamp(),
+            e.severityText(),
+            e.severityNumber(),
+            e.body(),
+            e.traceId(),
+            e.spanId(),
+            e.resource(),
+            e.attributes(),
+            new LogEnvelope.Source("app", 2, 4096, "nginx_access", "argus-1"));
+
+    List<Group> rows = writeAndRead(fromInstance, e);
+
+    assertEquals("argus-1", rows.get(0).getString(EnvelopeSchema.SOURCE_INSTANCE, 0));
+    assertEquals(0, rows.get(1).getFieldRepetitionCount(EnvelopeSchema.SOURCE_INSTANCE));
+    assertEquals(
+        fromInstance.eventId(),
+        EnvelopeFactory.eventId(
+            rows.get(0).getString(EnvelopeSchema.TENANT_ID, 0),
+            rows.get(0).getString(EnvelopeSchema.SOURCE_ID, 0),
+            rows.get(0).getString(EnvelopeSchema.SOURCE_INSTANCE, 0),
+            rows.get(0).getInteger(EnvelopeSchema.SOURCE_GENERATION, 0),
+            rows.get(0).getLong(EnvelopeSchema.SOURCE_OFFSET, 0)));
+  }
+
+  @Test
   void leavesNullFieldsAndEmptyMapsOut() throws IOException {
     LogEnvelope bare =
         new LogEnvelope(

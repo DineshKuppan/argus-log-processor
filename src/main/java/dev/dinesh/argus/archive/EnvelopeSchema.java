@@ -9,10 +9,11 @@ import org.apache.parquet.schema.MessageTypeParser;
  * schema migration for every query engine reading the archive, so add columns, never rename them.
  *
  * <p>There is no {@code event_id} column: the id is a hash of {@code tenant_id}, {@code source_id},
- * {@code source_generation} and {@code source_offset} ({@link
- * dev.dinesh.argus.pipeline.EnvelopeFactory#eventId(String, String, int, long)}), which the row
- * already holds, and a random-looking 36-character string would be three quarters of the archive
- * (measured: 20.5 of 27.2 bytes per row). Those four columns are the row's unique key.
+ * {@code source_instance}, {@code source_generation} and {@code source_offset} ({@link
+ * dev.dinesh.argus.pipeline.EnvelopeFactory#eventId(String, String, String, int, long)}), which the
+ * row already holds, and a random-looking 36-character string would be three quarters of the
+ * archive (measured: 20.5 of 27.2 bytes per row). Those columns are the row's unique key. {@code
+ * source_instance} (P6 D8) is null for a single instance.
  */
 public final class EnvelopeSchema {
 
@@ -30,6 +31,7 @@ public final class EnvelopeSchema {
   public static final String SOURCE_GENERATION = "source_generation";
   public static final String SOURCE_OFFSET = "source_offset";
   public static final String SOURCE_FORMAT = "source_format";
+  public static final String SOURCE_INSTANCE = "source_instance";
 
   /** Name of a map's repeated group, as the Parquet spec's MAP layout requires. */
   static final String KEY_VALUE = "key_value";
@@ -60,6 +62,7 @@ public final class EnvelopeSchema {
               + " required int32 source_generation;"
               + " required int64 source_offset;"
               + " optional binary source_format (STRING);"
+              + " optional binary source_instance (STRING);"
               + " }");
 
   private EnvelopeSchema() {}

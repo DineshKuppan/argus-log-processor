@@ -32,7 +32,7 @@ class HotDocumentTest {
             "00f067aa0ba902b7",
             Map.of("service.name", "api"),
             Map.of("http_status", 507, "nested", Map.of("k", List.of("v"))),
-            new LogEnvelope.Source("app", 3, 1024, "json"));
+            new LogEnvelope.Source("app", 3, 1024, "json", "argus-2"));
 
     ObjectNode doc = HotDocument.of(e, NOW, MAPPER);
 
@@ -47,6 +47,7 @@ class HotDocumentTest {
     assertEquals("v", doc.get("attributes").get("nested").get("k").get(0).asText());
     assertEquals(1024, doc.get("source_offset").asLong());
     assertEquals("json", doc.get("source_format").asText());
+    assertEquals("argus-2", doc.get("source_instance").asText());
   }
 
   @Test
@@ -58,6 +59,7 @@ class HotDocumentTest {
     assertEquals("2026-11-01T09:00:00Z", doc.get("@timestamp").asText());
     assertTrue(doc.get("event_time_missing").asBoolean());
     assertFalse(doc.has("attributes"));
+    assertFalse(doc.has("source_instance"));
   }
 
   @Test

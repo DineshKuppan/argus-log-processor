@@ -23,6 +23,12 @@ public interface ObjectStore {
   /** Keys that start with {@code prefix}, in no particular order. */
   List<String> list(String prefix) throws IOException;
 
+  /**
+   * The object at {@code key}, or null if there is none. Read whole into memory: for small objects
+   * (the archive index, P6 D8), never archived segments.
+   */
+  byte[] get(String key) throws IOException;
+
   /** Deletes {@code key}; deleting a missing key is not an error. */
   void delete(String key) throws IOException;
 }

@@ -1,6 +1,7 @@
 package dev.dinesh.argus.pipeline;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
@@ -89,5 +90,46 @@ class EnvelopeFactoryTest {
     assertNotEquals(app.eventId(100), new EnvelopeFactory("default", "other", 0).eventId(100));
     assertNotEquals(app.eventId(100), new EnvelopeFactory("default", "app", 1).eventId(100));
     assertNotEquals(app.eventId(100), new EnvelopeFactory("acme", "app", 0).eventId(100));
+  }
+
+  @Test
+  void withoutAnInstanceTheIdIsThePreInstanceOne() {
+    // The P0-P5 formula, so archives and hot documents written before P6b keep their ids.
+    assertEquals(
+        java.util
+            .UUID
+            .nameUUIDFromBytes(
+                "default\napp\n0\n100".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+            .toString(),
+        new EnvelopeFactory("default", "app", 0).eventId(100));
+    assertEquals(
+        new EnvelopeFactory("default", "app", 0, null).eventId(100),
+        EnvelopeFactory.eventId("default", "app", null, 0, 100));
+  }
+
+  @Test
+  void twoInstancesIngestingOneSourceIdGetDistinctIds() {
+    EnvelopeFactory one = new EnvelopeFactory("default", "app", 0, "argus-0");
+    EnvelopeFactory two = new EnvelopeFactory("default", "app", 0, "argus-1");
+
+    assertNotEquals(one.eventId(100), two.eventId(100));
+    assertNotEquals(one.eventId(100), new EnvelopeFactory("default", "app", 0).eventId(100));
+    assertEquals(one.eventId(100), EnvelopeFactory.eventId("default", "app", "argus-0", 0, 100));
+  }
+
+  @Test
+  void theInstanceIsWrittenOnlyWhenSet() throws Exception {
+    com.fasterxml.jackson.databind.ObjectMapper mapper = dev.dinesh.argus.wal.WalFixture.MAPPER;
+    assertFalse(
+        mapper
+            .writeValueAsString(new LogEnvelope.Source("app", 0, 0, "json"))
+            .contains("instance"));
+    assertEquals(
+        "argus-1",
+        mapper
+            .readValue(
+                mapper.writeValueAsString(new LogEnvelope.Source("app", 0, 0, "json", "argus-1")),
+                LogEnvelope.Source.class)
+            .instance());
   }
 }
