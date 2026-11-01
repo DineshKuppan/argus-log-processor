@@ -48,7 +48,8 @@ import org.apache.kafka.common.serialization.ByteArraySerializer;
  * <p>Records: key {@code <tenant>/<source>}, value the {@code LogEnvelope} JSON (the local WAL's
  * NDJSON line), headers {@link #SEGMENT} ({@code <generation>:<startOffset>}) and {@link #OFFSET}
  * (the line's source offset). A segment ends with a marker: same key, no value, {@link #TYPE}
- * {@code commit} (with {@link #END} and {@link #LINES}) or {@code abort}.
+ * {@code commit} (with {@link #END}, {@link #LINES} and {@link #FIRST}, the Kafka offset of the
+ * segment's first line) or {@code abort}.
  */
 @Slf4j
 public final class KafkaWal implements AutoCloseable {
@@ -58,6 +59,7 @@ public final class KafkaWal implements AutoCloseable {
   public static final String TYPE = "argus-type";
   public static final String END = "argus-end";
   public static final String LINES = "argus-lines";
+  public static final String FIRST = "argus-first";
   public static final String VERSION = "argus-v";
   public static final String COMMIT = "commit";
   public static final String ABORT = "abort";

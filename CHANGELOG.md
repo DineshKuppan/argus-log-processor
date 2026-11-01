@@ -22,6 +22,10 @@ Plan and results: [`P6_PLAN.md`](docs/architecture/P6_PLAN.md).
 - `HotBulkWriter` holds the `_bulk` code `HotIndexer` had, shared with the hot consumer; one backoff helper for the archiver, indexer and consumers. A non-JSON `_bulk` answer fails the pass instead of setting a segment aside (from #11's review).
 - `LocalVolumeSink` is created by `SinkConfig` (only with the local WAL); `WalConfig`, the `Archiver` bean and the `HotIndexer` bean exist only with `argus.wal.store=local`.
 
+#### Fixed (in review, before merge)
+- The archive consumer could archive a partial copy of a segment over its complete one: after a restart or rebalance it resumes at a committed offset that another source's open segment can hold inside an already archived segment. Commit markers now carry `argus-first` (the Kafka offset of the segment's first line), and a copy staged from past it is dropped.
+- An archive outage longer than `orphan-timeout` expired the open segments of the held partitions and let the commit pass their first lines. The orphan clock now stops while the consumer holds its partitions, and `orphan-timeout` must be longer than `max-outage`.
+
 #### Measured
 - **T1:** 131.9k lines/s pushed to Apache Kafka, 130.1k to Redpanda, the same as the local WAL in the same runs (125.6k / 131.7k), at a 256MB heap.
 - **T3:** a 60s broker outage under 2,000 lines/s was absorbed by the spools (no 429s), then all 180,800 lines were archived exactly once; an unwritable archive store paused ingest at the lag watermark (156–160 429 `WAL_FULL`), then all 180,400 lines were archived once. Both brokers.

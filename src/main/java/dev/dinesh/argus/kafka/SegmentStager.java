@@ -34,7 +34,10 @@ import org.apache.kafka.common.header.Headers;
  *
  * <p>A line whose source offset isn't past its staged segment's last one is a replay of the segment
  * (its producer crashed before the checkpoint): the staged copy is discarded and staging restarts.
- * Owned by the archive consumer's thread.
+ * A copy whose first record comes after the segment's first line (the marker's {@code argus-first})
+ * was staged from part-way through: reading resumed at a committed offset inside a segment that was
+ * handled before, so it is dropped rather than archived over the complete copy. Owned by the
+ * archive consumer's thread.
  */
 @Slf4j
 final class SegmentStager {
@@ -51,6 +54,8 @@ final class SegmentStager {
     /** Its segment's commit marker: {@link #takeReady} has the segment. */
     COMMITTED,
     ABORTED,
+    /** A commit marker for a copy staged from part-way through its segment: dropped. */
+    PARTIAL,
     /** A marker for a segment not staged here (empty, or dropped as an orphan). */
     UNKNOWN,
     /** Not a WAL record (bad key or headers): skipped. */
@@ -144,8 +149,7 @@ final class SegmentStager {
         discard(s);
         return Result.ABORTED;
       }
-      ready = commit(s, headers);
-      return ready == null ? Result.INVALID : Result.COMMITTED;
+      return commit(s, headers);
     }
     Long sourceOffset = number(KafkaWal.header(headers, KafkaWal.OFFSET));
     if (value == null || sourceOffset == null) {
@@ -180,13 +184,24 @@ final class SegmentStager {
     return r;
   }
 
-  private Ready commit(Staged s, Headers headers) throws IOException {
+  private Result commit(Staged s, Headers headers) throws IOException {
     Long end = number(KafkaWal.header(headers, KafkaWal.END));
     Long lines = number(KafkaWal.header(headers, KafkaWal.LINES));
+    Long first = number(KafkaWal.header(headers, KafkaWal.FIRST));
     s.out.close(); // ends the zstd frame
     if (end == null) {
       Files.deleteIfExists(s.file);
-      return null;
+      return Result.INVALID;
+    }
+    if (first != null && first >= 0 && s.firstOffset > first) {
+      // Its first line was read before this copy began, and so archived (or dropped) then.
+      log.info(
+          "Segment {} was staged from Kafka offset {} but starts at {}; dropping the partial copy",
+          s.key,
+          s.firstOffset,
+          first);
+      Files.deleteIfExists(s.file);
+      return Result.PARTIAL;
     }
     if (lines == null || lines != s.lines) {
       // Archived anyway: the lines are real, and dropping them would lose them from the cold tier.
@@ -207,7 +222,8 @@ final class SegmentStager {
             s.key.startOffset(),
             end,
             Files.getLastModifiedTime(target));
-    return new Ready(s.partition, s.firstOffset, segment);
+    ready = new Ready(s.partition, s.firstOffset, segment);
+    return Result.COMMITTED;
   }
 
   /** The smallest Kafka offset of a segment still staged in {@code partition}. */
@@ -220,6 +236,15 @@ final class SegmentStager {
 
   int open() {
     return staged.size();
+  }
+
+  /**
+   * Restarts every staged segment's orphan clock: after the consumer held its partitions (archive
+   * failing or slow), the silence was its own, not the producers'.
+   */
+  void touch() {
+    Instant now = clock.instant();
+    staged.values().forEach(s -> s.lastRecordAt = now);
   }
 
   /** Discards segments with no record for {@code timeout}; returns them (D3's orphans). */

@@ -62,7 +62,14 @@ class SegmentStagerTest {
   }
 
   private static RecordHeaders commit(String segment, long end, long lines) {
+    return commit(segment, end, lines, -1);
+  }
+
+  private static RecordHeaders commit(String segment, long end, long lines, long first) {
     RecordHeaders h = new RecordHeaders();
+    if (first >= 0) {
+      h.add(KafkaWal.FIRST, b(Long.toString(first)));
+    }
     h.add(KafkaWal.SEGMENT, b(segment));
     h.add(KafkaWal.TYPE, b(KafkaWal.COMMIT));
     h.add(KafkaWal.END, b(Long.toString(end)));
@@ -149,6 +156,31 @@ class SegmentStagerTest {
     s.accept(0, 0, b("acme/app"), line("0:0", 0), b("only one"));
     assertEquals(Result.COMMITTED, s.accept(0, 1, b("acme/app"), commit("0:0", 20, 2), null));
     assertEquals(List.of("only one"), lines(s.takeReady().segment().file()));
+  }
+
+  @Test
+  void aCopyStagedFromPartWayThroughItsSegmentIsDropped() throws IOException {
+    SegmentStager s = stager();
+    // Reading resumed at Kafka offset 5; the segment's first line is at 2.
+    s.accept(0, 5, b("acme/app"), line("0:0", 30), b("tail"));
+    assertEquals(Result.PARTIAL, s.accept(0, 6, b("acme/app"), commit("0:0", 40, 4, 2), null));
+    assertEquals(null, s.takeReady());
+    try (var files = Files.walk(root)) {
+      assertFalse(files.anyMatch(Files::isRegularFile));
+    }
+
+    s.accept(0, 7, b("acme/web"), line("0:0", 0), b("whole"));
+    assertEquals(Result.COMMITTED, s.accept(0, 8, b("acme/web"), commit("0:0", 10, 1, 7), null));
+  }
+
+  @Test
+  void touchRestartsTheOrphanClock() throws IOException {
+    SegmentStager s = stager();
+    s.accept(0, 0, b("acme/app"), line("0:0", 0), b("x"));
+    now = now.plus(Duration.ofMinutes(20)); // the consumer held its partitions
+    s.touch();
+    now = now.plus(Duration.ofMinutes(1));
+    assertEquals(List.of(), s.expire(Duration.ofMinutes(15)));
   }
 
   @Test

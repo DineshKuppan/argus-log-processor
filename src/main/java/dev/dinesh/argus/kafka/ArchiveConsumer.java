@@ -4,6 +4,9 @@ import dev.dinesh.argus.archive.Archiver;
 import dev.dinesh.argus.config.KafkaProperties;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.utils.Backoff;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -67,6 +70,7 @@ public final class ArchiveConsumer implements SmartLifecycle {
   private Instant retryAt = Instant.MIN;
   private Instant lastCommit = Instant.MIN;
   private Instant lastExpire = Instant.MIN;
+  private boolean held;
 
   public ArchiveConsumer(
       KafkaWal wal, KafkaProperties props, Archiver archiver, ArgusMetrics metrics) {
@@ -177,13 +181,17 @@ public final class ArchiveConsumer implements SmartLifecycle {
         if (hold) {
           c.pause(c.assignment());
         } else {
+          if (held) {
+            stager.touch(); // no record arrived because none was read: not orphans
+          }
           c.resume(c.paused());
         }
+        held = hold;
         for (ConsumerRecord<byte[], byte[]> r : c.poll(POLL)) {
           accept(r);
         }
         Instant now = clock.instant();
-        if (Duration.between(lastExpire, now).compareTo(EXPIRE_EVERY) >= 0) {
+        if (!hold && Duration.between(lastExpire, now).compareTo(EXPIRE_EVERY) >= 0) {
           lastExpire = now;
           for (SegmentStager.Key orphan : stager.expire(props.orphanTimeout())) {
             metrics.kafkaSegment("archive", "orphaned");
@@ -209,12 +217,13 @@ public final class ArchiveConsumer implements SmartLifecycle {
     SegmentStager.Result result;
     try {
       result = stager.accept(r.partition(), r.offset(), r.key(), r.headers(), r.value());
-    } catch (java.io.IOException e) {
-      throw new java.io.UncheckedIOException(e);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
     }
     switch (result) {
       case COMMITTED -> ready.add(stager.takeReady());
       case ABORTED -> metrics.kafkaSegment("archive", "aborted");
+      case PARTIAL -> metrics.kafkaSegment("archive", "partial");
       case INVALID ->
           log.warn(
               "Skipped a record that isn't a WAL record: partition={} offset={}",
@@ -311,8 +320,8 @@ public final class ArchiveConsumer implements SmartLifecycle {
   /** Always true, for {@code removeIf}: a ready file left behind is deleted at the next start. */
   private static boolean delete(SegmentStager.Ready r) {
     try {
-      java.nio.file.Files.deleteIfExists(r.segment().file());
-    } catch (java.io.IOException e) {
+      Files.deleteIfExists(r.segment().file());
+    } catch (IOException e) {
       log.debug("Could not delete {}", r.segment().file(), e);
     }
     return true;

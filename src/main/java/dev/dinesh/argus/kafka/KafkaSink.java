@@ -11,6 +11,7 @@ import java.io.InterruptedIOException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.producer.Callback;
@@ -58,10 +59,14 @@ public final class KafkaSink implements LogSink {
     private final byte[] segment;
     private final String describe;
     private final AtomicReference<Exception> failure = new AtomicReference<>();
+    // The first line's Kafka offset: one partition's callbacks run in send order.
+    private final AtomicLong first = new AtomicLong(-1);
     private final Callback onSent =
         (RecordMetadata metadata, Exception e) -> {
           if (e != null) {
             failure.compareAndSet(null, e);
+          } else {
+            first.compareAndSet(-1, metadata.offset());
           }
         };
     private long records;
@@ -136,6 +141,7 @@ public final class KafkaSink implements LogSink {
       headers.add(KafkaWal.TYPE, KafkaWal.utf8(KafkaWal.COMMIT));
       headers.add(KafkaWal.END, KafkaWal.utf8(Long.toString(endOffset)));
       headers.add(KafkaWal.LINES, KafkaWal.utf8(Long.toString(records)));
+      headers.add(KafkaWal.FIRST, KafkaWal.utf8(Long.toString(first.get())));
       try {
         RecordMetadata marker =
             wal.producer()

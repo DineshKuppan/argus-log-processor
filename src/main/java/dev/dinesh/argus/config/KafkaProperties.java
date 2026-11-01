@@ -16,7 +16,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param minRetention the topic must keep records at least this long (D5)
  * @param maxOutage how long a writer blocks on an unreachable cluster before its segment is aborted
  * @param maxLagRecords the lag the WAL watermarks ({@code argus.wal.*-watermark}) are fractions of
- * @param orphanTimeout a staged segment without a record for this long is discarded (D3)
+ * @param orphanTimeout a staged segment without a record for this long is discarded (D3); longer
+ *     than {@code maxOutage}
  * @param commitInterval consumers commit their offsets at least this often
  * @param hotLinger the hot consumer sends a partial bulk after this long (D4)
  * @param retryInitial first wait after a failure; doubles up to {@code retryMax}
@@ -71,6 +72,14 @@ public record KafkaProperties(
     if (maxOutage.toMillis() < 60_000) {
       throw new IllegalArgumentException(
           "argus.kafka.max-outage must be at least 1m (it bounds the producer's delivery timeout): "
+              + maxOutage);
+    }
+    if (orphanTimeout.compareTo(maxOutage) <= 0) {
+      // A writer blocked on the cluster for max-outage is silent, not gone.
+      throw new IllegalArgumentException(
+          "argus.kafka.orphan-timeout must be longer than argus.kafka.max-outage: "
+              + orphanTimeout
+              + " <= "
               + maxOutage);
     }
   }

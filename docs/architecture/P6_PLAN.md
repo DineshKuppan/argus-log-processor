@@ -47,7 +47,7 @@ P6a replaces the WAL with a Kafka topic, with the sinks as consumer groups (ADR-
     - value = the `LogEnvelope` JSON, exactly the WAL's NDJSON line, so every consumer reuses its parsing;
     - headers `argus-seg = <generation>:<startOffset>` (the segment it belongs to) and `argus-v = 1`.
   - **Marker:** on `commit(endOffset)`, after `producer.flush()` has acknowledged every line of the segment:
-    - a record with the same key, null value and headers `argus-type = commit`, `argus-seg`, `argus-end = <endOffset>`, `argus-lines = <n>`;
+    - a record with the same key, null value and headers `argus-type = commit`, `argus-seg`, `argus-end = <endOffset>`, `argus-lines = <n>`, `argus-first = <Kafka offset of the segment's first line>` (from the first send callback: one partition's callbacks run in send order);
     - `commit` returns only once the marker is acknowledged (`acks=all`).
     - `abort()` sends `argus-type = abort`, best effort.
   - **Producer:** `enable.idempotence=true` (ordering per partition with retries), `acks=all`, `compression.type=zstd`, `linger.ms=20`, `batch.size=1MB`, `max.request.size=4MB` (a 1MB line becomes an envelope of up to ~2MB of escaped JSON).
@@ -80,9 +80,12 @@ P6a replaces the WAL with a Kafka topic, with the sinks as consumer groups (ADR-
     - the staged file is renamed `<start>-<end>.ndjson.zst`, laid out like the local WAL, and becomes a `WalSegments.Segment`;
     - `Archiver.archive(segment)` runs unchanged (Parquet per hour → `ObjectStore.put` → `ArchiveIndex` supersede, the index kept in the staging root);
     - the staged file is then deleted.
-    - A line count that doesn't match the marker's `argus-lines` (a bug) logs an ERROR, and the segment is **archived anyway**: the lines are real, and skipping it would lose them from the cold tier.
+    - A copy staged from a Kafka offset past the marker's `argus-first` is **partial**: reading resumed at a committed offset inside a segment whose first lines were read before (the commit stops at another source's open segment, which can start in the middle of this one). That segment was archived, or dropped, back then, so the partial copy is deleted, never archived: archiving it would supersede the complete copy with its tail (found in review; `ArchiveConsumerTest` covers it on both brokers).
+    - Otherwise, a line count that doesn't match the marker's `argus-lines` (a bug) logs an ERROR, and the segment is **archived anyway**: the lines are real, and skipping it would lose them from the cold tier.
   - **Abort marker:** the staged file is discarded.
   - **Orphans:** a staged segment with no record for `orphan-timeout` (15m) is discarded with a WARN. Its producer died and will replay it in full from its checkpoint, or the source is gone.
+    - The clock runs only while the consumer reads: while it holds its partitions (archive failing, or `MAX_READY` segments waiting), no expiry, and resuming restarts every staged segment's clock. Otherwise an archive outage longer than the timeout would expire open segments and move the commit past their first lines (found in review).
+    - `orphan-timeout` must be longer than `max-outage` (checked at startup): a writer blocked on the cluster is silent, not gone.
   - **Offset commits:**
     - Per partition, the committable offset is the smallest first-offset of any open staged segment, or the next offset to read if none is open.
     - It is committed (`commitSync`) after each archived segment and every `commit-interval` (5s).
@@ -279,7 +282,7 @@ argus.instance.id=                         # P6b; the pod name in a StatefulSet
 |---|---|---|
 | `argus_kafka_lag_records` | gauge | `group` |
 | `argus_kafka_lag_seconds` | gauge | `group` |
-| `argus_kafka_segments_total` | counter | `outcome` (`committed`, `aborted`, `orphaned`), producer and archive consumer |
+| `argus_kafka_segments_total` | counter | `outcome` (`committed`, `aborted`, `orphaned`, `partial`), producer and archive consumer |
 | `argus_kafka_send_blocked_seconds` | timer | Time writers spent blocked on a full producer buffer |
 | `argus_tail_bus_dropped_total` | counter | `tenant` (P6b) |
 | kafka-clients' own metrics | via Micrometer's `KafkaClientMetrics` | `client.id` |

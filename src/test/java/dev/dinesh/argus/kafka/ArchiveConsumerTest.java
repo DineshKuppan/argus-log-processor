@@ -170,6 +170,61 @@ class ArchiveConsumerTest {
     }
   }
 
+  private static LogBatch batch(String source, long start, int lines, Instant first, long end) {
+    return new LogBatch(
+        source,
+        0,
+        start,
+        WalFixture.envelopes("acme", source, 0, start, WalFixture.times(lines, first)),
+        start,
+        end,
+        false,
+        0,
+        0,
+        0);
+  }
+
+  @ParameterizedTest
+  @EnumSource(Broker.class)
+  void aRestartInsideAnArchivedSegmentDoesNotArchiveItsTailOverIt(Broker broker) throws Exception {
+    KafkaProperties props = KafkaContainers.props(broker, KafkaContainers.topic(), dir, 1, 1000);
+    try (KafkaWal wal = new KafkaWal(props)) {
+      KafkaSink sink = new KafkaSink(wal, WalFixture.MAPPER, ArgusMetrics.noop());
+      // app's lines straddle slow's first record, where the first consumer's commit stops.
+      SegmentWriter app = sink.open("acme", "app", 0, 0);
+      app.write(batch("app", 0, 2, T, 20));
+      wal.producer().flush();
+      SegmentWriter slow = sink.open("acme", "slow", 0, 0);
+      slow.write(batch("slow", 0, 5, T, 50));
+      wal.producer().flush();
+      app.write(batch("app", 20, 1, T.plusSeconds(2), 30));
+      app.commit(30);
+
+      ArchiveConsumer first = consumer(wal);
+      first.start();
+      try {
+        await("app archived", () -> rows("kafka") == 3);
+        Thread.sleep(500); // past a commit-interval
+      } finally {
+        first.stop();
+      }
+      Map<String, Integer> archived = objects("kafka");
+
+      slow.commit(50);
+      ArchiveConsumer second = consumer(wal);
+      second.start();
+      try {
+        await("slow archived after the restart", () -> rows("kafka") == 8);
+        Thread.sleep(500);
+      } finally {
+        second.stop();
+      }
+      Map<String, Integer> after = objects("kafka");
+      archived.forEach((key, rows) -> assertEquals(rows, after.get(key), key));
+      assertEquals(8, rows("kafka"));
+    }
+  }
+
   @ParameterizedTest
   @EnumSource(Broker.class)
   void aRestartReadsAgainEverySegmentNotYetArchived(Broker broker) throws Exception {
