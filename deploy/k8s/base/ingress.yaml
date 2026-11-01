@@ -1,0 +1,24 @@
+# Push affinity (D12): a stream's pushes go to one pod, by consistent hash of the path, so its
+# Idempotency-Key retries reach the spool that knows the key. While pods are added or removed a
+# retry can land elsewhere and be stored twice (at-least-once, guardrail 3). Keep the management
+# port (Prometheus) off the ingress.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: argus
+  annotations:
+    nginx.ingress.kubernetes.io/upstream-hash-by: "$uri"
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600" # live tail connections
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: argus
+                port: {name: http}

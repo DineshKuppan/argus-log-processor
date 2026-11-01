@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: argus
+spec:
+  template:
+    spec:
+      containers:
+        - name: argus
+          imagePullPolicy: Never # loaded with kind load docker-image
+          env:
+            - {name: AWS_ACCESS_KEY_ID, value: test}
+            - {name: AWS_SECRET_ACCESS_KEY, value: test}
+          resources:
+            requests: {cpu: 250m, memory: 768Mi}
+            limits: {memory: 768Mi}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 2Gi}

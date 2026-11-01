@@ -1,0 +1,11 @@
+# Argus on Kubernetes (P6_PLAN.md D12, D13): several instances on Kafka as the WAL.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: argus
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - statefulset.yaml
+  - services.yaml
+  - ingress.yaml
+  - keda-scaledobject.yaml
