@@ -113,6 +113,11 @@ public class ArgusMetrics {
     count("argus.tail.lines.dropped", Tags.of(TENANT, tenant), lines);
   }
 
+  /** Tail lines the bus couldn't take (its buffer full or the topic unavailable, P6 D10). */
+  public void tailBusDropped(String tenant, long lines) {
+    count("argus.tail.bus.dropped", Tags.of(TENANT, tenant), lines);
+  }
+
   /** One WAL segment indexed into the hot tier ({@code P5_PLAN.md} D2). */
   public void hotSegment(String tenant, String outcome, long indexed, long rejected, long skipped) {
     registry.counter("argus.hot.segments", "outcome", outcome.toLowerCase(Locale.ROOT)).increment();

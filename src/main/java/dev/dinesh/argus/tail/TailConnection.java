@@ -177,7 +177,7 @@ public final class TailConnection {
           pendingDropped++;
           continue;
         }
-        appendEvent(out, read.first() + i, event);
+        appendEvent(out, read.ids().get(i), event);
         sentInWindow++;
         sentNow++;
       }
@@ -196,13 +196,11 @@ public final class TailConnection {
     }
   }
 
-  private void appendEvent(StringBuilder out, long seq, TailEvent event)
+  private void appendEvent(StringBuilder out, String eventId, TailEvent event)
       throws JsonProcessingException {
     // JSON escapes newlines, so the event is one data line.
     out.append("id: ")
-        .append(ring.id())
-        .append('-')
-        .append(seq)
+        .append(eventId)
         .append("\ndata: ")
         .append(mapper.writeValueAsString(event))
         .append("\n\n");

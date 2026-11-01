@@ -366,6 +366,54 @@ public final class KafkaWal implements AutoCloseable {
   }
 
   /**
+   * The tail topic's partition count, creating it first (1h retention, {@code partitions} as the
+   * WAL's) when it is missing and {@code create-topics} allows. Unlike the WAL topic it holds
+   * nothing that isn't elsewhere, so it isn't checked.
+   *
+   * @throws IllegalStateException it is missing and may not be created
+   */
+  public int ensureTailTopic() throws IOException {
+    String tail = props.tailTopic();
+    try {
+      try {
+        return await(admin.describeTopics(List.of(tail)).allTopicNames())
+            .get(tail)
+            .partitions()
+            .size();
+      } catch (ExecutionException e) {
+        if (!(e.getCause() instanceof UnknownTopicOrPartitionException)) {
+          throw e;
+        }
+      }
+      if (!props.createTopics()) {
+        throw new IllegalStateException(
+            "Kafka tail topic "
+                + tail
+                + " does not exist; create it or set argus.kafka.create-topics=true"
+                + " (or argus.kafka.tail-topic=none for a local tail)");
+      }
+      NewTopic topic =
+          new NewTopic(tail, props.partitions(), props.replicationFactor())
+              .configs(
+                  Map.of(
+                      TopicConfig.RETENTION_MS_CONFIG,
+                      "3600000",
+                      TopicConfig.MAX_MESSAGE_BYTES_CONFIG,
+                      Integer.toString(MAX_RECORD_BYTES)));
+      try {
+        await(admin.createTopics(List.of(topic)).all());
+      } catch (ExecutionException e) {
+        if (!(e.getCause() instanceof TopicExistsException)) {
+          throw e;
+        }
+      }
+      return props.partitions();
+    } catch (ExecutionException e) {
+      throw new IOException("Kafka tail topic " + tail + ": " + e.getCause(), e.getCause());
+    }
+  }
+
+  /**
    * Fails while another member of {@code group} uses {@code clientId}: with {@code
    * argus.instance.id} in client ids, two instances given the same id (D8), or this instance's
    * previous run killed less than {@code session.timeout.ms} ago. Without an instance id, never.

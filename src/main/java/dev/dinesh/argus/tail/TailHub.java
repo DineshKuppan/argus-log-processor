@@ -23,6 +23,9 @@ import org.springframework.stereotype.Component;
  * The live tail ({@code P4_PLAN.md} D1–D4): a ring per tenant that has a tail open, which ingest
  * publishes to without ever waiting, and the connections reading it. While nobody tails a tenant,
  * {@link #isWatched} is false and publishing costs one map lookup.
+ *
+ * <p>With a {@link TailBus} attached (several instances, P6 D10), publishing goes to the bus, which
+ * delivers every instance's lines here; a tenant is watched while any instance tails it.
  */
 @Slf4j
 @Component
@@ -50,6 +53,7 @@ public class TailHub implements SmartLifecycle {
   private final AtomicInteger connections = new AtomicInteger();
   private final AtomicLong connectionIds = new AtomicLong();
   private volatile boolean running;
+  private volatile TailBus bus;
   private ScheduledExecutorService sweeper;
 
   @Autowired
@@ -63,17 +67,58 @@ public class TailHub implements SmartLifecycle {
     this.metrics = metrics;
   }
 
-  /** True while the tenant has a ring: a tail open, or closed less than {@code ring-idle} ago. */
-  public boolean isWatched(String tenantId) {
-    return tenants.containsKey(tenantId);
+  /**
+   * Routes publishing through {@code bus} from now on. Rings created before keep their local ids
+   * (their clients' resumes stay on this instance), so attach at startup.
+   */
+  public void attach(TailBus bus) {
+    this.bus = bus;
   }
 
-  /** Appends to the tenant's ring if it has one; never waits on a tail client. */
+  /**
+   * True while the tenant has a ring here (a tail open, or closed less than {@code ring-idle} ago)
+   * or, with a bus, while another instance tails it.
+   */
+  public boolean isWatched(String tenantId) {
+    TailBus b = bus;
+    return tenants.containsKey(tenantId) || (b != null && b.isWatched(tenantId));
+  }
+
+  /** Appends to the tenant's ring (or sends to the bus); never waits on a tail client. */
   public void publish(String tenantId, List<TailEvent> events) {
+    TailBus b = bus;
+    if (b != null) {
+      if (isWatched(tenantId)) {
+        b.publish(tenantId, events);
+      }
+      return;
+    }
     TenantTail tail = tenants.get(tenantId);
     if (tail != null) {
       tail.ring.append(events);
     }
+  }
+
+  /** Events the bus received (from any instance, this one included), with their positions. */
+  public void deliver(String tenantId, List<TailEvent> events, long[] positions) {
+    TenantTail tail = tenants.get(tenantId);
+    if (tail != null) {
+      tail.ring.append(events, positions);
+    }
+  }
+
+  /** True once a bus is attached: this instance's tail shows every instance's lines. */
+  public boolean shared() {
+    return bus != null;
+  }
+
+  public boolean hasRing(String tenantId) {
+    return tenants.containsKey(tenantId);
+  }
+
+  /** Tenants with a ring here: what this instance tells the others it watches. */
+  public Set<String> tailedTenants() {
+    return Set.copyOf(tenants.keySet());
   }
 
   /** Open tail connections on this node. */
@@ -115,11 +160,7 @@ public class TailHub implements SmartLifecycle {
                 ringsFull[0] = true;
                 return null;
               }
-              TenantTail current =
-                  t != null
-                      ? t
-                      : new TenantTail(
-                          new TailRing(props.ringLines(), props.ringBytes().toBytes()));
+              TenantTail current = t != null ? t : new TenantTail(newRing(tenantId));
               if (current.connections >= props.maxConnectionsPerTenant()) {
                 tenantFull[0] = true;
               } else {
@@ -127,6 +168,10 @@ public class TailHub implements SmartLifecycle {
               }
               return current;
             });
+    TailBus b = bus;
+    if (b != null && !ringsFull[0]) {
+      b.watch(tenantId);
+    }
     if (ringsFull[0]) {
       connections.decrementAndGet();
       throw new TailLimitException(
@@ -144,7 +189,7 @@ public class TailHub implements SmartLifecycle {
     long cursor = newest;
     String greeting = "";
     if (lastEventId != null && !lastEventId.isBlank()) {
-      long resumeAt = resumeCursor(ring, lastEventId.strip());
+      long resumeAt = ring.resume(lastEventId.strip());
       if (resumeAt < 0) {
         greeting = "event: reset\ndata: {\"reason\":\"unknown Last-Event-ID\"}\n\n";
       } else {
@@ -182,17 +227,11 @@ public class TailHub implements SmartLifecycle {
     return connection;
   }
 
-  /** The cursor after {@code lastEventId}, or -1 if it belongs to another ring. */
-  private static long resumeCursor(TailRing ring, String lastEventId) {
-    int dash = lastEventId.lastIndexOf('-');
-    if (dash <= 0 || !lastEventId.substring(0, dash).equals(ring.id())) {
-      return -1;
-    }
-    try {
-      return Long.parseLong(lastEventId.substring(dash + 1)) + 1;
-    } catch (NumberFormatException e) {
-      return -1;
-    }
+  private TailRing newRing(String tenantId) {
+    TailBus b = bus;
+    return b == null
+        ? new TailRing(props.ringLines(), props.ringBytes().toBytes())
+        : new TailRing(props.ringLines(), props.ringBytes().toBytes(), b.ringId(tenantId));
   }
 
   private void closed(String tenantId, TailConnection connection) {

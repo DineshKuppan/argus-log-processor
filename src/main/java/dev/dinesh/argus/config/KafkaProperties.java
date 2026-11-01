@@ -4,6 +4,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 
 /**
  * Kafka as the WAL ({@code P6_PLAN.md}), used with {@code argus.wal.store=kafka}.
@@ -22,6 +23,8 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param hotLinger the hot consumer sends a partial bulk after this long (D4)
  * @param retryInitial first wait after a failure; doubles up to {@code retryMax}
  * @param stagingDir where the archive consumer reassembles segments; a working area, never the WAL
+ * @param tailTopic the shared live tail's topic (D10); {@code none} keeps each instance's tail
+ *     local
  * @param properties passed to every Kafka client: {@code security.protocol}, {@code sasl.*}, {@code
  *     ssl.*} (from the environment)
  */
@@ -42,7 +45,8 @@ public record KafkaProperties(
     Duration retryInitial,
     Duration retryMax,
     Path stagingDir,
-    Map<String, String> properties) {
+    Map<String, String> properties,
+    String tailTopic) {
 
   public enum Check {
     FAIL,
@@ -54,6 +58,7 @@ public record KafkaProperties(
 
   public static final String HOT_GROUP = "argus-hot";
 
+  @ConstructorBinding
   public KafkaProperties {
     topic = topic == null || topic.isBlank() ? "argus-wal" : topic;
     checkTopic = checkTopic != null ? checkTopic : Check.FAIL;
@@ -69,6 +74,7 @@ public record KafkaProperties(
     retryMax = retryMax != null ? retryMax : Duration.ofMinutes(5);
     stagingDir = stagingDir != null ? stagingDir : Path.of("data", "kafka-staging");
     properties = properties != null ? Map.copyOf(properties) : Map.of();
+    tailTopic = tailTopic == null || tailTopic.isBlank() ? "argus-tail" : tailTopic.strip();
     if (maxOutage.toMillis() < 60_000) {
       throw new IllegalArgumentException(
           "argus.kafka.max-outage must be at least 1m (it bounds the producer's delivery timeout): "
@@ -82,6 +88,48 @@ public record KafkaProperties(
               + " <= "
               + maxOutage);
     }
+  }
+
+  public KafkaProperties(
+      String bootstrapServers,
+      String topic,
+      boolean createTopics,
+      Check checkTopic,
+      int partitions,
+      short replicationFactor,
+      Duration minRetention,
+      Duration maxOutage,
+      long maxLagRecords,
+      Duration orphanTimeout,
+      Duration commitInterval,
+      Duration hotLinger,
+      Duration retryInitial,
+      Duration retryMax,
+      Path stagingDir,
+      Map<String, String> properties) {
+    this(
+        bootstrapServers,
+        topic,
+        createTopics,
+        checkTopic,
+        partitions,
+        replicationFactor,
+        minRetention,
+        maxOutage,
+        maxLagRecords,
+        orphanTimeout,
+        commitInterval,
+        hotLinger,
+        retryInitial,
+        retryMax,
+        stagingDir,
+        properties,
+        null);
+  }
+
+  /** True unless {@code tail-topic=none}. */
+  public boolean sharedTail() {
+    return !"none".equalsIgnoreCase(tailTopic);
   }
 
   /** Never prints {@code properties}: they may hold SASL credentials. */

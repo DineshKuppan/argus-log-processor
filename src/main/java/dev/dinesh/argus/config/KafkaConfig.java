@@ -9,11 +9,13 @@ import dev.dinesh.argus.hot.HotIndices;
 import dev.dinesh.argus.kafka.ArchiveConsumer;
 import dev.dinesh.argus.kafka.HotConsumer;
 import dev.dinesh.argus.kafka.KafkaSink;
+import dev.dinesh.argus.kafka.KafkaTailBus;
 import dev.dinesh.argus.kafka.KafkaWal;
 import dev.dinesh.argus.kafka.KafkaWalCapacity;
 import dev.dinesh.argus.kafka.WalForwarder;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.sink.LogSink;
+import dev.dinesh.argus.tail.TailHub;
 import dev.dinesh.argus.wal.WalSegments;
 import dev.dinesh.argus.wal.WalSink;
 import io.micrometer.core.instrument.Gauge;
@@ -27,6 +29,7 @@ import java.util.EnumSet;
 import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Conditional;
@@ -122,6 +125,14 @@ public class KafkaConfig {
     HotBulkWriter writer =
         new HotBulkWriter(hotClient, indices, hot, m, Clock.systemUTC(), Duration.ofSeconds(1));
     return new HotConsumer(wal, props, writer, m);
+  }
+
+  /** The live tail shared by every instance (D10), unless {@code tail-topic=none}. */
+  @Bean
+  @ConditionalOnExpression("!'${argus.kafka.tail-topic:argus-tail}'.equalsIgnoreCase('none')")
+  KafkaTailBus kafkaTailBus(
+      KafkaWal wal, TailHub hub, ObjectMapper mapper, ObjectProvider<ArgusMetrics> metrics) {
+    return new KafkaTailBus(wal, hub, mapper, metrics.getIfAvailable(ArgusMetrics::noop));
   }
 
   /** Sends what a local WAL still holds (D6); finds nothing when there is none. */
