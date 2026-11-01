@@ -6,7 +6,34 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
-### P6a: Kafka as the WAL (unmerged)
+### P6b: several instances (unmerged)
+Plan and results: [`P6_PLAN.md`](docs/architecture/P6_PLAN.md) D8–D13, §9.
+
+#### Added
+- **`argus.instance.id`:** each instance's sources get their own identity. The id joins every `eventId`, archive key (`instance=I/`), the Parquet `source_instance` column and the hot tier's `source_instance` field (template v2, which also adds the field to existing indices). Without an id, every identity is unchanged.
+- **Several instances in the shared consumer groups:** the archive index moves into the object store, so whichever instance owns a partition supersedes a replayed segment's earlier copy. A consumer whose client id is already a member of its group waits for that member to leave instead of joining.
+- **A live tail shared through a Kafka topic** (`argus.kafka.tail-topic`, `argus-tail`):
+  - a tail on any instance sees every instance's lines, within 54ms (p99) across instances;
+  - `Last-Event-ID` resumes on another instance;
+  - a full bus drops and counts lines (`argus_tail_bus_dropped_total`) and never waits.
+- **Suppression decided in pipelined batches:** one Redis round trip per 1,000 lines. A 10,000-line push's suppression takes 681ms (p99) with Redis, instead of 10,000 round trips.
+- **Graceful drain on shutdown** (`argus.instance.drain-timeout`, 90s):
+  1. readiness goes down;
+  2. new pushes get 503 + `Retry-After: 1`;
+  3. pushes in progress finish;
+  4. every spool is ingested.
+- **Job ids name their instance;** another instance's job answers 404 naming it.
+- **`deploy/`:** a Dockerfile, plus Kubernetes manifests: a StatefulSet, services, an ingress with push affinity, a KEDA scaler on consumer lag and an HPA alternative. A `kind` overlay; the `kind` check scaled 1 → 3 on archive lag and back to 1, with each pod draining.
+- `MultiInstanceIT` and `SuppressionAcrossInstancesIT` (tag `load`).
+
+#### Changed
+- `ObjectStore.get` (for the archive index) on every store.
+- Argus's Kafka consumers set `allow.auto.create.topics=false`. Brokers should run with `auto.create.topics.enable=false`: a broker-created `argus-wal` has unsafe defaults, which Argus refuses.
+
+#### Measured
+- **`kill -9` of one of three instances under load:** exactly 300,000 of 300,000 lines in both the archive and the hot tier, on Apache Kafka 3.8 and Redpanda 24.2.
+
+### P6a: Kafka as the WAL: [#12](https://github.com/DineshKuppan/argus-log-processor/pull/12) (2026-11-01)
 Plan and results: [`P6_PLAN.md`](docs/architecture/P6_PLAN.md).
 
 #### Added

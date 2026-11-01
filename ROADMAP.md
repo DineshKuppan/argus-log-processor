@@ -18,8 +18,8 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | **P3b** | Export sources (Elasticsearch, Coralogix), replay lane | ✅ Done (#9) |
 | **P4** | Live tail, metrics, producers' canonical lines | ✅ Done (#10) |
 | **P5** | OpenSearch / Elasticsearch hot tier, search API | ✅ Done (#11) |
-| **P6a** | Kafka or Redpanda as the WAL; the archive and hot tier as consumer groups; lag watermarks | ✅ Done |
-| **P6b** | Several instances: instance ids, shared consumer groups, shared tail, Redis suppression pipelined, autoscaling on lag | ⏭ Next |
+| **P6a** | Kafka or Redpanda as the WAL; the archive and hot tier as consumer groups; lag watermarks | ✅ Done (#12) |
+| **P6b** | Several instances: instance ids, shared consumer groups, shared tail, Redis suppression pipelined, autoscaling on lag | ✅ Done |
 
 ## Acceptance criteria
 
@@ -28,16 +28,15 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | T1 | Sustained throughput | ≥4,150 lines/s on one 4GB node | ✅ ~380–440k lines/s file ingest (1GB test); 132k lines/s pushed over HTTP end to end at a 256MB heap; the same with Kafka or Redpanda as the WAL (130–132k, P6a) |
 | T2 | Memory | Heap ≤2.4GB, no OOM on a 10GB file | ✅ 810MB peak (P0) |
 | T3 | Backpressure | Sink stalled for 10 min → no OOM, sources paused or 429, WAL under its watermark, full recovery | ✅ Scaled tests: a 30s outage during a 500MB file ingest paused ingest within one segment of the watermark; a 20s outage during push load turned into 429s, and all 1M acknowledged lines were archived afterwards (both at a 256MB heap). With Kafka (P6a): a 60s broker outage was absorbed by the spools; an archive outage paused push at the lag watermark (429 `WAL_FULL`); every line archived exactly once afterwards |
-| T4 | Durability | `kill -9` at a random point → no lost records, duplicates only with the same `eventId` | ✅ P0 (files); P3a (push with `Idempotency-Key`: no loss, one `eventId` per line); P6a (Kafka and Redpanda: 400,000 of 400,000 archived once) |
+| T4 | Durability | `kill -9` at a random point → no lost records, duplicates only with the same `eventId` | ✅ P0 (files); P3a (push with `Idempotency-Key`: no loss, one `eventId` per line); P6a (Kafka and Redpanda: 400,000 of 400,000 archived once); P6b (one of three instances killed: 300,000 of 300,000 in both tiers) |
 | T5 | Freshness | p99 ingest-to-searchable ≤30s | ✅ 2 CPUs, 4,150 lines/s pushed: p50 11.8s, p99 20.1s from the 202 to the search API finding the line (OpenSearch 2.17; Elasticsearch 8.15 on the host: p99 17.8s); Kafka as the WAL, host: p99 22.3s |
 | T6 | Suppression | Correct at the 10s boundary; p99 <1ms | ✅ 8.8µs |
 | T7 | Live tail | Visible ≤2s after ingest; a slow client can't slow ingest | ✅ 2 CPUs: push-to-tail p99 39ms; 16 tail clients that never read cost push p99 no more than 16 that read (within 7%, 4 runs), throughput unchanged; 1,000 connections at a 256MB heap |
 | T8 | Replay | Replay any range without starving live ingest | ✅ 2 CPUs: live push p99 unchanged within noise during a 1GB replay at 8MB/s (3–8x worse without the lane) |
 | T9 | Cost | Cold tier ≤3TiB at 7 years (≥8x compression) | ✅ 14.6x on synthetic data; re-measure on real logs |
 
-## Next: P6b ([`P6_PLAN.md`](docs/architecture/P6_PLAN.md))
-P6a (Kafka as the WAL, ADR-8) is done; P6b is the second PR.
-- **P6b:** several instances: an instance id in every source's identity, consumer groups across instances, a live tail shared through a tail topic, Redis suppression pipelined per request (not partitioned by key: suppression decides at receive time), autoscaling on consumer lag (KEDA / HPA manifests).
+## Next
+P6 is done: Kafka as the WAL (P6a, ADR-8) and several instances (P6b). What remains is under "Open items", below.
 
 ## Open items
 - **Re-measure T9 on real logs.** The 14.6x comes from `DataSeeder`, whose vocabulary is small. Real logs will compress less.
@@ -55,7 +54,6 @@ P6a (Kafka as the WAL, ADR-8) is done; P6b is the second PR.
 - **Exactly-once Elasticsearch exports across an expired point in time:** hits sharing the last exported timestamp can be exported twice. A stable unique sort field (when the index has one) would make it exact.
 - **Byte-range replay:** a replay re-reads a whole file (`fromBeginning`) or an export's time range; there is no "re-ingest offsets X–Y of this file".
 - **Tail warm-up:** a restart empties the tail rings; pre-fill them from the newest WAL segments so a reconnect resumes instead of getting `reset`.
-- **Tail across instances:** each instance tails only what it ingests; a shared tail needs a Redis Stream or Kafka topic per tenant (P6).
 - **Hot tier on a managed cluster:** tested against OpenSearch 2.17 and Elasticsearch 8.15 containers only; add AWS SigV4 for Amazon OpenSearch Service with IAM auth.
 - **Search the cold tier:** ranges older than the hot window (14 days) are only in Parquet; add Athena / BigQuery queries (asynchronous) behind the search API.
 - **Typed attributes in the hot tier:** attribute values are indexed as text; promote configured keys to numeric fields for ranges and aggregations.

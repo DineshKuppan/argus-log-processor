@@ -96,6 +96,16 @@ What Argus does today, by area. Planned work is in [ROADMAP.md](ROADMAP.md); the
 | Switching stores | At startup, local segments not yet archived or indexed are sent to the topic first |
 | Tested brokers | Apache Kafka 3.8 (KRaft) and Redpanda 24.2 |
 
+## Several instances (optional)
+| Feature | Details |
+|---|---|
+| Instance identity | `argus.instance.id` (the pod name) joins every `eventId`, archive key, Parquet row (`source_instance`) and hot document, so two instances ingesting the same source id never overwrite each other. Unset: identities unchanged |
+| Shared consumer groups | Every instance consumes its share of partitions; the archive index lives in the object store, so a partition can move between instances. `kill -9` of one of three under load: exact in both tiers |
+| Shared live tail | Through a tail topic: a tail on any instance sees every instance's lines (p99 54ms across instances), `Last-Event-ID` resumes on another instance; the tail never slows ingest (drops and counts) |
+| Suppression across instances | Redis, one pipelined round trip per 1,000 lines; each message allowed once across instances |
+| Graceful drain | On SIGTERM: readiness down, pushes 503 + `Retry-After: 1`, in-progress pushes finish, spools ingested (`drain-timeout` 90s) |
+| Kubernetes | `deploy/k8s`: StatefulSet, services, ingress with push affinity (`upstream-hash-by`), KEDA scaler on consumer lag (or an HPA via the Prometheus Adapter); checked in `kind` |
+
 ## Suppression
 | Feature | Details |
 |---|---|
