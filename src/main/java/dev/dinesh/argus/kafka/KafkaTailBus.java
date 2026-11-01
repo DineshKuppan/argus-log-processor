@@ -335,6 +335,7 @@ public final class KafkaTailBus implements TailBus, SmartLifecycle {
     config.put(ConsumerConfig.CLIENT_ID_CONFIG, wal.clientId("argus-tail"));
     config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
     config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "latest");
+    config.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, false);
     config.put(ConsumerConfig.FETCH_MAX_WAIT_MS_CONFIG, 50);
     config.put(ConsumerConfig.MAX_PARTITION_FETCH_BYTES_CONFIG, KafkaWal.MAX_RECORD_BYTES);
     config.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class);

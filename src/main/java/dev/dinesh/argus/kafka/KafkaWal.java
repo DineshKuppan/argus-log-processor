@@ -184,6 +184,8 @@ public final class KafkaWal implements AutoCloseable {
     config.put(ConsumerConfig.GROUP_ID_CONFIG, group);
     config.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
     config.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+    // Argus creates its topics with safe settings (D6); a broker default would not be.
+    config.put(ConsumerConfig.ALLOW_AUTO_CREATE_TOPICS_CONFIG, false);
     config.put(
         ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG,
         CooperativeStickyAssignor.class.getName());

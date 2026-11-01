@@ -2,6 +2,7 @@ package dev.dinesh.argus.ingest;
 
 import dev.dinesh.argus.config.InstanceProperties;
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.availability.AvailabilityChangeEvent;
@@ -34,6 +35,7 @@ public class InstanceDrain implements ApplicationListener<ContextClosedEvent> {
   private final ObjectProvider<StreamRunner> runner;
   private final ApplicationEventPublisher events;
   private final Duration timeout;
+  private final AtomicBoolean drained = new AtomicBoolean();
 
   public InstanceDrain(
       ObjectProvider<PushIngestService> push,
@@ -48,6 +50,10 @@ public class InstanceDrain implements ApplicationListener<ContextClosedEvent> {
 
   @Override
   public void onApplicationEvent(ContextClosedEvent event) {
+    // The management server's child context closes too, and its event reaches this listener.
+    if (event.getApplicationContext().getParent() != null || !drained.compareAndSet(false, true)) {
+      return;
+    }
     long start = System.nanoTime();
     long deadline = start + timeout.toNanos();
     boolean pushesFinished = true;
