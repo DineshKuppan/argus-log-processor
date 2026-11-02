@@ -434,6 +434,13 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
   **Choice:** one record per line plus markers, idempotent producer, no transactions. The archive consumer reassembles segments in local staging and runs the P2 archiver unchanged; the hot consumer indexes records as they arrive. Lag watermarks replace WAL bytes, because Kafka deletes by retention, not by acknowledgement.
 - **R:** T1, T3, T4 and T5 on Apache Kafka and Redpanda; the archive's keys identical to the local WAL's for the same input ([`P6_PLAN.md`](P6_PLAN.md) §5).
 
+### ADR-9: Record framing and PII masking
+- **S:** Since P1 every line is a record: stack traces split into one record per frame, push suppression drops frames as copies of other traces' frames, and secrets reach every tier, including the immutable 7-year archive.
+- **T:** Join multiline records and mask secrets without unbounded memory, a new stage thread or a change to the P0 commit protocol, and with single-line sources ingesting byte for byte as before.
+- **A:** Framing in the reader on bytes (needs format knowledge in two readers) vs. **in the parse stage, holding one open record across batches** vs. a separate stage thread vs. leaving it to agents. Masking parsed envelopes (the spool, receive-time tail and suppression keys see raw values first) vs. **text-level masking of each line before parsing, at both entry points** vs. at the sinks.
+  **Choice:** a stateful `RecordFramer` per run in the parse stage and in push receive; a record's offset (and `eventId`) is its head line's; batch ends, segment ends and checkpoints fall only at record starts; a run's last open record is held back until its source is quiet. Built-in continuation rules guarded by the primary parser. A `PiiMasker` whose detectors and tokens never touch `"` or `\`, idempotent, applied before framing.
+- **R:** Traces are one record in every tier and suppressed as one; `kill -9` across segment boundaries exact; no planted value in the spool, WAL, archive, hot tier, tail or logs; T1 held ([`P7_PLAN.md`](P7_PLAN.md) §5).
+
 ### ADR-6: Java version
 - **S:** Java 17 (pom).
 - **T:** Throughput and simplicity for I/O-heavy stages.
@@ -468,6 +475,7 @@ Each ADR follows the STAR template from §1. They're short on purpose: the reaso
 | **P4** | Live tail (SSE), canonical log lines (Argus's own + ingesting producers'), Micrometer metrics | Phase 3 | T7 |
 | **P5** | Hot tier (OpenSearch / Elasticsearch) as a second WAL consumer (ADR-7), daily indices with tuned mappings and retention, `GET /api/v2/search` | Phase 2 / 3 | T5 |
 | **P6** | P6a: Kafka as the WAL (ADR-8), the archive and hot tier as consumer groups. P6b: several instances (instance ids in identities, a shared tail, Redis suppression pipelined), autoscaling on consumer lag | Phase 3, Deployment | T1, T3, T4, T5 on Kafka; T7 across instances |
+| **P7** | P7a: multiline record framing (stack traces, CRI partial lines) in the parse stage and at push receive, so suppression and the tail act on records. P7b: PII masking before parsing at both entry points; resource enrichment (Kubernetes path metadata, configured attributes) ([`P7_PLAN.md`](P7_PLAN.md)) | Phase 1 / 3 | T1 with framing and masking on; T4 with records across segment boundaries; no planted secret in any tier |
 
 ### Verification approach per phase
 - **Unit:** each adapter against its port contract (shared contract test per port, so adapters are substitutable, per LSP).
