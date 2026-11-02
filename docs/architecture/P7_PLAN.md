@@ -63,7 +63,8 @@ Since P1, every `\n`-terminated line is one record. Two things in today's data a
   Chosen (c), as `framing` on file jobs and streams (`auto` default, `none`, or `start`):
   - **`auto`:** while a record is open, a line continues it when **the primary parser (if structured) does not parse it** *and* it matches a built-in rule, each anchored at the start of the line and checked on its first 256 characters:
     - an indented line (space or tab), which covers Java `\tat …`, `\t... 12 more`, Python's `  File "…", line 3` and Go's `\t/app/main.go:42`;
-    - `Caused by: `, `Suppressed: `, `Traceback (most recent call last):`, `goroutine N [`, `panic: `;
+    - `Caused by: `, `Suppressed: `, `Traceback (most recent call last):` and Python's chaining lines (`During handling of the above exception…`), `goroutine N [` (Go's `panic: ` line is a head: it starts the panic's output);
+    - after a `goroutine N [` header, Go's unindented function lines (`main.main()`) and `created by …`;
     - a fully-qualified exception line, `^[\w$]+(\.[\w$]+)+(: .*)?$`, ending in `Exception`, `Error` or `Throwable` before the colon (Java's `java.lang.IllegalStateException: boom`);
     - a Python exception line (`ValueError: …`, `^[A-Za-z_][\w.]*(Error|Exception|Warning|Exit|Interrupt)(: .*)?$`), but only directly after an indented traceback line.
   - **`start:<regex>`** (≤256 characters; checked on a line's first 256 characters, so a 1MB line costs no more than a short one): a matching line starts a record and every other line continues it. This is for layouts the rules don't cover. It is set per file job or stream like `pattern` today: a tenant's own data, CPU bounded by the 256-character window.
