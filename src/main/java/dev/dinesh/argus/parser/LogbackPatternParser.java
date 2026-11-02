@@ -226,7 +226,7 @@ public class LogbackPatternParser implements LogParser {
           "wEx",
           "nopex",
           "nopexception" -> {
-        // stack traces span lines; multiline framing is not supported yet
+        // the trace follows on its own lines, which framing joins into the record (P7a)
       }
       default -> addField(out, new Field(Kind.ATTRIBUTE, word), "(.*?)", padded);
     }

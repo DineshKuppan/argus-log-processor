@@ -10,12 +10,19 @@ A Spring Boot service that ingests, parses, filters, aggregates and archives log
 |---|---|
 | [FEATURES.md](FEATURES.md) | Everything Argus does today, by area |
 | [CHANGELOG.md](CHANGELOG.md) | What changed, merged PR by merged PR |
-| [ROADMAP.md](ROADMAP.md) | What's next (P5) and the open items |
+| [ROADMAP.md](ROADMAP.md) | What's next (P7b) and the open items |
 | [docs/architecture/SCALING_DESIGN.md](docs/architecture/SCALING_DESIGN.md) | Target architecture, capacity maths, ADRs |
 | [CLAUDE.md](CLAUDE.md) | Code map, guardrails and conventions for contributors |
 
 ## What's new
 
+- **Multiline framing (P7a).**
+  - A stack trace is now one record, not one per line: Java, Python and Go traces by default (`framing=auto`), any layout with `framing=start:<regex>`, or one record per line with `framing=none`. The head line's time, level and attributes apply to the whole trace; `exception.type` names the exception, and `argus.lines` counts the lines.
+  - A line the source's format parses always starts a new record, so a trace can't swallow the next event.
+  - Pushed traces are suppressed and tailed whole: a repeated trace is dropped as one record, never frame by frame, even when an agent splits it across two requests.
+  - Kubernetes' split CRI lines (`P` … `F`) are joined before parsing, so a long JSON line from a pod is one parsed record.
+  - Checkpoints and segment ends fall only at record starts, so a crash never splits or duplicates a trace (`kill -9` mid-file: every record exactly once). A trace still being written at the end of a file waits for the next run.
+  - 538k lines/s on a log with 5% stack traces at a 256MB heap, faster than without framing (474k).
 - **Several instances (P6b).**
   - Run several Argus instances on one Kafka topic. Each instance has an id (the pod name), which keeps two instances' lines apart in every tier.
   - The archive and the hot tier share their consumer groups, and a live tail on any instance shows every instance's lines (54ms p99 across instances).
@@ -129,6 +136,7 @@ curl -X POST localhost:9000/api/v2/ingest/file \
 curl localhost:9000/api/v2/ingest/jobs/<jobId> -H 'X-Argus-Api-Key: my-secret-key'
 ```
 - **Format:** detected from the first 100 lines, or set with `format` (`nginx_access`, `json`, `cri`, `kv`, `raw`, `logback`) or `pattern` (a Logback layout).
+- **Framing:** stack traces are joined into one record (`framing`: `auto` by default, `none`, or `start:<regex>` for a line that starts each record). Job status shows `multilineRecords`, and `heldBackBytes` for a trace still being written at the end of the file.
 - **Output:** NDJSON `LogEnvelope`s under `data/out/tenant=acme/dt=…/source=app/gen=…/`.
 - **Resume:** a rerun of the same `sourceId` continues from its checkpoint. A rotated or truncated file starts again as a new generation.
 
@@ -299,12 +307,12 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 
 | Method | Endpoint | What it does |
 |---|---|---|
-| POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`, `lane` (`live` / `replay`; `replay` by default with `fromBeginning`). 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (the lane's job slots busy, or the WAL full while the archive catches up) |
+| POST | `/api/v2/ingest/file` | Start a streaming ingest job: `path`, optional `sourceId`, `fromBeginning`, `format`, `pattern`, `framing` (`auto` / `none` / `start:<regex>`), `lane` (`live` / `replay`; `replay` by default with `fromBeginning`). 202, or 400 / 404 / 409 (source busy) / 429 + `Retry-After` (the lane's job slots busy, or the WAL full while the archive catches up) |
 | POST | `/api/v2/ingest/exports` | Export `[from, to)` from a configured source into a stream: `source`, `streamId`, `query`, `from`, `to`, `fromBeginning`. 202, or 400 / 404 (no such source for the tenant) / 409 (an export already running on the stream) / 429 + `Retry-After` (replay slots busy, WAL full) |
 | GET, DELETE | `/api/v2/ingest/exports/{id}` | Export progress (pages, lines, `paused`, cursor position) / cancel before the next page |
 | GET | `/api/v2/search` | Search the hot tier (with `argus.hot.store`): `from`, `to` (required, ≤14 days, within the hot window), `q`, `level`, `source`, `service`, `attr=key:value`, `size`, `cursor` → `hits`, `next`, `partial`. 400 out of bounds, 404 without a hot tier, 429 + `Retry-After` (search slots busy), 503 + `Retry-After` (cluster busy or down) |
 | GET | `/api/v2/tail` | Live tail (Server-Sent Events) of the tenant's lines: `level`, `source`, `q`, `Last-Event-ID`. `event: dropped` / `reset`; 400 bad filter, 429 + `Retry-After` at a connection or tailed-tenant limit |
-| POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, same key in progress, quota, WAL or spool full), 413, 409 (too many streams, or the id is a file job's source id), 415 |
+| POST | `/api/v2/ingest/streams/{id}` | Push lines (NDJSON or text, optional `Content-Encoding: gzip`, `Idempotency-Key`, `format`, `pattern`, `framing`). 202 once durable; 200 for a repeated key; 429 + `Retry-After` (busy, same key in progress, quota, WAL or spool full), 413, 409 (too many streams, or the id is a file job's source id), 415 |
 | GET | `/api/v2/ingest/streams/{id}`, `/api/v2/ingest/streams` | A stream's (or every stream's) spool, counters and last run. Another tenant's stream is 404 |
 | GET | `/api/v2/ingest/jobs/{id}` | Job progress: bytes, lines, format, segments, outputs, `paused` / `pausedMs`. Another tenant's job is 404 |
 | DELETE | `/api/v2/ingest/jobs/{id}` | Cancel a job at its next batch; committed segments stay |
@@ -327,19 +335,25 @@ Every endpoint needs an API key: 401 without one. Request bodies are JSON.
 java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-processor-0.1.0.jar \
   org.springframework.boot.loader.launch.PropertiesLauncher data/in/big.log 10GB
 ```
+Or a key=value application log in which a share of records carry a Java stack trace:
+```bash
+java -Dloader.main=dev.dinesh.argus.seeder.DataSeeder -cp target/argus-log-processor-0.1.0.jar \
+  org.springframework.boot.loader.launch.PropertiesLauncher data/in/app.log 1GB --stack-traces=0.05
+```
 The repository includes `app.json` (25,000 JSON lines) and `k8s.cri.txt` in `src/main/resources/logs/`.
 
 ## Tests
 
 ```bash
-mvn test                                         # 562 tests; Redis, S3, GCS, Elasticsearch, OpenSearch, Kafka and Redpanda tests need Docker
+mvn test                                         # 607 tests; Redis, S3, GCS, Elasticsearch, OpenSearch, Kafka and Redpanda tests need Docker
 mvn -P ci test                                   # same, without reformatting the code
 mvn test -Dgroups=load -DexcludedGroups=none     # load: 1GB ingest + archive at 256MB heap, T3 archive outage, 1M suppression
                                                  # decisions, push throughput / isolation, push backpressure, kill -9 during push,
                                                  # T8 replay isolation, T7 live tail, T5 hot-tier freshness, a hot-tier outage and
                                                  # kill -9 while indexing (-Dargus.load.docker-cpus=2 runs the server in a 2-CPU
                                                  # container); Kafka as the WAL (KafkaWalIT, host only: T1, broker and archive outages,
-                                                 # kill -9; -Dargus.load.kafka-broker=redpanda; HotTierIT with -Dargus.load.wal=kafka)
+                                                 # kill -9; -Dargus.load.kafka-broker=redpanda; HotTierIT with -Dargus.load.wal=kafka); FramingIT (P7a: auto vs none
+                                                 # on 1GB with stack traces, kill -9 mid-trace)
 ```
 
 ## License
