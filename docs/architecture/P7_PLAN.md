@@ -179,7 +179,7 @@ Since P1, every `\n`-terminated line is one record. Two things in today's data a
 - **Task:** make masking and framing observable.
 - **Action:**
   - **Canonical lines:** `Push request finished …`, `Ingest finished …` and `Export page finished …` gain `masked=N` (values replaced) and `records=N` (records after framing; `lines` stays the line count).
-  - **Job and stream status** gain `records`, `multilineRecords`, `heldBackBytes` and `masked`.
+  - **Job and stream status** gain `framing` (as requested), `multilineRecords`, `heldBackBytes` and (P7b) `masked`. Their `lines` keeps its meaning, the records written, so a multiline record counts once; the `Ingest finished …` line gains `multilineRecords` and `heldBackBytes`.
   - **Meters:** `argus.pii.masked{tenant, detector}`, `argus.ingest.records{tenant}`, `argus.framing.orphans{tenant}`.
   - `sampleUnparsed` logs the line after masking.
 - **Result:** an operator can see that a tenant's cards are being masked (and how many) without the logs or the scrape ever containing one.

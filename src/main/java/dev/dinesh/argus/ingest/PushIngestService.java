@@ -71,6 +71,8 @@ public class PushIngestService {
    * @param idempotencyKey retries with the same key are answered from the first request
    * @param format the stream's format from now on ({@code json}, …), or null to keep or detect it
    * @param pattern a Logback layout; implies format {@code logback}
+   * @param framing the stream's framing from now on ({@code auto}, {@code none}, {@code
+   *     start:<regex>}), or null to keep it
    */
   public record PushRequest(
       String tenantId,
@@ -80,7 +82,30 @@ public class PushIngestService {
       long contentLength,
       String idempotencyKey,
       String format,
-      String pattern) {}
+      String pattern,
+      String framing) {
+
+    public PushRequest(
+        String tenantId,
+        String streamId,
+        InputStream body,
+        String contentEncoding,
+        long contentLength,
+        String idempotencyKey,
+        String format,
+        String pattern) {
+      this(
+          tenantId,
+          streamId,
+          body,
+          contentEncoding,
+          contentLength,
+          idempotencyKey,
+          format,
+          pattern,
+          null);
+    }
+  }
 
   /**
    * What was spooled.
@@ -281,6 +306,7 @@ public class PushIngestService {
     String streamId = SourceOffset.requireValidSourceId(request.streamId());
     String key = validKey(request.idempotencyKey());
     LogParser requested = parsers.resolve(request.format(), request.pattern()).orElse(null);
+    FramingSpec framing = FramingSpec.parse(request.framing()).orElse(null);
     // Cheapest checks first, all before the body is read.
     if (draining) {
       throw new PushRejectedException(
@@ -306,7 +332,8 @@ public class PushIngestService {
             "The spool holds argus.push.max-spool-bytes not yet ingested; retry later");
       }
       if (key == null) {
-        return readAndSpool(request, tenantId, streamId, requested, null, receivedAt, counts);
+        return readAndSpool(
+            request, tenantId, streamId, requested, framing, null, receivedAt, counts);
       }
       // One request per key at a time: a retry racing its original would otherwise miss the key,
       // have its lines suppressed as the original's copies, and could be stored under the key.
@@ -327,7 +354,8 @@ public class PushIngestService {
           stream.lastRequestAt = receivedAt;
           return duplicate(stream, earlier.get());
         }
-        return readAndSpool(request, tenantId, streamId, requested, key, receivedAt, counts);
+        return readAndSpool(
+            request, tenantId, streamId, requested, framing, key, receivedAt, counts);
       } finally {
         keysInFlight.remove(inFlight);
       }
@@ -341,6 +369,7 @@ public class PushIngestService {
       String tenantId,
       String streamId,
       LogParser requested,
+      FramingSpec framing,
       String key,
       Instant receivedAt,
       Counts counts)
@@ -367,6 +396,9 @@ public class PushIngestService {
     stream.lastRequestAt = receivedAt;
     if (requested != null) {
       stream.useParser(requested);
+    }
+    if (framing != null) {
+      stream.useFraming(framing);
     }
     return spool(stream, body, key, receivedAt);
   }

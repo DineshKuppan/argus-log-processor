@@ -156,6 +156,17 @@ class StreamControllerTest {
   }
 
   @Test
+  void aStreamsFramingIsSetByAPushAndABadOneIs400() throws Exception {
+    as(ACME_KEY, pushTo("framed", "a\n").param("framing", "none")).andExpect(status().isAccepted());
+    as(ACME_KEY, get("/api/v2/ingest/streams/framed"))
+        .andExpect(jsonPath("$.framing").value("none"));
+    as(ACME_KEY, pushTo("framed", "a\n").param("framing", "multiline"))
+        .andExpect(status().isBadRequest());
+    as(ACME_KEY, pushTo("framed", "a\n").param("framing", "start:("))
+        .andExpect(status().isBadRequest());
+  }
+
+  @Test
   void anotherTenantsStreamIsNotFound() throws Exception {
     as(ACME_KEY, pushTo("private", "a\n")).andExpect(status().isAccepted());
 

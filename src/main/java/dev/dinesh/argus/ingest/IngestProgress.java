@@ -19,6 +19,7 @@ public final class IngestProgress {
   private final AtomicLong segmentsCommitted = new AtomicLong();
   private final AtomicLong committedOffset = new AtomicLong();
   private final AtomicLong heldBackBytes = new AtomicLong();
+  private final AtomicLong multilineRecords = new AtomicLong();
   private final List<String> outputs = new CopyOnWriteArrayList<>();
   private volatile String resumeReason;
   private volatile String format;
@@ -56,6 +57,10 @@ public final class IngestProgress {
   /** Continuation lines past a record's limits, counted with the truncated lines (P7 D4). */
   void dropped(int lines) {
     truncated.addAndGet(lines);
+  }
+
+  void multiline(int records) {
+    multilineRecords.addAndGet(records);
   }
 
   /** A multiline record open at the source's end, left for the next run (P7 D3). */
@@ -140,6 +145,11 @@ public final class IngestProgress {
 
   public long segmentsCommitted() {
     return segmentsCommitted.get();
+  }
+
+  /** Records of more than one line (P7 D4); {@link #lines()} counts records. */
+  public long multilineRecords() {
+    return multilineRecords.get();
   }
 
   public long heldBackBytes() {

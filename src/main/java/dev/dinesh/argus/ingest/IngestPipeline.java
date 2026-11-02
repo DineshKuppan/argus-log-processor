@@ -352,7 +352,8 @@ public class IngestPipeline {
       log.info(
           "Ingest finished tenant={} source={} outcome={} error={} resumeReason={} format={}"
               + " formatSource={} startOffset={} committedOffset={} totalBytes={} segments={}"
-              + " lines={} fallbackParsed={} unparsed={} rejected={} truncated={} heldBackBytes={}"
+              + " lines={} multilineRecords={} fallbackParsed={} unparsed={} rejected={} truncated={}"
+              + " heldBackBytes={}"
               + " pausedMs={}"
               + " durationMs={}",
           tenantId,
@@ -367,6 +368,7 @@ public class IngestPipeline {
           progress.totalBytes(),
           progress.segmentsCommitted(),
           progress.lines(),
+          progress.multilineRecords(),
           progress.fallbackParsed(),
           progress.unparsed(),
           progress.rejected(),
@@ -776,6 +778,7 @@ public class IngestPipeline {
       int count = records.list.size();
       progress.parsed(count, records.rejected, records.unparsed, records.fallback);
       progress.dropped(records.dropped);
+      progress.multiline(records.multiline);
       metrics.ingestBatch(
           tenantId,
           lane,
@@ -816,6 +819,7 @@ public class IngestPipeline {
       int unparsed;
       int fallback;
       int dropped;
+      int multiline;
 
       Records(RawBatch batch) {
         this.batch = batch;
@@ -831,6 +835,9 @@ public class IngestPipeline {
           case PRIMARY -> {}
         }
         dropped += record.droppedLines();
+        if (record.lines() > 1) {
+          multiline++;
+        }
         LogEnvelope envelope = envelopes.create(record.parsed(), record.offset(), observedAt);
         list.add(envelope);
         if (tailEvents != null) {

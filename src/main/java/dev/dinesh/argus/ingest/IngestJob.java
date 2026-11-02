@@ -1,5 +1,6 @@
 package dev.dinesh.argus.ingest;
 
+import dev.dinesh.argus.framing.FramingSpec;
 import dev.dinesh.argus.parser.LogParser;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -26,6 +27,7 @@ public final class IngestJob {
   private final Path path;
   private final boolean fromBeginning;
   private final LogParser parser;
+  private final FramingSpec framing;
   private final Lane lane;
   private final Instant createdAt = Instant.now();
   private final IngestProgress progress = new IngestProgress();
@@ -36,6 +38,7 @@ public final class IngestJob {
 
   /**
    * @param parser requested primary parser, or null to detect it
+   * @param framing requested framing, or null for {@code argus.framing.mode}
    */
   IngestJob(
       String id,
@@ -44,7 +47,9 @@ public final class IngestJob {
       Path path,
       boolean fromBeginning,
       LogParser parser,
+      FramingSpec framing,
       Lane lane) {
+    this.framing = framing;
     this.id = id;
     this.tenantId = tenantId;
     this.sourceId = sourceId;
@@ -82,6 +87,11 @@ public final class IngestJob {
 
   public boolean fromBeginning() {
     return fromBeginning;
+  }
+
+  /** Requested framing, or null for the configured default. */
+  public FramingSpec framing() {
+    return framing;
   }
 
   /** Requested primary parser, or null if the format is detected. */

@@ -8,6 +8,9 @@ import java.util.List;
  *
  * @param paused why a running job is waiting ({@code WAL_FULL}), or null
  * @param pausedMs total time the job has waited for WAL room
+ * @param framing the requested framing, or null for {@code argus.framing.mode}
+ * @param lines records written (a multiline record counts once)
+ * @param heldBackBytes a multiline record open at the end of the file, left for the next run
  */
 public record IngestJobStatus(
     String jobId,
@@ -25,11 +28,14 @@ public record IngestJobStatus(
     double percent,
     String format,
     String formatSource,
+    String framing,
     long lines,
+    long multilineRecords,
     long fallbackParsed,
     long unparsed,
     long rejected,
     long truncated,
+    long heldBackBytes,
     long segmentsCommitted,
     long committedOffset,
     List<String> outputs,
@@ -65,11 +71,14 @@ public record IngestJobStatus(
         Math.round(percent * 10) / 10.0,
         p.format(),
         p.formatSource(),
+        job.framing() == null ? null : job.framing().toString(),
         p.lines(),
+        p.multilineRecords(),
         p.fallbackParsed(),
         p.unparsed(),
         p.rejected(),
         p.truncated(),
+        p.heldBackBytes(),
         p.segmentsCommitted(),
         p.committedOffset(),
         p.outputs(),
