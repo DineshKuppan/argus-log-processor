@@ -298,4 +298,15 @@ Meters: `argus_pii_masked_total{tenant,detector}`, `argus_ingest_records_total{t
 
 ## 9. Results
 
-To be filled in from `FramingIT` and the end-to-end tests.
+### P7a
+`FramingIT` (tag `load`), on the host (a 10-core laptop). Each run is its own JVM capped at 256MB, ingesting a `DataSeeder.generateAppLogs` file: key=value lines, 5% of records ERRORs with a Java stack trace (exception line, 8–40 frames, half with a `Caused by:` and `... N more`), about 2.4 lines per record.
+
+| Check | Result |
+|---|---|
+| **T1**: 1GB (5,134,560 records, 12,508,545 lines, 256,474 traces), production batches and 500MB segments | **`auto`: 538k lines/s (44.1MB/s), 23.2s, peak heap 180MB**; `none`: 474k lines/s (38.8MB/s), 26.4s, peak heap 201MB. `auto` wrote exactly 5,134,560 records, 256,474 of them multiline, none unparsed; `none` wrote 12,508,545 records, 7,373,985 of them `raw` / unparsed |
+| **T4**: 256MB (1,285,992 records, 64,433 traces), 8MB segments, `kill -9` once 4 segments were committed, then a rerun | Resumed from the checkpoint at byte 34,079,295; afterwards exactly 1,285,992 records with 1,285,992 distinct offsets, 64,433 multiline, and their `argus.lines` summing to the file's 3,137,501 lines: every line in exactly one record, none twice; every `eventId` the head line's |
+
+- **Framing is faster than no framing on trace-heavy logs:** joining 2.4 lines into a record means 58% fewer envelopes to build, serialise and write, which outweighs the continuation checks. On a log without traces the checks run once per line and add nothing else; the compatibility test (§5) shows the output is byte for byte the same.
+- **T1 holds with a wide margin:** 538k lines/s against T1's 4,150, in a 256MB heap.
+- **Segment ends inside traces:** with 8MB segments there are 32 segment ends in 256MB, and traces (about 2–3KB, one every ~4KB of file) cover a large share of the bytes, so many reader-chosen ends fall inside a trace (how many wasn't counted; `IngestPipelineFramingTest` asserts each committed end is a record start). No record was split or duplicated.
+- **Not measured yet:** pushes of traces under suppression at load (covered by `PushIngestServiceTest` and `StreamRunnerTest`); P7b's masking cost.

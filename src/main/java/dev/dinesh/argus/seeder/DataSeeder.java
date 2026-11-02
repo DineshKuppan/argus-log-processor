@@ -42,11 +42,16 @@ public class DataSeeder {
 
   /**
    * With no arguments, regenerates the bundled sample log. With {@code <path> <size>} (e.g. {@code
-   * data/in/big.log 10GB}), streams a large Nginx log for load testing.
+   * data/in/big.log 10GB}), streams a large Nginx log for load testing; with {@code <path> <size>
+   * --stack-traces=0.05}, an application log in which that share of records are ERRORs with a Java
+   * stack trace (P7).
    */
   public static void main(String[] args) {
     try {
-      if (args.length == 2) {
+      if (args.length == 3 && args[2].startsWith(STACK_TRACES_ARG)) {
+        double ratio = Double.parseDouble(args[2].substring(STACK_TRACES_ARG.length()));
+        generateAppLogs(Path.of(args[0]), DataSize.parse(args[1]).toBytes(), ratio, 42L);
+      } else if (args.length == 2) {
         generateNginxLogs(Path.of(args[0]), DataSize.parse(args[1]).toBytes(), 42L);
       } else {
         generate();
@@ -162,6 +167,109 @@ public class DataSeeder {
     }
     log.info("Generated {} nginx lines ({} bytes) at {}", lines, written, path);
     return lines;
+  }
+
+  private static final String STACK_TRACES_ARG = "--stack-traces=";
+  private static final String[] APP_SERVICES = {"order", "payment", "user", "shipping"};
+  private static final String[] APP_MESSAGES = {
+    "Order placed", "Payment processed", "User login successful", "Shipment dispatched"
+  };
+  private static final String[] APP_CLASSES = {
+    "dev.example.orders.OrderService",
+    "dev.example.orders.OrderController",
+    "dev.example.payments.PaymentClient",
+    "org.springframework.web.servlet.FrameworkServlet",
+    "org.apache.catalina.core.ApplicationFilterChain",
+    "java.base/java.util.concurrent.ThreadPoolExecutor"
+  };
+
+  /**
+   * What {@link #generateAppLogs} wrote.
+   *
+   * @param records log events (a stack trace and the line that logged it are one)
+   * @param lines lines, stack trace lines included
+   * @param traces records with a stack trace
+   */
+  public record Generated(long records, long lines, long traces, long bytes) {}
+
+  /**
+   * Streams key=value application log lines to {@code path} until at least {@code targetBytes} are
+   * written. A {@code traceRatio} share of records are ERRORs followed by a Java stack trace (an
+   * exception line, 8-40 frames, sometimes a {@code Caused by:} with its own frames and {@code ...
+   * N more}), as Logback writes them, so framing (P7) has records spanning batches and segments. A
+   * fixed {@code seed} makes the file reproducible.
+   */
+  public static Generated generateAppLogs(Path path, long targetBytes, double traceRatio, long seed)
+      throws IOException {
+    Random rand = new Random(seed);
+    Instant start = Instant.parse("2025-10-01T00:00:00Z");
+    long written = 0;
+    long records = 0;
+    long lines = 0;
+    long traces = 0;
+    try (BufferedWriter writer =
+        Files.newBufferedWriter(
+            path,
+            StandardCharsets.UTF_8,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.TRUNCATE_EXISTING,
+            StandardOpenOption.WRITE)) {
+      StringBuilder record = new StringBuilder(4096);
+      while (written < targetBytes) {
+        record.setLength(0);
+        boolean trace = rand.nextDouble() < traceRatio;
+        String service = APP_SERVICES[rand.nextInt(APP_SERVICES.length)];
+        record
+            .append("timestamp=")
+            .append(start.plusMillis(records * 10))
+            .append(" level=")
+            .append(trace ? "ERROR" : "INFO")
+            .append(" service=")
+            .append(service)
+            .append(" msg=\"")
+            .append(trace ? "Request failed" : APP_MESSAGES[rand.nextInt(APP_MESSAGES.length)])
+            .append(" id=")
+            .append(records)
+            .append("\"\n");
+        int recordLines = 1;
+        if (trace) {
+          record.append("java.lang.IllegalStateException: Order ").append(records);
+          record.append(" could not be placed\n");
+          recordLines += 1 + appendFrames(record, rand, 8 + rand.nextInt(33));
+          if (rand.nextBoolean()) {
+            record.append("Caused by: java.net.SocketTimeoutException: Read timed out\n");
+            recordLines += 1 + appendFrames(record, rand, 3 + rand.nextInt(6));
+            record.append("\t... ").append(5 + rand.nextInt(30)).append(" more\n");
+            recordLines++;
+          }
+          traces++;
+        }
+        writer.append(record);
+        // Generated lines are ASCII, so chars equal bytes.
+        written += record.length();
+        records++;
+        lines += recordLines;
+      }
+    }
+    log.info(
+        "Generated {} app records ({} lines, {} stack traces, {} bytes) at {}",
+        records,
+        lines,
+        traces,
+        written,
+        path);
+    return new Generated(records, lines, traces, written);
+  }
+
+  private static int appendFrames(StringBuilder record, Random rand, int frames) {
+    for (int f = 0; f < frames; f++) {
+      String cls = APP_CLASSES[rand.nextInt(APP_CLASSES.length)];
+      String file = cls.substring(cls.lastIndexOf('.') + 1);
+      record.append("\tat ").append(cls).append(".handle").append(rand.nextInt(20));
+      record.append('(').append(file).append(".java:").append(10 + rand.nextInt(900));
+      record.append(")\n");
+    }
+    return frames;
   }
 
   private static String nginxLine(Random rand, Instant instant) {
