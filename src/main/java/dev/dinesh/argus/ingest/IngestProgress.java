@@ -18,6 +18,7 @@ public final class IngestProgress {
   private final AtomicLong truncated = new AtomicLong();
   private final AtomicLong segmentsCommitted = new AtomicLong();
   private final AtomicLong committedOffset = new AtomicLong();
+  private final AtomicLong heldBackBytes = new AtomicLong();
   private final List<String> outputs = new CopyOnWriteArrayList<>();
   private volatile String resumeReason;
   private volatile String format;
@@ -50,6 +51,16 @@ public final class IngestProgress {
     rejected.addAndGet(rejectedLines);
     unparsed.addAndGet(unparsedLines);
     fallbackParsed.addAndGet(fallbackLines);
+  }
+
+  /** Continuation lines past a record's limits, counted with the truncated lines (P7 D4). */
+  void dropped(int lines) {
+    truncated.addAndGet(lines);
+  }
+
+  /** A multiline record open at the source's end, left for the next run (P7 D3). */
+  void heldBack(long bytes) {
+    heldBackBytes.set(bytes);
   }
 
   /** The writer waits for WAL room ({@code true}) or resumes ({@code false}). */
@@ -129,6 +140,10 @@ public final class IngestProgress {
 
   public long segmentsCommitted() {
     return segmentsCommitted.get();
+  }
+
+  public long heldBackBytes() {
+    return heldBackBytes.get();
   }
 
   public long committedOffset() {

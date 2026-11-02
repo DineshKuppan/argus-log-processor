@@ -41,6 +41,15 @@ public interface RecordFramer {
   /** The open record's offset (its head line's), or -1 when no record is open. */
   long openOffset();
 
+  /** Lines in the open record's body, or 0 when no record is open. */
+  int openLines();
+
+  /**
+   * Whether the line last offered became part of the open record (kept or dropped past the limits)
+   * rather than starting one or being discarded.
+   */
+  boolean lastJoined();
+
   /** Completes the open record: the source has no more lines for it. Null when none is open. */
   FramedRecord flush();
 

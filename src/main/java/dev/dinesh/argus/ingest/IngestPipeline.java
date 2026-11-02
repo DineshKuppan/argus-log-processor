@@ -3,8 +3,12 @@ package dev.dinesh.argus.ingest;
 import dev.dinesh.argus.checkpoint.CheckpointStore;
 import dev.dinesh.argus.checkpoint.ResumePoint;
 import dev.dinesh.argus.checkpoint.ResumePoint.Reason;
+import dev.dinesh.argus.config.FramingProperties;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.InstanceProperties;
+import dev.dinesh.argus.framing.FramedRecord;
+import dev.dinesh.argus.framing.FramingSpec;
+import dev.dinesh.argus.framing.RecordFramer;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
 import dev.dinesh.argus.parser.FormatDetector;
@@ -22,6 +26,8 @@ import dev.dinesh.argus.source.SourceOffset;
 import dev.dinesh.argus.tail.TailEvent;
 import dev.dinesh.argus.tail.TailHub;
 import dev.dinesh.argus.tenant.TenantIds;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -71,6 +77,10 @@ public class IngestPipeline {
    *     numbered spools), rather than resuming when the inode and head match
    * @param readLimit the reader waits for each batch's bytes (the replay lane's budget), or null
    * @param lowPriority run the reader and parser threads at minimum priority (the replay lane)
+   * @param framing how lines join into records, or null for {@code argus.framing.mode}
+   * @param finalRun no more lines can follow the source's last line in this generation (a drain, a
+   *     sealed spool file), so a multiline record open at its end is ingested rather than held back
+   *     ({@code P7_PLAN.md} D3)
    */
   public record Request(
       String tenantId,
@@ -81,7 +91,9 @@ public class IngestPipeline {
       Long endOffset,
       boolean pathIsIdentity,
       ByteRateLimiter readLimit,
-      boolean lowPriority) {
+      boolean lowPriority,
+      FramingSpec framing,
+      boolean finalRun) {
 
     /** A file: read to its last newline, identified by inode and head. */
     public Request(
@@ -98,13 +110,66 @@ public class IngestPipeline {
         LogParser parser,
         Long endOffset,
         boolean pathIsIdentity) {
-      this(tenantId, path, sourceId, fromBeginning, parser, endOffset, pathIsIdentity, null, false);
+      this(
+          tenantId,
+          path,
+          sourceId,
+          fromBeginning,
+          parser,
+          endOffset,
+          pathIsIdentity,
+          null,
+          false,
+          null,
+          false);
     }
 
     /** The same run on the replay lane: paced by {@code limit}, at minimum thread priority. */
     public Request onReplayLane(ByteRateLimiter limit) {
       return new Request(
-          tenantId, path, sourceId, fromBeginning, parser, endOffset, pathIsIdentity, limit, true);
+          tenantId,
+          path,
+          sourceId,
+          fromBeginning,
+          parser,
+          endOffset,
+          pathIsIdentity,
+          limit,
+          true,
+          framing,
+          finalRun);
+    }
+
+    /** The same run with {@code framing} (null: {@code argus.framing.mode}). */
+    public Request withFraming(FramingSpec framing) {
+      return new Request(
+          tenantId,
+          path,
+          sourceId,
+          fromBeginning,
+          parser,
+          endOffset,
+          pathIsIdentity,
+          readLimit,
+          lowPriority,
+          framing,
+          finalRun);
+    }
+
+    /** The same run, the last for its source's lines in this generation. */
+    public Request asFinalRun() {
+      return new Request(
+          tenantId,
+          path,
+          sourceId,
+          fromBeginning,
+          parser,
+          endOffset,
+          pathIsIdentity,
+          readLimit,
+          lowPriority,
+          framing,
+          true);
     }
 
     /**
@@ -135,6 +200,7 @@ public class IngestPipeline {
   private final ArgusMetrics metrics;
   private final TailHub tail;
   private final String instanceId;
+  private final FramingProperties framing;
 
   /** Without an archive store nothing drains the WAL, so there is no WAL limit to wait for. */
   @Autowired
@@ -146,7 +212,8 @@ public class IngestPipeline {
       ObjectProvider<WalCapacity> walCapacity,
       ObjectProvider<ArgusMetrics> metrics,
       ObjectProvider<TailHub> tail,
-      ObjectProvider<InstanceProperties> instance) {
+      ObjectProvider<InstanceProperties> instance,
+      ObjectProvider<FramingProperties> framing) {
     this(
         props,
         parsers,
@@ -155,7 +222,8 @@ public class IngestPipeline {
         walCapacity.getIfAvailable(() -> WalCapacity.UNBOUNDED),
         metrics.getIfAvailable(ArgusMetrics::noop),
         tail.getIfAvailable(),
-        instance.getIfAvailable(() -> InstanceProperties.NONE).id());
+        instance.getIfAvailable(() -> InstanceProperties.NONE).id(),
+        framing.getIfAvailable(() -> FramingProperties.DEFAULTS));
   }
 
   public IngestPipeline(
@@ -209,6 +277,32 @@ public class IngestPipeline {
       ArgusMetrics metrics,
       TailHub tail,
       String instanceId) {
+    this(
+        props,
+        parsers,
+        sink,
+        checkpoints,
+        walCapacity,
+        metrics,
+        tail,
+        instanceId,
+        FramingProperties.DEFAULTS);
+  }
+
+  /**
+   * @param framing the default framing and its limits ({@code P7_PLAN.md} D2–D4)
+   */
+  public IngestPipeline(
+      IngestProperties props,
+      ParserRegistry parsers,
+      LogSink sink,
+      CheckpointStore checkpoints,
+      WalCapacity walCapacity,
+      ArgusMetrics metrics,
+      TailHub tail,
+      String instanceId,
+      FramingProperties framing) {
+    this.framing = framing;
     this.instanceId = instanceId;
     this.props = props;
     this.parsers = parsers;
@@ -251,7 +345,8 @@ public class IngestPipeline {
       log.info(
           "Ingest finished tenant={} source={} outcome={} error={} resumeReason={} format={}"
               + " formatSource={} startOffset={} committedOffset={} totalBytes={} segments={}"
-              + " lines={} fallbackParsed={} unparsed={} rejected={} truncated={} pausedMs={}"
+              + " lines={} fallbackParsed={} unparsed={} rejected={} truncated={} heldBackBytes={}"
+              + " pausedMs={}"
               + " durationMs={}",
           tenantId,
           sourceId,
@@ -269,6 +364,7 @@ public class IngestPipeline {
           progress.unparsed(),
           progress.rejected(),
           progress.truncated(),
+          progress.heldBackBytes(),
           progress.pausedMs(),
           TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos));
     }
@@ -344,7 +440,10 @@ public class IngestPipeline {
               cancel,
               request.readLimit(),
               request.lowPriority(),
-              tail != null && request.tailed());
+              tail != null && request.tailed(),
+              (request.framing() != null ? request.framing() : framing.defaultSpec())
+                  .framer(framing.limits()),
+              request.finalRun());
     } catch (Exception e) {
       source.close();
       throw e;
@@ -363,8 +462,14 @@ public class IngestPipeline {
       throw failure instanceof Exception e ? e : new IllegalStateException(failure);
     }
     // Decided by what was committed, not by the flag: a cancel that arrives after the last commit
-    // still leaves a fully ingested file.
-    return stages.committedOffset >= source.limit() ? Outcome.COMPLETED : Outcome.CANCELLED;
+    // still leaves a fully ingested file. A record held back at the end counts as ingested: the
+    // next run reads it again (P7 D3).
+    long heldBackFrom = stages.heldBackFrom;
+    if (heldBackFrom >= 0) {
+      progress.heldBack(source.limit() - heldBackFrom);
+    }
+    long end = heldBackFrom >= 0 ? heldBackFrom : source.limit();
+    return stages.committedOffset >= end ? Outcome.COMPLETED : Outcome.CANCELLED;
   }
 
   /** State shared by the three stages of one run. */
@@ -386,11 +491,26 @@ public class IngestPipeline {
     private final BlockingQueue<LogBatch> parsed;
     private final AtomicBoolean stop = new AtomicBoolean();
     private final AtomicReference<Throwable> failure = new AtomicReference<>();
+    private final Path path;
     private final AtomicInteger unparsedSamples = new AtomicInteger();
     private final List<Thread> threads = new ArrayList<>();
+    private final RecordFramer framer;
+    private final boolean finalRun;
 
     /** Written and read only by the writer (caller) thread. */
     private long committedOffset;
+
+    // Parser-thread state (P7 D3). Batch and segment ends fall only at record starts: a batch ends
+    // where the open record starts, and a segment end the reader chose waits for the next line,
+    // which tells whether the record open there continues past it.
+    private long emitStart = -1;
+    private long segmentStart;
+    private boolean closePending;
+    private long closeAt;
+    private RawBatch lastBatch;
+
+    /** Where a record held back at the end of the source starts, or -1; read after the join. */
+    private volatile long heldBackFrom = -1;
 
     Stages(
         FileSource source,
@@ -402,9 +522,14 @@ public class IngestPipeline {
         AtomicBoolean cancel,
         ByteRateLimiter readLimit,
         boolean lowPriority,
-        boolean tailed) {
+        boolean tailed,
+        RecordFramer framer,
+        boolean finalRun) {
       this.tailed = tailed;
+      this.framer = framer;
+      this.finalRun = finalRun;
       this.source = source;
+      this.path = Path.of(checkpointTemplate.path());
       this.tenantId = tenantId;
       this.chain = chain;
       this.envelopes = envelopes;
@@ -477,65 +602,171 @@ public class IngestPipeline {
           return;
         }
         if (batch == END_OF_RAW) {
+          if (closePending && !endOfSource()) {
+            return;
+          }
           handOff(parsed, END_OF_PARSED);
           return;
         }
-        List<LogEnvelope> records = new ArrayList<>(batch.lines().size());
-        int rejected = 0;
-        int unparsed = 0;
-        int fallback = 0;
-        Instant observedAt = Instant.now();
-        // Checked once per batch: while nobody tails the tenant, nothing is built.
-        List<TailEvent> tailEvents =
-            tailed && tail.isWatched(tenantId) ? new ArrayList<>(batch.lines().size()) : null;
-        for (int i = 0; i < batch.lines().size(); i++) {
-          String line = batch.lines().get(i);
-          ParserChain.Parsed result = chain.parse(line);
-          if (result == null) {
-            rejected++;
-            sampleUnparsed(line, batch);
-            continue;
-          }
-          switch (result.outcome()) {
-            case UNPARSED -> {
-              unparsed++;
-              sampleUnparsed(line, batch);
-            }
-            case FALLBACK -> fallback++;
-            case PRIMARY -> {}
-          }
-          LogEnvelope envelope = envelopes.create(result, batch.lineOffsets()[i], observedAt);
-          records.add(envelope);
-          if (tailEvents != null) {
-            tailEvents.add(TailEvent.ofFile(envelope));
-          }
+        if (emitStart < 0) {
+          emitStart = batch.startOffset();
+          segmentStart = emitStart;
         }
-        if (tailEvents != null) {
-          tail.publish(tenantId, tailEvents);
-        }
-        progress.parsed(records.size(), rejected, unparsed, fallback);
-        metrics.ingestBatch(
-            tenantId,
-            lane,
-            records.size() - unparsed - fallback,
-            fallback,
-            unparsed,
-            rejected,
-            batch.endOffset() - batch.startOffset());
-        LogBatch out =
-            new LogBatch(
-                batch.sourceId(),
-                batch.segmentIndex(),
-                batch.sequence(),
-                records,
-                batch.startOffset(),
-                batch.endOffset(),
-                batch.lastInSegment(),
-                rejected,
-                unparsed,
-                fallback);
-        if (!handOff(parsed, out)) {
+        lastBatch = batch;
+        if (!parse(batch)) {
           return;
+        }
+      }
+    }
+
+    /** Returns false if the run is stopping. */
+    private boolean parse(RawBatch batch) {
+      Records records = new Records(batch);
+      for (int i = 0; i < batch.lines().size(); i++) {
+        String line = batch.lines().get(i);
+        ParserChain.Parsed result = chain.parse(line);
+        FramedRecord done = framer.offer(line, batch.lineOffsets()[i], result);
+        boolean joined = framer.lastJoined();
+        if (!joined) {
+          if (result == null) {
+            records.rejected++;
+            sampleUnparsed(line, batch);
+          } else if (result.outcome() == ParserChain.Outcome.UNPARSED) {
+            sampleUnparsed(line, batch);
+          }
+        }
+        if (closePending) {
+          closePending = false;
+          if (!joined) {
+            // The record open at the segment end was complete: the segment ends where it was read.
+            records.add(done);
+            done = null;
+            if (!emit(records, closeAt, true)) {
+              return false;
+            }
+            records = new Records(batch);
+          } else if (emitStart > segmentStart) {
+            // It continues past the segment end: the segment ends at its start instead.
+            if (!emit(records, emitStart, true)) {
+              return false;
+            }
+            records = new Records(batch);
+          }
+          // Otherwise the segment holds only that record, and the reader's next end closes it.
+        }
+        if (done != null) {
+          records.add(done);
+        }
+      }
+      long open = framer.openOffset();
+      boolean closes = batch.lastInSegment();
+      if (closes && open >= 0) {
+        closePending = true;
+        closeAt = batch.endOffset();
+        closes = false;
+      } else if (closePending && batch.lastInSegment()) {
+        // A batch with no lines (blank ones only) moves the pending segment end past itself.
+        closeAt = batch.endOffset();
+      }
+      return emit(records, open >= 0 ? open : batch.endOffset(), closes);
+    }
+
+    /**
+     * The run read its source to the end with a record open there: it is ingested if no more lines
+     * can follow it, and otherwise held back for the next run (P7 D3). A single-line record never
+     * waits, so a source of single-line records commits exactly as before framing.
+     */
+    private boolean endOfSource() {
+      closePending = false;
+      if (finalRun || framer.openLines() <= 1 || sourceIsQuiet()) {
+        Records records = new Records(lastBatch);
+        records.add(framer.flush());
+        return emit(records, closeAt, true);
+      }
+      heldBackFrom = framer.openOffset();
+      // Commit what precedes it; a segment holding nothing else stays open and is discarded.
+      return emitStart <= segmentStart || emit(new Records(lastBatch), emitStart, true);
+    }
+
+    private boolean sourceIsQuiet() {
+      try {
+        Instant modified = Files.getLastModifiedTime(path).toInstant();
+        return !modified.isAfter(Instant.now().minus(framing.flushAfter()));
+      } catch (IOException e) {
+        return true;
+      }
+    }
+
+    /** Hands {@code [emitStart, end)} to the writer; returns false if the run is stopping. */
+    private boolean emit(Records records, long end, boolean lastInSegment) {
+      if (!lastInSegment && end == emitStart && records.list.isEmpty()) {
+        return true;
+      }
+      if (records.tailEvents != null && !records.tailEvents.isEmpty()) {
+        tail.publish(tenantId, records.tailEvents);
+      }
+      int count = records.list.size();
+      progress.parsed(count, records.rejected, records.unparsed, records.fallback);
+      progress.dropped(records.dropped);
+      metrics.ingestBatch(
+          tenantId,
+          lane,
+          count - records.unparsed - records.fallback,
+          records.fallback,
+          records.unparsed,
+          records.rejected,
+          end - emitStart);
+      RawBatch batch = records.batch;
+      LogBatch out =
+          new LogBatch(
+              batch.sourceId(),
+              batch.segmentIndex(),
+              batch.sequence(),
+              records.list,
+              emitStart,
+              end,
+              lastInSegment,
+              records.rejected,
+              records.unparsed,
+              records.fallback);
+      emitStart = end;
+      if (lastInSegment) {
+        segmentStart = end;
+      }
+      return handOff(parsed, out);
+    }
+
+    /** The records of one batch handed to the writer, and their counts. */
+    private final class Records {
+
+      final RawBatch batch;
+      final List<LogEnvelope> list;
+      final Instant observedAt = Instant.now();
+      // Checked once per batch: while nobody tails the tenant, nothing is built.
+      final List<TailEvent> tailEvents;
+      int rejected;
+      int unparsed;
+      int fallback;
+      int dropped;
+
+      Records(RawBatch batch) {
+        this.batch = batch;
+        this.list = new ArrayList<>(batch.lines().size());
+        this.tailEvents =
+            tailed && tail.isWatched(tenantId) ? new ArrayList<>(batch.lines().size()) : null;
+      }
+
+      void add(FramedRecord record) {
+        switch (record.parsed().outcome()) {
+          case UNPARSED -> unparsed++;
+          case FALLBACK -> fallback++;
+          case PRIMARY -> {}
+        }
+        dropped += record.droppedLines();
+        LogEnvelope envelope = envelopes.create(record.parsed(), record.offset(), observedAt);
+        list.add(envelope);
+        if (tailEvents != null) {
+          tailEvents.add(TailEvent.ofFile(envelope));
         }
       }
     }

@@ -20,6 +20,16 @@ public final class NoFraming implements RecordFramer {
   }
 
   @Override
+  public int openLines() {
+    return 0;
+  }
+
+  @Override
+  public boolean lastJoined() {
+    return false;
+  }
+
+  @Override
   public FramedRecord flush() {
     return null;
   }

@@ -84,7 +84,8 @@ Since P1, every `\n`-terminated line is one record. Two things in today's data a
   - **Invariant:** batch ends, segment ends and checkpoints fall only at record starts. The parse stage emits a `LogBatch` whose `endOffset` is the open record's start, and the next batch starts there.
   - **Segment boundaries:** when the reader's batch closes a segment (`lastInSegment`) with a record open, the record moves into the next segment and the committed segment ends at its start. If that would leave a segment with no records, the boundary moves to the next batch's end instead (a record is ≤1MB; a segment is 500MB).
   - **Replays are deterministic:** framing from a record start is a pure function of the bytes after it. A run resumed from a checkpoint (a record start) therefore frames exactly as the crashed run did, except for the end-of-run decision below.
-  - **End of run.** The open record is emitted when no more lines can follow it in this generation:
+  - **Segment ends wait for one line.** When the reader closes a segment with a record open, the parse stage hands on the records before it and keeps the segment end pending until the next line arrives. If that line continues the record, the segment ends at the record's start. Otherwise the record was complete, and the segment ends where the reader put it. A source of single-line records therefore commits exactly the segments it committed before framing.
+  - **End of run.** A *multiline* record open at the end (a single-line one is emitted at once, for the same reason) is emitted when no more lines can follow it in this generation:
     - the file ends at EOF and its modification time is at least `argus.framing.flush-after` (5s) ago;
     - the spool file is sealed;
     - its last append is at least `flush-after` ago;
@@ -218,7 +219,7 @@ Since P1, every `\n`-terminated line is one record. Two things in today's data a
 
 | Property | Default | Meaning |
 |---|---|---|
-| `argus.framing.default` | `auto` | Framing for jobs and streams that don't request one (`none` restores P0–P6 behaviour) |
+| `argus.framing.mode` | `auto` | Framing for jobs and streams that don't request one (`none` restores P0–P6 behaviour) |
 | `argus.framing.max-record-lines` | `500` | Continuation lines beyond are dropped and counted |
 | `argus.framing.max-record-bytes` | `1MB` | Same, in bytes |
 | `argus.framing.flush-after` | `5s` | An open record at the end of a run is emitted once its source was quiet this long; otherwise held back |

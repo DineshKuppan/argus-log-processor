@@ -35,6 +35,7 @@ abstract class JoiningFramer implements RecordFramer {
   private int bytes;
   private int dropped;
   private String exceptionType;
+  private boolean lastJoined;
 
   JoiningFramer(Limits limits) {
     this.limits = limits;
@@ -52,7 +53,8 @@ abstract class JoiningFramer implements RecordFramer {
   @Override
   public final FramedRecord offer(String line, long offset, ParserChain.Parsed parsed) {
     boolean continuation = continues(line, parsed);
-    if (continuation && head != null) {
+    lastJoined = continuation && head != null;
+    if (lastJoined) {
       append(line);
       return null;
     }
@@ -66,6 +68,16 @@ abstract class JoiningFramer implements RecordFramer {
   @Override
   public final long openOffset() {
     return head == null ? -1 : headOffset;
+  }
+
+  @Override
+  public final int openLines() {
+    return head == null ? 0 : lines;
+  }
+
+  @Override
+  public final boolean lastJoined() {
+    return lastJoined;
   }
 
   @Override
