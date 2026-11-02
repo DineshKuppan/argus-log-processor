@@ -34,6 +34,23 @@ public class CriLogParser implements LogParser {
         && (line.contains(" stdout ") || line.contains(" stderr "));
   }
 
+  /**
+   * The body of a line this parser parsed (what follows {@code <F|P> }), found without a regex;
+   * null for a line it doesn't parse.
+   */
+  public static String body(String line) {
+    int s1 = line.indexOf(' ');
+    int s2 = s1 < 0 ? -1 : line.indexOf(' ', s1 + 1);
+    if (s2 < 0 || s2 + 1 >= line.length()) {
+      return null;
+    }
+    int start = s2 + 2;
+    if (start < line.length() && line.charAt(start) == ' ') {
+      start++;
+    }
+    return start >= line.length() ? "" : line.substring(start);
+  }
+
   @Override
   public LogRecord parse(String line) {
     Matcher m = CRI_LINE.matcher(line);

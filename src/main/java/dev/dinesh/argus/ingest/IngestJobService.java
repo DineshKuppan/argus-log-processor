@@ -2,6 +2,7 @@ package dev.dinesh.argus.ingest;
 
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.ReplayProperties;
+import dev.dinesh.argus.framing.FramingSpec;
 import dev.dinesh.argus.ingest.IngestJob.State;
 import dev.dinesh.argus.ingest.IngestPipeline.Outcome;
 import dev.dinesh.argus.ingest.IngestPipeline.Request;
@@ -185,6 +186,26 @@ public class IngestJobService {
       String pattern,
       Lane requestedLane)
       throws IOException {
+    return submit(
+        tenantId, rawPath, requestedSourceId, fromBeginning, format, pattern, null, requestedLane);
+  }
+
+  /**
+   * {@link #submit(String, String, String, boolean, String, String, Lane)} with a framing.
+   *
+   * @param framing {@code auto}, {@code none} or {@code start:<regex>}; null for {@code
+   *     argus.framing.mode}
+   */
+  public IngestJob submit(
+      String tenantId,
+      String rawPath,
+      String requestedSourceId,
+      boolean fromBeginning,
+      String format,
+      String pattern,
+      String framing,
+      Lane requestedLane)
+      throws IOException {
     TenantIds.requireValid(tenantId);
     Path realPath = tenantRoots.forTenant(tenantId).requireFile(rawPath);
     String sourceId =
@@ -192,6 +213,7 @@ public class IngestJobService {
             ? defaultSourceId(realPath)
             : SourceOffset.requireValidSourceId(requestedSourceId);
     LogParser parser = parsers.resolve(format, pattern).orElse(null);
+    FramingSpec framingSpec = FramingSpec.parse(framing).orElse(null);
     Lane lane = requestedLane != null ? requestedLane : fromBeginning ? Lane.REPLAY : Lane.LIVE;
     if (pipeline.walFull()) {
       throw new WalFullException();
@@ -205,6 +227,7 @@ public class IngestJobService {
             realPath,
             fromBeginning,
             parser,
+            framingSpec,
             lane);
     Optional<String> owner = leases.tryAcquireForFile(tenantId, sourceId, job.id());
     if (owner.isPresent()) {
@@ -269,8 +292,8 @@ public class IngestJobService {
     job.running();
     try {
       Request request =
-          new Request(
-              job.tenantId(), job.path(), job.sourceId(), job.fromBeginning(), job.parser());
+          new Request(job.tenantId(), job.path(), job.sourceId(), job.fromBeginning(), job.parser())
+              .withFraming(job.framing());
       if (job.lane() == Lane.REPLAY) {
         request = request.onReplayLane(replay.readLimit());
       }

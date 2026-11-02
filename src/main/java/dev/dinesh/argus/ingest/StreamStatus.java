@@ -8,6 +8,7 @@ import java.time.Instant;
  * JSON view of a {@link PushStream} returned by the stream API.
  *
  * @param format the stream's requested format, or null when each spool file's is detected
+ * @param framing the stream's requested framing, or null for {@code argus.framing.mode}
  * @param pendingBytes acknowledged bytes not yet ingested
  * @param lastRun the running or latest run of the spool, or null if none has run since startup
  */
@@ -15,6 +16,7 @@ public record StreamStatus(
     String streamId,
     String tenantId,
     String format,
+    String framing,
     int activeSpool,
     int spoolFiles,
     long spoolBytes,
@@ -42,6 +44,8 @@ public record StreamStatus(
       long startOffset,
       long committedOffset,
       long lines,
+      long multilineRecords,
+      long heldBackBytes,
       long segmentsCommitted,
       String paused,
       long pausedMs) {}
@@ -63,6 +67,8 @@ public record StreamStatus(
               p.startOffset(),
               p.committedOffset(),
               p.lines(),
+              p.multilineRecords(),
+              p.heldBackBytes(),
               p.segmentsCommitted(),
               p.pauseReason(),
               p.pausedMs());
@@ -71,6 +77,7 @@ public record StreamStatus(
         stream.streamId(),
         stream.tenantId(),
         parser == null ? null : parser.name(),
+        stream.framing() == null ? null : stream.framing().toString(),
         spool.activeSpool(),
         spool.files(),
         spool.bytesOnDisk(),

@@ -19,16 +19,18 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | **P4** | Live tail, metrics, producers' canonical lines | ✅ Done (#10) |
 | **P5** | OpenSearch / Elasticsearch hot tier, search API | ✅ Done (#11) |
 | **P6a** | Kafka or Redpanda as the WAL; the archive and hot tier as consumer groups; lag watermarks | ✅ Done (#12) |
-| **P6b** | Several instances: instance ids, shared consumer groups, shared tail, Redis suppression pipelined, autoscaling on lag | ✅ Done |
+| **P6b** | Several instances: instance ids, shared consumer groups, shared tail, Redis suppression pipelined, autoscaling on lag | ✅ Done (#13) |
+| **P7a** | Multiline framing: stack traces as one record (files, pushes, CRI partial lines), suppressed and tailed whole | ✅ Done |
+| **P7b** | PII masking before every tier; resource enrichment from Kubernetes paths and configuration | Planned ([`P7_PLAN.md`](docs/architecture/P7_PLAN.md) D7–D10) |
 
 ## Acceptance criteria
 
 | # | Criterion | Target | Status |
 |---|---|---|---|
-| T1 | Sustained throughput | ≥4,150 lines/s on one 4GB node | ✅ ~380–440k lines/s file ingest (1GB test); 132k lines/s pushed over HTTP end to end at a 256MB heap; the same with Kafka or Redpanda as the WAL (130–132k, P6a) |
+| T1 | Sustained throughput | ≥4,150 lines/s on one 4GB node | ✅ ~380–440k lines/s file ingest (1GB test); 132k lines/s pushed over HTTP end to end at a 256MB heap; the same with Kafka or Redpanda as the WAL (130–132k, P6a); 538k lines/s with framing `auto` on a log with 5% stack traces (P7a, 474k with `none`) |
 | T2 | Memory | Heap ≤2.4GB, no OOM on a 10GB file | ✅ 810MB peak (P0) |
 | T3 | Backpressure | Sink stalled for 10 min → no OOM, sources paused or 429, WAL under its watermark, full recovery | ✅ Scaled tests: a 30s outage during a 500MB file ingest paused ingest within one segment of the watermark; a 20s outage during push load turned into 429s, and all 1M acknowledged lines were archived afterwards (both at a 256MB heap). With Kafka (P6a): a 60s broker outage was absorbed by the spools; an archive outage paused push at the lag watermark (429 `WAL_FULL`); every line archived exactly once afterwards |
-| T4 | Durability | `kill -9` at a random point → no lost records, duplicates only with the same `eventId` | ✅ P0 (files); P3a (push with `Idempotency-Key`: no loss, one `eventId` per line); P6a (Kafka and Redpanda: 400,000 of 400,000 archived once); P6b (one of three instances killed: 300,000 of 300,000 in both tiers) |
+| T4 | Durability | `kill -9` at a random point → no lost records, duplicates only with the same `eventId` | ✅ P0 (files); P3a (push with `Idempotency-Key`: no loss, one `eventId` per line); P6a (Kafka and Redpanda: 400,000 of 400,000 archived once); P6b (one of three instances killed: 300,000 of 300,000 in both tiers); P7a (killed mid-file with traces across segment ends: every record exactly once and whole) |
 | T5 | Freshness | p99 ingest-to-searchable ≤30s | ✅ 2 CPUs, 4,150 lines/s pushed: p50 11.8s, p99 20.1s from the 202 to the search API finding the line (OpenSearch 2.17; Elasticsearch 8.15 on the host: p99 17.8s); Kafka as the WAL, host: p99 22.3s |
 | T6 | Suppression | Correct at the 10s boundary; p99 <1ms | ✅ 8.8µs |
 | T7 | Live tail | Visible ≤2s after ingest; a slow client can't slow ingest | ✅ 2 CPUs: push-to-tail p99 39ms; 16 tail clients that never read cost push p99 no more than 16 that read (within 7%, 4 runs), throughput unchanged; 1,000 connections at a 256MB heap |
@@ -36,13 +38,13 @@ Where Argus is heading, phase by phase. The reasoning behind each phase (capacit
 | T9 | Cost | Cold tier ≤3TiB at 7 years (≥8x compression) | ✅ 14.6x on synthetic data; re-measure on real logs |
 
 ## Next
-P6 is done: Kafka as the WAL (P6a, ADR-8) and several instances (P6b). What remains is under "Open items", below.
+P7a is done: multiline framing (ADR-9). Next is **P7b**: PII masking at both entry points and resource enrichment ([`P7_PLAN.md`](docs/architecture/P7_PLAN.md) D7–D10). What else remains is under "Open items", below.
 
 ## Open items
 - **Re-measure T9 on real logs.** The 14.6x comes from `DataSeeder`, whose vocabulary is small. Real logs will compress less.
 - **Test against real AWS S3 and GCS.** Only S3Mock and fake-gcs-server (plus a protocol stub for GCS resumes) are tested today.
 - **Run T3 at full length:** the 10-minute outage is tested scaled down to 30s (`-Dargus.load.outage-seconds`).
-- **Multiline framing:** stack traces become one record per line. A `framing` stage would join continuation lines.
+- **Framing beyond stack traces:** JSON-array framing and gzip / zstd file inputs ([`P7_PLAN.md`](docs/architecture/P7_PLAN.md) §8). Pushes of traces under suppression aren't load-tested yet.
 - **Records without an event time** land in `dt=unknown`, and v1's time filters skip them.
 - **v1 `/parse`, `/parse/regexp` and `/filter`** still read whole files behind the 50MB cap.
 - **API keys:** static only. There's no rotation API, expiry or identity provider yet.

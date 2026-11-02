@@ -181,6 +181,19 @@ class IngestControllerTest {
   }
 
   @Test
+  void aRequestedFramingIsShownOnTheJobAndABadOneIs400() throws Exception {
+    submit(
+            Map.of(
+                "path", ROOT.resolve("app.log").toString(),
+                "sourceId", "api-framed",
+                "framing", "start:^\\d{4}-"))
+        .andExpect(status().isAccepted())
+        .andExpect(jsonPath("$.framing").value("start:^\\d{4}-"));
+    submit(Map.of("path", ROOT.resolve("app.log").toString(), "framing", "lines"))
+        .andExpect(status().isBadRequest());
+  }
+
+  @Test
   void aJobFromTheBeginningIsOnTheReplayLaneUnlessLiveIsRequested() throws Exception {
     submit(
             Map.of(

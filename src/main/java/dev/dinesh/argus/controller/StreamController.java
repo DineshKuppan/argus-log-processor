@@ -48,6 +48,8 @@ public class StreamController {
    *
    * @param format the stream's format from now on; detected from each spool file when never given
    * @param pattern a Logback layout; implies {@code logback}
+   * @param framing the stream's framing from now on: {@code auto}, {@code none} or {@code
+   *     start:<regex>}; {@code argus.framing.mode} when never given
    */
   @PostMapping("/{streamId}")
   public ResponseEntity<PushResult> pushLines(
@@ -55,6 +57,7 @@ public class StreamController {
       @PathVariable String streamId,
       @RequestParam(required = false) String format,
       @RequestParam(required = false) String pattern,
+      @RequestParam(required = false) String framing,
       @RequestHeader(value = HttpHeaders.CONTENT_ENCODING, required = false) String encoding,
       @RequestHeader(value = IDEMPOTENCY_KEY, required = false) String idempotencyKey,
       HttpServletRequest request)
@@ -69,7 +72,8 @@ public class StreamController {
                 request.getContentLengthLong(),
                 idempotencyKey,
                 format,
-                pattern));
+                pattern,
+                framing));
     return ResponseEntity.status(result.duplicate() ? HttpStatus.OK : HttpStatus.ACCEPTED)
         .body(result);
   }

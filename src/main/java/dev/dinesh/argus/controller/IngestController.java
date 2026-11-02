@@ -46,6 +46,8 @@ public class IngestController {
    *     {@code raw}, {@code logback}); detected from the file's first lines when omitted
    * @param pattern Logback layout such as {@code %d{ISO8601} [%t] %-5p %c - %m%n}; implies {@code
    *     logback}
+   * @param framing how lines join into records: {@code auto} (stack traces), {@code none} or {@code
+   *     start:<regex>}; {@code argus.framing.mode} when omitted
    * @param lane {@code live} or {@code replay} (its own slots and read budget); defaults to {@code
    *     replay} with {@code fromBeginning}, else {@code live}
    */
@@ -55,6 +57,7 @@ public class IngestController {
       Boolean fromBeginning,
       String format,
       String pattern,
+      String framing,
       String lane) {}
 
   @PostMapping("/file")
@@ -69,6 +72,7 @@ public class IngestController {
             fromBeginning,
             request.format(),
             request.pattern(),
+            request.framing(),
             Lane.parse(request.lane()));
     return ResponseEntity.accepted()
         .header(HttpHeaders.LOCATION, "/api/v2/ingest/jobs/" + job.id())

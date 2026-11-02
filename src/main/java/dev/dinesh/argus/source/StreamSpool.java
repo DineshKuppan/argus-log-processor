@@ -304,6 +304,16 @@ public final class StreamSpool implements Closeable {
   }
 
   /**
+   * After a completed run: bytes it claimed but held back (a record that may still grow, {@code
+   * P7_PLAN.md} D3) wait again from now, like newly appended ones, instead of being due at once.
+   */
+  public synchronized void restartWaitIfPending() {
+    if (pendingSince == 0 && pending() > 0) {
+      pendingSince = nanoTime.getAsLong();
+    }
+  }
+
+  /**
    * Records how far the stream's checkpoint has got, then deletes sealed files that are fully read
    * (and seals and deletes a fully read idle file of at least {@link #IDLE_ROTATE_BYTES}).
    */

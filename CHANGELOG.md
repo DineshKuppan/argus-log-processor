@@ -6,7 +6,29 @@ No versions have been tagged yet (the pom says `0.1.0`), so changes are grouped 
 
 ## [Unreleased]
 
-### P6b: several instances (unmerged)
+### P7a: multiline framing (unmerged)
+Plan and results: [`P7_PLAN.md`](docs/architecture/P7_PLAN.md) D1–D6, §9; ADR-9 in [`SCALING_DESIGN.md`](docs/architecture/SCALING_DESIGN.md).
+
+#### Added
+- **Lines joined into records** (`framing` on file jobs and push streams; default `argus.framing.mode=auto`):
+  - `auto`: Java, Python and Go stack traces (indented frames, `Caused by:` / `Suppressed:`, `Traceback`, exception lines, goroutine headers). A line only continues a record when the source's structured format doesn't parse it, so a head line always starts a new record;
+  - `start:<regex>` (≤256 characters, matched on a line's first 256 characters, with a step budget against catastrophic backtracking): a matching line starts a record;
+  - `none`: one record per line, as before. Exports always use `none`.
+- **A multiline record** keeps its head line's time, level, attributes and `eventId`; its body is the head's message plus each continuation line. It carries `argus.lines`, `exception.type` (OpenTelemetry), and `argus.multiline.truncated` when it reached `max-record-lines` (500) / `max-record-bytes` (1MB): the line past them starts the next record (`argus.framing=split`), so no line is dropped. A continuation line with no record to join becomes its own record, `argus.framing=orphan`.
+- **CRI partial lines joined:** with format `cri`, consecutive `P` fragments of one stream up to its `F` become one line before parsing (`argus.cri.fragments`), in file jobs and at push receive time. Container lines are framed by their body, within one stream, so a pod's stack trace becomes one record.
+- **Status:** `framing`, `multilineRecords` and `heldBackBytes` on jobs and stream runs; the `Ingest finished …` canonical line adds `multilineRecords` and `heldBackBytes`.
+- `argus.framing.*` (`mode`, `max-record-lines`, `max-record-bytes`, `flush-after`); `DataSeeder` app logs with stack traces (`--stack-traces=0.05`); `FramingIT` (tag `load`).
+
+#### Changed
+- **Batch ends, segment ends and checkpoints fall only at record starts.** A trace open at the end of a run is held back (checkpoint at its start) until its file has been quiet for `flush-after` (5s), its spool file is sealed, or the instance drains. Sources of single-line records commit exactly the segments they did before.
+- **Push suppression and the tail act on whole records** (fixes frames of a trace being suppressed as copies of an earlier trace's frames). A trace cut across two requests follows its head's decision.
+- `lines` in job and stream status counts records written: a multiline record counts once.
+
+#### Measured
+- **T1, 1GB with 5% stack traces at a 256MB heap:** 538k lines/s with `auto` (peak heap 180MB), 474k with `none`; exactly the generated 5,134,560 records.
+- **T4, `kill -9` mid-file with 8MB segments:** after the rerun, every record exactly once and whole, every `eventId` its head line's.
+
+### P6b: several instances: [#13](https://github.com/DineshKuppan/argus-log-processor/pull/13) (2026-11-01)
 Plan and results: [`P6_PLAN.md`](docs/architecture/P6_PLAN.md) D8–D13, §9.
 
 #### Added

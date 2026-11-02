@@ -7,6 +7,7 @@ import dev.dinesh.argus.export.ExportCursorStore.Saved;
 import dev.dinesh.argus.export.ExportSource.Cursor;
 import dev.dinesh.argus.export.ExportSource.Page;
 import dev.dinesh.argus.export.ExportSource.Query;
+import dev.dinesh.argus.framing.FramingSpec;
 import dev.dinesh.argus.ingest.IngestJob.State;
 import dev.dinesh.argus.ingest.IngestJobService.JobSlotsBusyException;
 import dev.dinesh.argus.ingest.IngestJobService.WalFullException;
@@ -196,6 +197,8 @@ public class ExportJobService {
       }
       PushStream stream = streams.getOrCreate(tenantId, streamId);
       stream.useParser(parsers.resolve("json", null).orElseThrow());
+      // Each hit is one document, already a record (P7 D2).
+      stream.useFraming(FramingSpec.NONE);
       Optional<Saved> saved =
           cursors
               .load(tenantId, streamId)

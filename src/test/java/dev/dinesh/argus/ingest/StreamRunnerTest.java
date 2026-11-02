@@ -22,6 +22,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
@@ -216,6 +217,48 @@ class StreamRunnerTest {
     assertEquals(0, app.spool().pendingBytes());
     assertEquals(0, web.spool().pendingBytes());
     assertEquals(3, outputLines());
+  }
+
+  private List<String> outputBodies() throws IOException {
+    List<String> bodies = new ArrayList<>();
+    for (String file : outputs()) {
+      for (String line : Files.readAllLines(dir.resolve("out").resolve(file))) {
+        bodies.add(MAPPER.readTree(line).get("body").asText());
+      }
+    }
+    return bodies;
+  }
+
+  /** P7 D3 / D5: the run frames the spool, joining a trace that two pushes split. */
+  @Test
+  void aTraceSplitAcrossTwoAppendsIsOneRecordAndWaitsWhileItCanStillGrow() throws IOException {
+    start(1L << 30, 1L << 30);
+    PushStream stream =
+        append(
+            "level=INFO msg=before",
+            "level=ERROR msg=failed",
+            "java.lang.IllegalStateException: boom");
+    nanos.addAndGet(Duration.ofMinutes(1).toNanos());
+
+    // The spool file was just written: the open trace at its end is held back.
+    assertEquals(Optional.of(Outcome.COMPLETED), runner.runNow(stream));
+    assertEquals(List.of("before"), outputBodies());
+    assertTrue(stream.spool().pendingBytes() > 0);
+    assertTrue(stream.lastRun().progress().heldBackBytes() > 0);
+    assertFalse(runner.due(stream), "held-back bytes wait again, not a run every scan");
+    nanos.addAndGet(Duration.ofMinutes(1).toNanos());
+    assertTrue(runner.due(stream));
+
+    append("\tat a.B.c(B.java:1)", "level=INFO msg=after");
+    assertTrue(runner.drain(Duration.ofSeconds(30)), "a drain reads every spool to its end");
+
+    assertEquals(
+        List.of(
+            "before",
+            "failed\njava.lang.IllegalStateException: boom\n\tat a.B.c(B.java:1)",
+            "after"),
+        outputBodies());
+    assertEquals(0, stream.spool().pendingBytes());
   }
 
   @Test
