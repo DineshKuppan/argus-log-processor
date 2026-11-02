@@ -6,11 +6,13 @@ import dev.dinesh.argus.checkpoint.ResumePoint.Reason;
 import dev.dinesh.argus.config.FramingProperties;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.InstanceProperties;
+import dev.dinesh.argus.framing.CriPartialJoiner;
 import dev.dinesh.argus.framing.FramedRecord;
 import dev.dinesh.argus.framing.FramingSpec;
 import dev.dinesh.argus.framing.RecordFramer;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.model.LogEnvelope;
+import dev.dinesh.argus.parser.CriLogParser;
 import dev.dinesh.argus.parser.FormatDetector;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserChain;
@@ -429,6 +431,11 @@ public class IngestPipeline {
           resume.generation(),
           resume.reason(),
           primary.name());
+      FramingSpec spec = request.framing() != null ? request.framing() : framing.defaultSpec();
+      CriPartialJoiner joiner =
+          primary instanceof CriLogParser && spec.mode() != FramingSpec.Mode.NONE
+              ? new CriPartialJoiner(framing.limits().maxBytes())
+              : null;
       stages =
           new Stages(
               source,
@@ -441,8 +448,8 @@ public class IngestPipeline {
               request.readLimit(),
               request.lowPriority(),
               tail != null && request.tailed(),
-              (request.framing() != null ? request.framing() : framing.defaultSpec())
-                  .framer(framing.limits()),
+              spec.framer(framing.limits()),
+              joiner,
               request.finalRun());
     } catch (Exception e) {
       source.close();
@@ -495,6 +502,7 @@ public class IngestPipeline {
     private final AtomicInteger unparsedSamples = new AtomicInteger();
     private final List<Thread> threads = new ArrayList<>();
     private final RecordFramer framer;
+    private final CriPartialJoiner joiner;
     private final boolean finalRun;
 
     /** Written and read only by the writer (caller) thread. */
@@ -508,6 +516,8 @@ public class IngestPipeline {
     private boolean closePending;
     private long closeAt;
     private RawBatch lastBatch;
+    private Records current;
+    private boolean stopped;
 
     /** Where a record held back at the end of the source starts, or -1; read after the join. */
     private volatile long heldBackFrom = -1;
@@ -524,9 +534,11 @@ public class IngestPipeline {
         boolean lowPriority,
         boolean tailed,
         RecordFramer framer,
+        CriPartialJoiner joiner,
         boolean finalRun) {
       this.tailed = tailed;
       this.framer = framer;
+      this.joiner = joiner;
       this.finalRun = finalRun;
       this.source = source;
       this.path = Path.of(checkpointTemplate.path());
@@ -621,46 +633,22 @@ public class IngestPipeline {
 
     /** Returns false if the run is stopping. */
     private boolean parse(RawBatch batch) {
-      Records records = new Records(batch);
-      for (int i = 0; i < batch.lines().size(); i++) {
+      current = new Records(batch);
+      for (int i = 0; i < batch.lines().size() && !stopped; i++) {
         String line = batch.lines().get(i);
-        ParserChain.Parsed result = chain.parse(line);
-        FramedRecord done = framer.offer(line, batch.lineOffsets()[i], result);
-        boolean joined = framer.lastJoined();
-        if (!joined) {
-          if (result == null) {
-            records.rejected++;
-            sampleUnparsed(line, batch);
-          } else if (result.outcome() == ParserChain.Outcome.UNPARSED) {
-            sampleUnparsed(line, batch);
-          }
-        }
-        if (closePending) {
-          closePending = false;
-          if (!joined) {
-            // The record open at the segment end was complete: the segment ends where it was read.
-            records.add(done);
-            done = null;
-            if (!emit(records, closeAt, true)) {
-              return false;
-            }
-            records = new Records(batch);
-          } else if (emitStart > segmentStart) {
-            // It continues past the segment end: the segment ends at its start instead.
-            if (!emit(records, emitStart, true)) {
-              return false;
-            }
-            records = new Records(batch);
-          }
-          // Otherwise the segment holds only that record, and the reader's next end closes it.
-        }
-        if (done != null) {
-          records.add(done);
+        long offset = batch.lineOffsets()[i];
+        if (joiner == null) {
+          offer(line, offset, 1, 0);
+        } else {
+          joiner.offer(line, offset, this::offer);
         }
       }
-      long open = framer.openOffset();
+      if (stopped) {
+        return false;
+      }
+      long held = heldOffset();
       boolean closes = batch.lastInSegment();
-      if (closes && open >= 0) {
+      if (closes && held >= 0) {
         closePending = true;
         closeAt = batch.endOffset();
         closes = false;
@@ -668,24 +656,99 @@ public class IngestPipeline {
         // A batch with no lines (blank ones only) moves the pending segment end past itself.
         closeAt = batch.endOffset();
       }
-      return emit(records, open >= 0 ? open : batch.endOffset(), closes);
+      return emit(current, held >= 0 ? held : batch.endOffset(), closes);
+    }
+
+    private void offer(CriPartialJoiner.Line line) {
+      offer(line.text(), line.offset(), line.fragments(), line.droppedFragments());
+    }
+
+    /** Parses and frames one line; sets {@link #stopped} if the run is stopping. */
+    private void offer(String line, long offset, int fragments, int droppedFragments) {
+      if (stopped) {
+        return;
+      }
+      ParserChain.Parsed result = chain.parse(line);
+      if (result != null && fragments > 1) {
+        result.record().getMeta().put(CriPartialJoiner.FRAGMENTS_ATTRIBUTE, fragments);
+      }
+      current.dropped += droppedFragments;
+      FramedRecord done = framer.offer(line, offset, result);
+      boolean joined = framer.lastJoined();
+      if (!joined) {
+        if (result == null) {
+          current.rejected++;
+          sampleUnparsed(line, current.batch);
+        } else if (result.outcome() == ParserChain.Outcome.UNPARSED) {
+          sampleUnparsed(line, current.batch);
+        }
+      }
+      if (closePending) {
+        closePending = false;
+        if (!joined) {
+          // The record open at the segment end was complete: the segment ends where this line
+          // starts (where the reader put the end, unless a split CRI line straddled it).
+          if (done != null) {
+            current.add(done);
+            done = null;
+          }
+          if (offset > segmentStart && !closeSegment(offset)) {
+            return;
+          }
+        } else if (emitStart > segmentStart && !closeSegment(emitStart)) {
+          // It continues past the segment end: the segment ends at its start instead.
+          return;
+        }
+        // Otherwise the segment holds nothing else, and the reader's next end closes it.
+      }
+      if (done != null) {
+        current.add(done);
+      }
+    }
+
+    private boolean closeSegment(long end) {
+      Records closing = current;
+      current = new Records(closing.batch);
+      stopped = !emit(closing, end, true);
+      return !stopped;
+    }
+
+    /** Where the first line not yet handed on starts: the open record's, else a split line's. */
+    private long heldOffset() {
+      long open = framer.openOffset();
+      return open >= 0 || joiner == null ? open : joiner.pendingOffset();
     }
 
     /**
-     * The run read its source to the end with a record open there: it is ingested if no more lines
-     * can follow it, and otherwise held back for the next run (P7 D3). A single-line record never
-     * waits, so a source of single-line records commits exactly as before framing.
+     * The run read its source to the end with a record (or a split CRI line) open there: it is
+     * ingested if no more lines can follow it, and otherwise held back for the next run (P7 D3,
+     * D6). A single-line record never waits, so a source of single-line records commits exactly as
+     * before framing.
      */
     private boolean endOfSource() {
       closePending = false;
-      if (finalRun || framer.openLines() <= 1 || sourceIsQuiet()) {
-        Records records = new Records(lastBatch);
-        records.add(framer.flush());
-        return emit(records, closeAt, true);
+      boolean split = joiner != null && joiner.pendingOffset() >= 0;
+      if (finalRun || (!split && framer.openLines() <= 1) || sourceIsQuiet()) {
+        current = new Records(lastBatch);
+        if (split) {
+          joiner.flush(this::offer);
+        }
+        FramedRecord last = framer.flush();
+        if (last != null) {
+          current.add(last);
+        }
+        return !stopped && emit(current, closeAt, true);
       }
-      heldBackFrom = framer.openOffset();
+      if (split && framer.openOffset() >= 0 && framer.openLines() <= 1) {
+        // A single-line record before the split line doesn't wait with it.
+        current = new Records(lastBatch);
+        current.add(framer.flush());
+      } else {
+        current = new Records(lastBatch);
+      }
+      heldBackFrom = heldOffset();
       // Commit what precedes it; a segment holding nothing else stays open and is discarded.
-      return emitStart <= segmentStart || emit(new Records(lastBatch), emitStart, true);
+      return heldBackFrom <= segmentStart || emit(current, heldBackFrom, true);
     }
 
     private boolean sourceIsQuiet() {

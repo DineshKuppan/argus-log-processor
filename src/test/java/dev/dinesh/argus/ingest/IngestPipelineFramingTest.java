@@ -222,7 +222,12 @@ class IngestPipelineFramingTest {
         assertTrue(r.at("/attributes/argus.lines").isMissingNode());
       }
     }
-    // Segments tile the file, and each ends at a record start (or the file's end).
+    assertSegmentsEndAtRecordStarts(out, file, heads);
+  }
+
+  /** Segments tile the file, and each ends at a record start (or the file's end). */
+  private static void assertSegmentsEndAtRecordStarts(Path out, Path file, Set<Long> heads)
+      throws IOException {
     List<long[]> ranges = segmentRanges(out);
     assertTrue(ranges.size() > 3, "the test needs several segments: " + ranges.size());
     assertEquals(0, ranges.get(0)[0]);
@@ -235,6 +240,70 @@ class IngestPipelineFramingTest {
         assertEquals(Files.size(file), end);
       }
     }
+  }
+
+  @Test
+  void splitCriLinesAreJoinedAndParsedOnceAcrossBatchAndSegmentEnds() throws Exception {
+    Path file = dir.resolve("in/pod.log");
+    Files.createDirectories(file.getParent());
+    String ts = "2025-08-21T12:00:00.000000000Z";
+    StringBuilder sb = new StringBuilder();
+    int n = 90;
+    for (int i = 0; i < n; i++) {
+      if (i % 3 == 2) {
+        String json =
+            "{\"level\":\"ERROR\",\"message\":\"split " + i + " " + "x".repeat(60) + "\"}";
+        int a = json.length() / 3;
+        int b = 2 * a;
+        sb.append(ts).append(" stdout P ").append(json, 0, a).append('\n');
+        sb.append(ts).append(" stdout P ").append(json, a, b).append('\n');
+        sb.append(ts).append(" stdout F ").append(json, b, json.length()).append('\n');
+      } else {
+        sb.append(ts).append(" stdout F {\"level\":\"INFO\",\"message\":\"line ").append(i);
+        sb.append("\"}\n");
+      }
+    }
+    Files.writeString(file, sb);
+    Path out = dir.resolve("out");
+    IngestProgress progress = new IngestProgress();
+
+    pipeline(localSink(out), checkpoints(dir.resolve("cp")), QUIET)
+        .run(request(file), progress, new AtomicBoolean());
+
+    assertEquals("cri", progress.format());
+    List<JsonNode> records = records(out);
+    assertEquals(n, records.size());
+    Set<Long> heads = new TreeSet<>();
+    for (int i = 0; i < n; i++) {
+      JsonNode r = records.get(i);
+      heads.add(offset(r));
+      if (i % 3 == 2) {
+        assertEquals("split " + i + " " + "x".repeat(60), r.get("body").asText());
+        assertEquals("ERROR", r.get("severityText").asText());
+        assertEquals(3, r.at("/attributes/argus.cri.fragments").asInt());
+      } else {
+        assertEquals("line " + i, r.get("body").asText());
+        assertTrue(r.at("/attributes/argus.cri.fragments").isMissingNode());
+      }
+    }
+    assertSegmentsEndAtRecordStarts(out, file, heads);
+  }
+
+  @Test
+  void anUnclosedCriPartialAtTheEndIsHeldBackLikeAnOpenTrace() throws Exception {
+    Path file = dir.resolve("in/pod.log");
+    Files.createDirectories(file.getParent());
+    String ts = "2025-08-21T12:00:00.000000000Z";
+    String done = ts + " stdout F {\"message\":\"done\"}\n";
+    Files.writeString(file, done + ts + " stdout P {\"message\":\"still\n");
+    Path out = dir.resolve("out");
+    IngestProgress progress = new IngestProgress();
+
+    pipeline(localSink(out), checkpoints(dir.resolve("cp")), HOLD)
+        .run(request(file), progress, new AtomicBoolean());
+
+    assertEquals(Files.size(file) - done.length(), progress.heldBackBytes());
+    assertEquals(1, records(out).size());
   }
 
   @Test
