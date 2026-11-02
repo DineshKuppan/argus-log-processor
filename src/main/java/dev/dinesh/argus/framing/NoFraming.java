@@ -11,7 +11,7 @@ public final class NoFraming implements RecordFramer {
 
   @Override
   public FramedRecord offer(String line, long offset, ParserChain.Parsed parsed) {
-    return parsed == null ? null : new FramedRecord(parsed, offset, 1, 0);
+    return parsed == null ? null : new FramedRecord(parsed, offset, 1, false);
   }
 
   @Override

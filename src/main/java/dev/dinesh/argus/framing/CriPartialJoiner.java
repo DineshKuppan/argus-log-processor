@@ -38,7 +38,8 @@ public final class CriPartialJoiner {
   private int bytes;
 
   /**
-   * @param maxBytes UTF-8 bytes of a joined body; later fragments are dropped
+   * @param maxBytes UTF-8 bytes of a joined body; the fragment that passes it and every later one
+   *     are dropped
    */
   public CriPartialJoiner(int maxBytes) {
     this.maxBytes = maxBytes;
@@ -89,7 +90,9 @@ public final class CriPartialJoiner {
   private void append(String fragment) {
     fragments++;
     int length = JoiningFramer.utf8Length(fragment);
-    if (bytes + length > maxBytes && fragments > 1) {
+    // Past the limit the line is cut: later fragments are dropped even if they would fit, so the
+    // body is a prefix of the original line, never one with a hole.
+    if (dropped > 0 || (bytes + length > maxBytes && fragments > 1)) {
       dropped++;
       return;
     }

@@ -1,8 +1,10 @@
 package dev.dinesh.argus.framing;
 
 import dev.dinesh.argus.model.LogRecord;
+import dev.dinesh.argus.parser.CriLogParser;
 import dev.dinesh.argus.parser.ParserChain;
 import java.util.Map;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -10,6 +12,13 @@ import java.util.regex.Pattern;
  * Holds the open record and appends continuation lines to it; subclasses decide what continues a
  * record. The body is built only once a second line arrives, so single-line records allocate
  * nothing extra.
+ *
+ * <p>A record reaching its limits is cut: the line that would pass them starts a new record ({@link
+ * #SPLIT}), so no line is lost and no record grows without bound, whatever the rules decide.
+ *
+ * <p>A container (CRI) line is judged and joined by its body, not the runtime's {@code <time>
+ * <stream> <tag>} prefix, and only within one stream: the parser accepts every CRI line, so its
+ * acceptance means a head only when the body itself was structured (JSON).
  */
 abstract class JoiningFramer implements RecordFramer {
 
@@ -29,11 +38,15 @@ abstract class JoiningFramer implements RecordFramer {
 
   private ParserChain.Parsed head;
   private String headLine;
+  private String headStream;
   private long headOffset = -1;
   private StringBuilder body;
   private int lines;
   private int bytes;
-  private int dropped;
+
+  /** The open record reached its limits: the line that would pass them starts the next one. */
+  private boolean cut;
+
   private String exceptionType;
   private boolean lastJoined;
 
@@ -41,8 +54,14 @@ abstract class JoiningFramer implements RecordFramer {
     this.limits = limits;
   }
 
-  /** Whether {@code line} continues the open record (or, with none open, would have). */
-  abstract boolean continues(String line, ParserChain.Parsed parsed);
+  /**
+   * Whether a line continues the open record (or, with none open, would have).
+   *
+   * @param text the line, or a container line's body
+   * @param structured the source's structured primary format parsed it (a head, for rules that
+   *     respect it)
+   */
+  abstract boolean continues(String text, boolean structured);
 
   /** Called for each line added to a record, head included, after {@link #reset()} on a head. */
   void accepted(String line) {}
@@ -52,15 +71,30 @@ abstract class JoiningFramer implements RecordFramer {
 
   @Override
   public final FramedRecord offer(String line, long offset, ParserChain.Parsed parsed) {
-    boolean continuation = continues(line, parsed);
-    lastJoined = continuation && head != null;
+    String text = line;
+    String stream = null;
+    boolean structured = parsed != null && parsed.outcome() == ParserChain.Outcome.PRIMARY;
+    if (parsed != null && CriLogParser.NAME.equals(parsed.format())) {
+      String body = CriLogParser.body(line);
+      if (body != null) {
+        text = body;
+        // A plain body is the record's message; a JSON body was parsed into fields.
+        structured = !body.equals(parsed.record().getMessage());
+        stream = Objects.toString(parsed.record().getMeta().get("log.iostream"), null);
+      }
+    }
+    boolean continuation =
+        continues(text, structured) && (head == null || Objects.equals(headStream, stream));
+    String joined = continuation && head != null ? withoutCr(text) : null;
+    lastJoined = joined != null && fits(joined);
     if (lastJoined) {
-      append(line);
+      append(joined);
       return null;
     }
+    boolean cut = joined != null;
     FramedRecord done = flush();
     if (parsed != null) {
-      open(line, offset, parsed, continuation);
+      open(text, offset, parsed, stream, cut ? SPLIT : continuation ? ORPHAN : null);
     }
     return done;
   }
@@ -94,41 +128,54 @@ abstract class JoiningFramer implements RecordFramer {
         meta.putIfAbsent(EXCEPTION_TYPE_ATTRIBUTE, exceptionType);
       }
     }
-    if (dropped > 0) {
+    if (cut) {
       meta.put(TRUNCATED_ATTRIBUTE, true);
-      meta.put(DROPPED_ATTRIBUTE, dropped);
     }
-    FramedRecord done = new FramedRecord(head, headOffset, lines, dropped);
+    FramedRecord done = new FramedRecord(head, headOffset, lines, cut);
     head = null;
     headLine = null;
+    headStream = null;
     headOffset = -1;
     body = null;
+    cut = false;
     return done;
   }
 
-  private void open(String line, long offset, ParserChain.Parsed parsed, boolean orphan) {
+  /**
+   * @param framing {@link #ORPHAN}, {@link #SPLIT} or null
+   */
+  private void open(
+      String text, long offset, ParserChain.Parsed parsed, String stream, String framing) {
     head = parsed;
-    headLine = line;
+    headLine = text;
+    headStream = stream;
     headOffset = offset;
     lines = 1;
-    dropped = 0;
     exceptionType = null;
     String message = parsed.record().getMessage();
-    bytes = utf8Length(message != null ? message : line);
-    if (orphan) {
-      parsed.record().getMeta().put(FRAMING_ATTRIBUTE, ORPHAN);
+    bytes = utf8Length(message != null ? message : text);
+    if (framing != null) {
+      parsed.record().getMeta().put(FRAMING_ATTRIBUTE, framing);
     }
     reset();
-    accepted(line);
+    accepted(text);
   }
 
-  private void append(String line) {
-    String text = line.endsWith("\r") ? line.substring(0, line.length() - 1) : line;
-    int length = utf8Length(text) + 1;
-    if (lines >= limits.maxLines() || bytes + length > limits.maxBytes()) {
-      dropped++;
-      return;
+  /** Whether {@code text} can join the open record within its limits; else the record is cut. */
+  private boolean fits(String text) {
+    if (lines < limits.maxLines() && bytes + utf8Length(text) + 1 <= limits.maxBytes()) {
+      return true;
     }
+    cut = true;
+    return false;
+  }
+
+  private static String withoutCr(String line) {
+    return line.endsWith("\r") ? line.substring(0, line.length() - 1) : line;
+  }
+
+  private void append(String text) {
+    int length = utf8Length(text) + 1;
     if (body == null) {
       String message = head.record().getMessage();
       body = new StringBuilder(message != null ? message : headLine);

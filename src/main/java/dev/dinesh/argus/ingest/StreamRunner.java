@@ -297,6 +297,9 @@ public class StreamRunner implements SmartLifecycle {
         if (read.isPresent()) {
           spool.markRead(read.get());
         }
+        if (outcome == Outcome.COMPLETED) {
+          spool.restartWaitIfPending();
+        }
       } catch (IOException | RuntimeException e) {
         log.warn("Stream {}: could not update its spool after a run: {}", streamId, e.toString());
       } finally {

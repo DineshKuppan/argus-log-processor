@@ -103,4 +103,19 @@ class FramingSpecTest {
     assertEquals(1, records.size());
     assertTrue(bodies(records).get(0).endsWith("START too late"));
   }
+
+  @Test
+  void aBacktrackingStartPatternIsAbandonedNotRunForever() {
+    StartPatternFramer framer = (StartPatternFramer) spec("start:(.*a){8}!").framer(LIMITS);
+    // 7.7s for 40 characters on JDK 17; far longer for 60, without the budget.
+    String line = "a".repeat(60);
+    long started = System.nanoTime();
+
+    List<FramedRecord> records = frame(framer, chain("raw", true), line, line, "b");
+
+    assertTrue(System.nanoTime() - started < 5_000_000_000L, "took too long");
+    assertEquals(2, framer.abandoned());
+    // An abandoned search starts a record, as with framing none.
+    assertEquals(List.of(line, line + "\nb"), bodies(records));
+  }
 }

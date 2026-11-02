@@ -3,11 +3,13 @@ package dev.dinesh.argus.ingest;
 import dev.dinesh.argus.config.FramingProperties;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.PushProperties;
+import dev.dinesh.argus.framing.CriPartialJoiner;
 import dev.dinesh.argus.framing.FramedRecord;
 import dev.dinesh.argus.framing.FramingSpec;
 import dev.dinesh.argus.framing.RecordFramer;
 import dev.dinesh.argus.ingest.PushRejectedException.Reason;
 import dev.dinesh.argus.metrics.ArgusMetrics;
+import dev.dinesh.argus.parser.CriLogParser;
 import dev.dinesh.argus.parser.FormatDetector;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.parser.ParserChain;
@@ -28,6 +30,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -409,11 +412,11 @@ public class PushIngestService {
     // to publish them; otherwise not at all. Parsed lines join into records (P7 D5): a record is
     // suppressed, spooled and tailed whole.
     boolean tailed = tail != null && tail.isWatched(stream.tenantId());
-    ParserChain chain = props.suppress() || tailed ? messageChain(stream, body) : null;
-    RecordFramer framer = chain == null ? null : framer(stream);
+    LogParser parser = props.suppress() || tailed ? messageParser(stream, body) : null;
     List<ParserChain.Parsed> tailLines = tailed ? new ArrayList<>() : null;
     List<String> allowedKeys = new ArrayList<>();
-    Compactor lines = new Compactor(body, stream, tailLines, allowedKeys);
+    Compactor lines = new Compactor(body, stream.tenantId(), tailLines, allowedKeys);
+    RequestFramer records = parser == null ? null : new RequestFramer(stream, parser, lines);
     // Compacts the accepted lines in place: what is written never overtakes what is read.
     for (int start = 0; start < body.length; ) {
       int newline = indexOf(body, (byte) '\n', start);
@@ -424,53 +427,45 @@ public class PushIngestService {
         continue;
       }
       int length = Math.min(end - start, maxLineBytes);
-      if (framer == null) {
+      if (records == null) {
         lines.line(start, length, end - start, null);
         lines.endRecord(null);
       } else {
         int textLength = length > 0 && body[start + length - 1] == '\r' ? length - 1 : length;
-        String line = new String(body, start, textLength, StandardCharsets.UTF_8);
-        FramedRecord done = framer.offer(line, start, chain.parse(line));
-        if (done != null && done.offset() == start) {
-          // This line is the record (framing none).
-          lines.line(start, length, end - start, line);
-          lines.endRecord(done);
-        } else {
-          // A joining framer completes the record before this line, which this line may start.
-          if (done != null) {
-            lines.endRecord(done);
-          }
-          lines.line(start, length, end - start, framer.lastJoined() ? null : line);
-        }
+        records.line(start, length, end - start, textLength);
       }
       start = next;
     }
-    if (framer != null) {
-      FramedRecord last = framer.flush();
-      if (last != null) {
-        lines.endRecord(last);
-      }
+    if (records != null) {
+      records.flush();
     }
     lines.flush();
-    byte[] out = lines.out;
-    int written = lines.written;
-    int accepted = lines.accepted;
-    int suppressed = lines.suppressed;
-    int truncated = lines.truncated;
     StreamSpool.Append append;
-    // With the append, so the next request on the stream sees this one's last decision.
+    // The decision on the record a request's leading continuation lines extend is the previous
+    // append's: read and updated with the append, so concurrent requests see each other's in order.
     synchronized (stream) {
+      Boolean previous = stream.lastRecordAllowed;
+      if (previous == Boolean.FALSE) {
+        lines.dropLeading();
+      }
       try {
-        append = stream.spool().append(out, written, key, receivedAt);
+        append = stream.spool().append(lines.out, lines.written, key, receivedAt);
       } catch (IOException | RuntimeException e) {
         // Nothing was spooled: the client retries, and its lines must not be suppressed as copies.
         suppressor.release(allowedKeys);
         throw e;
       }
-      if (!append.duplicate() && lines.lastAllowed != null) {
-        stream.lastRecordAllowed = lines.lastAllowed;
+      if (!append.duplicate()) {
+        Boolean last =
+            lines.onlyLeading() ? Boolean.valueOf(previous != Boolean.FALSE) : lines.lastAllowed;
+        if (last != null) {
+          stream.lastRecordAllowed = last;
+        }
       }
     }
+    int accepted = lines.accepted;
+    int suppressed = lines.suppressed;
+    int truncated = lines.truncated;
     if (append.duplicate()) {
       suppressor.release(allowedKeys);
       return duplicate(stream, append);
@@ -493,12 +488,6 @@ public class PushIngestService {
         receivedAt);
   }
 
-  /** The stream's framing for one request; the stream run frames the spool the same way. */
-  private RecordFramer framer(PushStream stream) {
-    FramingSpec spec = stream.framing() != null ? stream.framing() : framing.defaultSpec();
-    return spec.framer(framing.limits());
-  }
-
   private static PushResult duplicate(PushStream stream, StreamSpool.Append original) {
     stream.duplicates.incrementAndGet();
     return new PushResult(
@@ -514,13 +503,78 @@ public class PushIngestService {
   }
 
   /** Suppression compares messages, so lines are parsed with the stream's format to find them. */
-  private ParserChain messageChain(PushStream stream, byte[] body) {
+  private LogParser messageParser(PushStream stream, byte[] body) {
     LogParser parser = stream.messageParser();
     if (parser == null) {
       parser = parsers.detect(sample(body)).parser();
       stream.detectedMessageParser(parser);
     }
-    return parsers.chain(parser, true);
+    return parser;
+  }
+
+  /**
+   * Frames one request's lines into records for the {@link Compactor}, as the stream run will frame
+   * the spool: split CRI lines are joined first (P7 D6), so a split line is one record, suppressed
+   * whole. The spool keeps the original fragments; the run joins them again.
+   */
+  private final class RequestFramer {
+    final ParserChain chain;
+    final RecordFramer framer;
+    final CriPartialJoiner joiner;
+    final Compactor lines;
+
+    /** Each original line not yet framed: start, kept length, span. A joined line pops several. */
+    final ArrayDeque<int[]> ranges = new ArrayDeque<>();
+
+    RequestFramer(PushStream stream, LogParser parser, Compactor lines) {
+      FramingSpec spec = stream.framing() != null ? stream.framing() : framing.defaultSpec();
+      this.chain = parsers.chain(parser, true);
+      this.framer = spec.framer(framing.limits());
+      this.joiner =
+          parser instanceof CriLogParser && spec.mode() != FramingSpec.Mode.NONE
+              ? new CriPartialJoiner(framing.limits().maxBytes())
+              : null;
+      this.lines = lines;
+    }
+
+    void line(int start, int length, int span, int textLength) {
+      String text = new String(lines.body, start, textLength, StandardCharsets.UTF_8);
+      ranges.addLast(new int[] {start, length, span});
+      if (joiner == null) {
+        frame(text, start, 1);
+      } else {
+        joiner.offer(text, start, l -> frame(l.text(), l.offset(), l.fragments()));
+      }
+    }
+
+    void flush() {
+      if (joiner != null) {
+        joiner.flush(l -> frame(l.text(), l.offset(), l.fragments()));
+      }
+      FramedRecord last = framer.flush();
+      if (last != null) {
+        lines.endRecord(last);
+      }
+    }
+
+    /** One (possibly joined) line made of the next {@code fragments} original lines. */
+    private void frame(String text, long offset, int fragments) {
+      FramedRecord done = framer.offer(text, offset, chain.parse(text));
+      boolean whole = done != null && done.offset() == offset;
+      if (done != null && !whole) {
+        // A joining framer completes the record before this line, which this line may start.
+        lines.endRecord(done);
+      }
+      String head = framer.lastJoined() ? null : text;
+      for (int i = 0; i < fragments; i++) {
+        int[] range = ranges.removeFirst();
+        lines.line(range[0], range[1], range[2], i == 0 ? head : null);
+      }
+      if (whole) {
+        // This line is the record (framing none).
+        lines.endRecord(done);
+      }
+    }
   }
 
   /** Durable in the spool now: shown on the tail at once, not when the stream runner ingests it. */
@@ -555,8 +609,16 @@ public class PushIngestService {
     final List<ParserChain.Parsed> tailLines;
     final List<String> allowedKeys;
 
-    /** The stream's last decision before this request: leading continuation lines follow it. */
-    final Boolean previousAllowed;
+    /**
+     * Where the request's leading continuation lines (a record continuing the previous request's
+     * last) end in {@link #out}, and how many there are; -1 when the request has none. They are
+     * kept here and dropped under the stream's lock if that record was suppressed.
+     */
+    int leadingBytes = -1;
+
+    int leadingLines;
+    boolean leadingTailed;
+    int recordsDecided;
 
     // The lines of the records awaiting a decision, then of the open record.
     int[] starts = new int[SUPPRESS_BATCH];
@@ -585,15 +647,34 @@ public class PushIngestService {
 
     Compactor(
         byte[] body,
-        PushStream stream,
+        String tenantId,
         List<ParserChain.Parsed> tailLines,
         List<String> allowedKeys) {
       this.body = body;
       this.out = body;
-      this.tenantId = stream.tenantId();
-      this.previousAllowed = stream.lastRecordAllowed;
+      this.tenantId = tenantId;
       this.tailLines = tailLines;
       this.allowedKeys = allowedKeys;
+    }
+
+    /** The record the leading lines continue was suppressed: they go with it. */
+    void dropLeading() {
+      if (leadingBytes < 0) {
+        return;
+      }
+      System.arraycopy(out, leadingBytes, out, 0, written - leadingBytes);
+      written -= leadingBytes;
+      accepted -= leadingLines;
+      suppressed += leadingLines;
+      if (leadingTailed) {
+        tailLines.remove(0);
+      }
+      leadingBytes = -1;
+    }
+
+    /** The request holds nothing but leading continuation lines. */
+    boolean onlyLeading() {
+      return recordsDecided == 1 && (leadingBytes >= 0 || leadingLines > 0);
     }
 
     /**
@@ -626,10 +707,12 @@ public class PushIngestService {
       if (record != null) {
         Map<String, Object> meta = record.parsed().record().getMeta();
         if (first && RecordFramer.ORPHAN.equals(meta.get(RecordFramer.FRAMING_ATTRIBUTE))) {
-          // Continues the previous request's last record: follows its decision. Unknown (a
-          // restart): kept, as suppression fails open.
+          // Continues the previous request's last record and follows its decision, known only
+          // under the stream's lock (dropLeading). Unknown (a restart): kept, as suppression fails
+          // open.
           meta.put(RecordFramer.FRAMING_ATTRIBUTE, RecordFramer.CONTINUED);
-          forced[r] = previousAllowed != Boolean.FALSE;
+          forced[r] = Boolean.TRUE;
+          leadingBytes = 0;
         } else if (props.suppress()) {
           String message = message(record.parsed(), headLine);
           if (message != null) {
@@ -655,6 +738,7 @@ public class PushIngestService {
                 ? forced[r]
                 : messageAt[r] < 0 || decisions.get(messageAt[r]).allowed();
         lastAllowed = allowed;
+        boolean leading = recordsDecided++ == 0 && leadingBytes == 0;
         if (!allowed) {
           suppressed += recordEnd[r] - i;
           i = recordEnd[r];
@@ -662,6 +746,10 @@ public class PushIngestService {
         }
         if (tailLines != null && parsed[r] != null) {
           tailLines.add(parsed[r]);
+          leadingTailed = leading;
+        }
+        if (leading) {
+          leadingLines = recordEnd[r] - i;
         }
         for (; i < recordEnd[r]; i++) {
           if (lengths[i] < spans[i]) {
@@ -675,6 +763,9 @@ public class PushIngestService {
           written += lengths[i];
           out[written++] = '\n';
           accepted++;
+        }
+        if (leading) {
+          leadingBytes = written;
         }
       }
       Arrays.fill(parsed, 0, records, null);

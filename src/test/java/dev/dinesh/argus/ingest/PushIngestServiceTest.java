@@ -300,6 +300,33 @@ class PushIngestServiceTest {
     assertEquals(HEAD + EXCEPTION + FRAME_1 + HEAD + EXCEPTION + FRAME_2, spooled("acme"));
   }
 
+  private static PushRequest cri(String body) {
+    byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+    return new PushRequest(
+        "acme", "app", new ByteArrayInputStream(bytes), null, bytes.length, null, "cri", null);
+  }
+
+  private static String fragment(char tag, String body) {
+    return "2025-08-21T12:00:00.000000000Z stdout " + tag + " " + body + "\n";
+  }
+
+  @Test
+  void aSplitContainerLineIsSuppressedWholeNotFragmentByFragment() throws IOException {
+    PushIngestService service = service();
+    String shared = fragment('P', "{\"message\":\"order ") + fragment('P', "12345 failed: ");
+    String first = shared + fragment('F', "timeout\"}");
+    String other = shared + fragment('F', "refused\"}");
+
+    PushResult kept = service.push(cri(first));
+    PushResult copy = service.push(cri(first));
+    PushResult different = service.push(cri(other));
+
+    assertEquals(3, kept.accepted());
+    assertEquals(3, copy.suppressed(), "every fragment of the copy");
+    assertEquals(3, different.accepted(), "the same first fragments, another line");
+    assertEquals(first + other, spooled("acme"));
+  }
+
   @Test
   void framesThatStartARequestFollowTheDecisionOnTheRecordTheyContinue() throws IOException {
     PushIngestService service = service();

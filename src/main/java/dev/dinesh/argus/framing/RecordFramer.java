@@ -15,16 +15,21 @@ public interface RecordFramer {
   /** Number of lines in a multiline record; absent on single-line records. */
   String LINES_ATTRIBUTE = "argus.lines";
 
-  /** Set when continuation lines past the record's limits were dropped. */
+  /**
+   * Set on a record cut at its limits ({@code max-record-lines} / {@code max-record-bytes}): its
+   * remaining lines follow as a record marked {@value #SPLIT}.
+   */
   String TRUNCATED_ATTRIBUTE = "argus.multiline.truncated";
 
-  /** How many continuation lines were dropped. */
-  String DROPPED_ATTRIBUTE = "argus.multiline.dropped";
-
-  /** {@value #ORPHAN} on a record whose first line was a continuation with no record to join. */
+  /**
+   * {@value #ORPHAN} on a record whose first line was a continuation with no record to join;
+   * {@value #SPLIT} on one that continues a record cut at its limits.
+   */
   String FRAMING_ATTRIBUTE = "argus.framing";
 
   String ORPHAN = "orphan";
+
+  String SPLIT = "split";
 
   /**
    * {@value #CONTINUED} on a pushed record whose lines continue the stream's previous request's
@@ -60,8 +65,8 @@ public interface RecordFramer {
   FramedRecord flush();
 
   /**
-   * @param maxLines lines in a record, head included; later continuation lines are dropped
-   * @param maxBytes UTF-8 bytes of a record's body; later continuation lines are dropped
+   * @param maxLines lines in a record, head included; a line past them starts a new record
+   * @param maxBytes UTF-8 bytes of a record's body; a line past them starts a new record
    */
   record Limits(int maxLines, int maxBytes) {
     public Limits {

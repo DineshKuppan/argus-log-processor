@@ -1,8 +1,6 @@
 package dev.dinesh.argus.ingest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -452,7 +450,7 @@ class IngestPipelineFramingTest {
   }
 
   @Test
-  void continuationLinesPastTheLimitsAreCountedAsTruncated() throws Exception {
+  void aRecordPastItsLimitsIsCutIntoSeveralAndNoLineIsLost() throws Exception {
     Path file = writeLog(4, 4);
     Path out = dir.resolve("out");
     IngestProgress progress = new IngestProgress();
@@ -463,12 +461,35 @@ class IngestPipelineFramingTest {
             new FramingProperties("auto", 3, null, Duration.ZERO))
         .run(request(file), progress, new AtomicBoolean());
 
-    JsonNode trace = records(out).get(3);
+    // The trace's 7 lines: [head, exception, frame 0] cut, [frames 1-3] split and cut, [frame 4].
+    List<JsonNode> records = records(out);
+    assertEquals(6, records.size());
+    JsonNode trace = records.get(3);
     assertEquals(3, trace.at("/attributes/argus.lines").asInt());
-    assertEquals(FRAMES - 1, trace.at("/attributes/" + RecordFramer.DROPPED_ATTRIBUTE).asInt());
-    assertEquals(FRAMES - 1, progress.truncated());
-    assertNotEquals(0, progress.committedOffset());
-    assertFalse(trace.at("/attributes/argus.multiline.truncated").isMissingNode());
+    assertTrue(trace.at("/attributes/" + RecordFramer.TRUNCATED_ATTRIBUTE).asBoolean());
+    JsonNode rest = records.get(4);
+    assertEquals(RecordFramer.SPLIT, rest.at("/attributes/argus.framing").asText());
+    assertEquals(3, rest.at("/attributes/argus.lines").asInt());
+    assertEquals(RecordFramer.SPLIT, records.get(5).at("/attributes/argus.framing").asText());
+    assertTrue(records.get(5).at("/attributes/argus.lines").isMissingNode());
+    assertEquals(2, progress.truncated());
+    assertEquals(Files.size(file), progress.committedOffset());
+  }
+
+  @Test
+  void aStartPatternThatNeverMatchesStillCommitsBoundedSegments() throws Exception {
+    Path file = writeLog(3000, 0);
+    Path out = dir.resolve("out");
+    IngestProgress progress = new IngestProgress();
+
+    pipeline(
+            localSink(out),
+            checkpoints(dir.resolve("cp")),
+            new FramingProperties("start:^NEVER", 100, null, Duration.ZERO))
+        .run(request(file), progress, new AtomicBoolean());
+
+    assertEquals(30, records(out).size());
+    assertEquals(Files.size(file), progress.committedOffset());
   }
 
   /** Bytes of record {@code i}'s head and trace, as {@link #writeLog} writes them. */

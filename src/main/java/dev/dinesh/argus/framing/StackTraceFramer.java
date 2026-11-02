@@ -1,6 +1,5 @@
 package dev.dinesh.argus.framing;
 
-import dev.dinesh.argus.parser.ParserChain;
 import java.util.List;
 import java.util.regex.Pattern;
 
@@ -36,8 +35,8 @@ public final class StackTraceFramer extends JoiningFramer {
   }
 
   @Override
-  boolean continues(String line, ParserChain.Parsed parsed) {
-    if (parsed != null && parsed.outcome() == ParserChain.Outcome.PRIMARY) {
+  boolean continues(String line, boolean structured) {
+    if (structured) {
       return false;
     }
     if (isIndented(line) || isJavaException(line)) {

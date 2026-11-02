@@ -7,6 +7,7 @@ import static dev.dinesh.argus.framing.FramerFixture.frame;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.dinesh.argus.parser.ParserChain;
 import java.util.List;
@@ -159,7 +160,7 @@ class StackTraceFramerTest {
   }
 
   @Test
-  void continuationsPastTheLineLimitAreDroppedAndCounted() {
+  void aRecordPastTheLineLimitIsCutAndTheRestFollowsAsSplitRecords() {
     StackTraceFramer framer = new StackTraceFramer(new RecordFramer.Limits(3, 1024));
     List<FramedRecord> records =
         frame(
@@ -172,23 +173,31 @@ class StackTraceFramerTest {
             "\tat d(A.java:4)",
             HEAD_2);
 
-    assertEquals(2, records.size());
+    assertEquals(
+        List.of(
+            "Request failed\n\tat a(A.java:1)\n\tat b(A.java:2)",
+            "\tat c(A.java:3)\n\tat d(A.java:4)",
+            "Next"),
+        bodies(records));
     FramedRecord trace = records.get(0);
     assertEquals(3, trace.lines());
-    assertEquals(2, trace.droppedLines());
+    assertTrue(trace.truncated());
     assertEquals(true, trace.parsed().record().getMeta().get(RecordFramer.TRUNCATED_ATTRIBUTE));
-    assertEquals(2, trace.parsed().record().getMeta().get(RecordFramer.DROPPED_ATTRIBUTE));
-    assertEquals("Request failed\n\tat a(A.java:1)\n\tat b(A.java:2)", bodies(records).get(0));
+    FramedRecord rest = records.get(1);
+    assertFalse(rest.truncated());
+    assertEquals(
+        RecordFramer.SPLIT, rest.parsed().record().getMeta().get(RecordFramer.FRAMING_ATTRIBUTE));
+    assertEquals(HEAD_1.length() + 1 + 2 * ("\tat a(A.java:1)".length() + 1), rest.offset());
   }
 
   @Test
-  void continuationsPastTheByteLimitAreDropped() {
+  void aLinePastTheByteLimitStartsTheNextRecordSoNothingIsSkipped() {
     // "Request failed" is 14 bytes; "\tat é" adds 6 (é is 2) plus the newline.
     StackTraceFramer framer = new StackTraceFramer(new RecordFramer.Limits(500, 14 + 7));
     List<FramedRecord> records = frame(framer, kv, HEAD_1, "\tat é", "\tat b");
 
-    assertEquals("Request failed\n\tat é", bodies(records).get(0));
-    assertEquals(1, records.get(0).droppedLines());
+    assertEquals(List.of("Request failed\n\tat é", "\tat b"), bodies(records));
+    assertTrue(records.get(0).truncated());
   }
 
   @Test
@@ -227,5 +236,44 @@ class StackTraceFramerTest {
     FramedRecord trace = frameKv(head, "java.lang.IllegalStateException: boom").get(0);
 
     assertEquals("app.Custom", trace.parsed().record().getMeta().get("exception.type"));
+  }
+
+  private static String cri(String stream, String body) {
+    return "2025-08-21T12:00:00.000000000Z " + stream + " F " + body;
+  }
+
+  @Test
+  void containerLinesAreFramedByTheirBodyWithinOneStream() {
+    ParserChain criChain = chain("cri", true);
+    List<FramedRecord> records =
+        frame(
+            new StackTraceFramer(LIMITS),
+            criChain,
+            cri("stderr", "ERROR request failed"),
+            cri("stderr", "java.lang.IllegalStateException: boom"),
+            cri("stderr", "\tat com.example.Orders.place(Orders.java:42)"),
+            cri("stdout", "\tat looks.Like(AFrame.java:1)"),
+            cri("stderr", "{\"level\":\"INFO\",\"message\":\"  indented json\"}"));
+
+    assertEquals(
+        List.of(
+            "ERROR request failed\njava.lang.IllegalStateException: boom\n"
+                + "\tat com.example.Orders.place(Orders.java:42)",
+            "\tat looks.Like(AFrame.java:1)",
+            "  indented json"),
+        bodies(records));
+    assertEquals(
+        "java.lang.IllegalStateException",
+        records.get(0).parsed().record().getMeta().get(RecordFramer.EXCEPTION_TYPE_ATTRIBUTE));
+  }
+
+  @Test
+  void aStartPatternMatchesAContainerLinesBody() {
+    StartPatternFramer framer =
+        new StartPatternFramer(java.util.regex.Pattern.compile("^\\["), LIMITS);
+    List<FramedRecord> records =
+        frame(framer, chain("cri", true), cri("stdout", "[main] boom"), cri("stdout", "detail"));
+
+    assertEquals(List.of("[main] boom\ndetail"), bodies(records));
   }
 }

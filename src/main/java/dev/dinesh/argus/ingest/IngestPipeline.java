@@ -128,34 +128,12 @@ public class IngestPipeline {
 
     /** The same run on the replay lane: paced by {@code limit}, at minimum thread priority. */
     public Request onReplayLane(ByteRateLimiter limit) {
-      return new Request(
-          tenantId,
-          path,
-          sourceId,
-          fromBeginning,
-          parser,
-          endOffset,
-          pathIsIdentity,
-          limit,
-          true,
-          framing,
-          finalRun);
+      return with(limit, true, framing, finalRun);
     }
 
     /** The same run with {@code framing} (null: {@code argus.framing.mode}). */
     public Request withFraming(FramingSpec framing) {
-      return new Request(
-          tenantId,
-          path,
-          sourceId,
-          fromBeginning,
-          parser,
-          endOffset,
-          pathIsIdentity,
-          readLimit,
-          lowPriority,
-          framing,
-          finalRun);
+      return with(readLimit, lowPriority, framing, finalRun);
     }
 
     /** {@link #asFinalRun()} when {@code last}, else this run. */
@@ -165,6 +143,12 @@ public class IngestPipeline {
 
     /** The same run, the last for its source's lines in this generation. */
     public Request asFinalRun() {
+      return with(readLimit, lowPriority, framing, true);
+    }
+
+    /** The one place a copy names every component: the source's identity is never changed. */
+    private Request with(
+        ByteRateLimiter readLimit, boolean lowPriority, FramingSpec framing, boolean finalRun) {
       return new Request(
           tenantId,
           path,
@@ -176,7 +160,7 @@ public class IngestPipeline {
           readLimit,
           lowPriority,
           framing,
-          true);
+          finalRun);
     }
 
     /**
@@ -524,6 +508,10 @@ public class IngestPipeline {
     private long closeAt;
     private RawBatch lastBatch;
     private Records current;
+
+    /** Counts of batches {@link #emit} skipped (an open record spanned them), for the next. */
+    private Records carried;
+
     private boolean stopped;
 
     /** Where a record held back at the end of the source starts, or -1; read after the join. */
@@ -770,7 +758,13 @@ public class IngestPipeline {
     /** Hands {@code [emitStart, end)} to the writer; returns false if the run is stopping. */
     private boolean emit(Records records, long end, boolean lastInSegment) {
       if (!lastInSegment && end == emitStart && records.list.isEmpty()) {
+        // An open record spans the batch: nothing to hand on yet, but its counts go with the next.
+        carried = carried == null ? records : carried.plus(records);
         return true;
+      }
+      if (carried != null) {
+        records.addCounts(carried);
+        carried = null;
       }
       if (records.tailEvents != null && !records.tailEvents.isEmpty()) {
         tail.publish(tenantId, records.tailEvents);
@@ -821,6 +815,20 @@ public class IngestPipeline {
       int dropped;
       int multiline;
 
+      /** Counts only: what a skipped batch saw, merged into a later one. */
+      Records plus(Records later) {
+        later.addCounts(this);
+        return later;
+      }
+
+      void addCounts(Records other) {
+        rejected += other.rejected;
+        unparsed += other.unparsed;
+        fallback += other.fallback;
+        dropped += other.dropped;
+        multiline += other.multiline;
+      }
+
       Records(RawBatch batch) {
         this.batch = batch;
         this.list = new ArrayList<>(batch.lines().size());
@@ -834,7 +842,9 @@ public class IngestPipeline {
           case FALLBACK -> fallback++;
           case PRIMARY -> {}
         }
-        dropped += record.droppedLines();
+        if (record.truncated()) {
+          dropped++;
+        }
         if (record.lines() > 1) {
           multiline++;
         }

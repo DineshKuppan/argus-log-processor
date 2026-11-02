@@ -108,4 +108,13 @@ class CriPartialJoinerTest {
 
     assertEquals(cri("stdout", 'F', "x"), out.get(0).text());
   }
+
+  @Test
+  void afterAFragmentIsDroppedLaterOnesAreTooSoTheBodyHasNoHole() {
+    CriPartialJoiner joiner = new CriPartialJoiner(7);
+    offer(joiner, cri("stdout", 'P', "abc"), cri("stdout", 'P', "defgh"), cri("stdout", 'F', "i"));
+
+    assertEquals(cri("stdout", 'F', "abc"), out.get(0).text());
+    assertEquals(2, out.get(0).droppedFragments());
+  }
 }

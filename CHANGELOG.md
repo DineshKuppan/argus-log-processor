@@ -12,10 +12,10 @@ Plan and results: [`P7_PLAN.md`](docs/architecture/P7_PLAN.md) D1–D6, §9; ADR
 #### Added
 - **Lines joined into records** (`framing` on file jobs and push streams; default `argus.framing.mode=auto`):
   - `auto`: Java, Python and Go stack traces (indented frames, `Caused by:` / `Suppressed:`, `Traceback`, exception lines, goroutine headers). A line only continues a record when the source's structured format doesn't parse it, so a head line always starts a new record;
-  - `start:<regex>` (≤256 characters, matched on a line's first 256 characters): a matching line starts a record;
+  - `start:<regex>` (≤256 characters, matched on a line's first 256 characters, with a step budget against catastrophic backtracking): a matching line starts a record;
   - `none`: one record per line, as before. Exports always use `none`.
-- **A multiline record** keeps its head line's time, level, attributes and `eventId`; its body is the head's message plus each continuation line. It carries `argus.lines`, `exception.type` (OpenTelemetry), and `argus.multiline.truncated` / `.dropped` beyond `max-record-lines` (500) / `max-record-bytes` (1MB). A continuation line with no record to join becomes its own record, `argus.framing=orphan`.
-- **CRI partial lines joined:** with format `cri`, consecutive `P` fragments of one stream up to its `F` become one line before parsing (`argus.cri.fragments`).
+- **A multiline record** keeps its head line's time, level, attributes and `eventId`; its body is the head's message plus each continuation line. It carries `argus.lines`, `exception.type` (OpenTelemetry), and `argus.multiline.truncated` when it reached `max-record-lines` (500) / `max-record-bytes` (1MB): the line past them starts the next record (`argus.framing=split`), so no line is dropped. A continuation line with no record to join becomes its own record, `argus.framing=orphan`.
+- **CRI partial lines joined:** with format `cri`, consecutive `P` fragments of one stream up to its `F` become one line before parsing (`argus.cri.fragments`), in file jobs and at push receive time. Container lines are framed by their body, within one stream, so a pod's stack trace becomes one record.
 - **Status:** `framing`, `multilineRecords` and `heldBackBytes` on jobs and stream runs; the `Ingest finished …` canonical line adds `multilineRecords` and `heldBackBytes`.
 - `argus.framing.*` (`mode`, `max-record-lines`, `max-record-bytes`, `flush-after`); `DataSeeder` app logs with stack traces (`--stack-traces=0.05`); `FramingIT` (tag `load`).
 

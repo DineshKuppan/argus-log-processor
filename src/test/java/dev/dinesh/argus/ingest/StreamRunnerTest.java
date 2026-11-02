@@ -245,6 +245,9 @@ class StreamRunnerTest {
     assertEquals(List.of("before"), outputBodies());
     assertTrue(stream.spool().pendingBytes() > 0);
     assertTrue(stream.lastRun().progress().heldBackBytes() > 0);
+    assertFalse(runner.due(stream), "held-back bytes wait again, not a run every scan");
+    nanos.addAndGet(Duration.ofMinutes(1).toNanos());
+    assertTrue(runner.due(stream));
 
     append("\tat a.B.c(B.java:1)", "level=INFO msg=after");
     assertTrue(runner.drain(Duration.ofSeconds(30)), "a drain reads every spool to its end");

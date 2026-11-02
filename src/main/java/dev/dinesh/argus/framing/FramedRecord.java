@@ -8,6 +8,6 @@ import dev.dinesh.argus.parser.ParserChain;
  * @param parsed the head line's parse result; for a multiline record its message is the whole body
  * @param offset the head line's byte offset in the source
  * @param lines lines kept in the body, head included
- * @param droppedLines continuation lines past the limits, not in the body
+ * @param truncated cut at the limits: the next record ({@code argus.framing=split}) continues it
  */
-public record FramedRecord(ParserChain.Parsed parsed, long offset, int lines, int droppedLines) {}
+public record FramedRecord(ParserChain.Parsed parsed, long offset, int lines, boolean truncated) {}
