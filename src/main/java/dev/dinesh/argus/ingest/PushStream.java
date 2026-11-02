@@ -1,5 +1,6 @@
 package dev.dinesh.argus.ingest;
 
+import dev.dinesh.argus.framing.FramingSpec;
 import dev.dinesh.argus.parser.LogParser;
 import dev.dinesh.argus.source.StreamSpool;
 import java.time.Instant;
@@ -48,6 +49,16 @@ public final class PushStream {
   /** What push requests parse lines with to find their message: {@link #parser} or detected. */
   private volatile LogParser messageParser;
 
+  /** How the stream's lines join into records, or null for {@code argus.framing.mode}. */
+  private volatile FramingSpec framing;
+
+  /**
+   * Whether the last record of the latest appended request was kept (not suppressed), or null when
+   * unknown (no request yet, or a restart): continuation lines that start the next request follow
+   * it ({@code P7_PLAN.md} D5).
+   */
+  volatile Boolean lastRecordAllowed;
+
   PushStream(String tenantId, String streamId, StreamSpool spool) {
     this.tenantId = tenantId;
     this.streamId = streamId;
@@ -88,6 +99,14 @@ public final class PushStream {
     if (messageParser == null) {
       messageParser = detected;
     }
+  }
+
+  public FramingSpec framing() {
+    return framing;
+  }
+
+  public void useFraming(FramingSpec requested) {
+    framing = requested;
   }
 
   public Run lastRun() {

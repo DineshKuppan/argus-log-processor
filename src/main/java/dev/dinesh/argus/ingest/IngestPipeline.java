@@ -158,6 +158,11 @@ public class IngestPipeline {
           finalRun);
     }
 
+    /** {@link #asFinalRun()} when {@code last}, else this run. */
+    public Request finalIf(boolean last) {
+      return last ? asFinalRun() : this;
+    }
+
     /** The same run, the last for its source's lines in this generation. */
     public Request asFinalRun() {
       return new Request(

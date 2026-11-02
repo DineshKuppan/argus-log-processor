@@ -1,7 +1,11 @@
 package dev.dinesh.argus.ingest;
 
+import dev.dinesh.argus.config.FramingProperties;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.PushProperties;
+import dev.dinesh.argus.framing.FramedRecord;
+import dev.dinesh.argus.framing.FramingSpec;
+import dev.dinesh.argus.framing.RecordFramer;
 import dev.dinesh.argus.ingest.PushRejectedException.Reason;
 import dev.dinesh.argus.metrics.ArgusMetrics;
 import dev.dinesh.argus.parser.FormatDetector;
@@ -27,6 +31,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -116,6 +121,8 @@ public class PushIngestService {
   /** Where accepted lines are published, or null for none. */
   private final TailHub tail;
 
+  private final FramingProperties framing;
+
   public PushIngestService(
       StreamRegistry streams,
       IngestPipeline pipeline,
@@ -137,7 +144,8 @@ public class PushIngestService {
       PushProperties props,
       IngestProperties ingest,
       ObjectProvider<ArgusMetrics> metrics,
-      ObjectProvider<TailHub> tail) {
+      ObjectProvider<TailHub> tail,
+      ObjectProvider<FramingProperties> framing) {
     this(
         streams,
         pipeline,
@@ -147,7 +155,8 @@ public class PushIngestService {
         props,
         ingest,
         metrics.getIfAvailable(ArgusMetrics::noop),
-        tail.getIfAvailable());
+        tail.getIfAvailable(),
+        framing.getIfAvailable(() -> FramingProperties.DEFAULTS));
   }
 
   public PushIngestService(
@@ -160,6 +169,35 @@ public class PushIngestService {
       IngestProperties ingest,
       ArgusMetrics metrics,
       TailHub tail) {
+    this(
+        streams,
+        pipeline,
+        quotas,
+        suppressor,
+        parsers,
+        props,
+        ingest,
+        metrics,
+        tail,
+        FramingProperties.DEFAULTS);
+  }
+
+  /**
+   * @param framing how pushed lines join into records; the stream runs frame the spool the same way
+   *     ({@code P7_PLAN.md} D5)
+   */
+  public PushIngestService(
+      StreamRegistry streams,
+      IngestPipeline pipeline,
+      QuotaService quotas,
+      Suppressor suppressor,
+      ParserRegistry parsers,
+      PushProperties props,
+      IngestProperties ingest,
+      ArgusMetrics metrics,
+      TailHub tail,
+      FramingProperties framing) {
+    this.framing = framing;
     this.metrics = metrics;
     this.tail = tail;
     this.streams = streams;
@@ -336,12 +374,14 @@ public class PushIngestService {
   private PushResult spool(PushStream stream, byte[] body, String key, Instant receivedAt)
       throws IOException {
     // Lines are parsed to find their messages (suppression) and, while the tenant has a tail open,
-    // to publish them; otherwise not at all.
+    // to publish them; otherwise not at all. Parsed lines join into records (P7 D5): a record is
+    // suppressed, spooled and tailed whole.
     boolean tailed = tail != null && tail.isWatched(stream.tenantId());
     ParserChain chain = props.suppress() || tailed ? messageChain(stream, body) : null;
+    RecordFramer framer = chain == null ? null : framer(stream);
     List<ParserChain.Parsed> tailLines = tailed ? new ArrayList<>() : null;
     List<String> allowedKeys = new ArrayList<>();
-    Compactor lines = new Compactor(body, stream.tenantId(), tailLines, allowedKeys);
+    Compactor lines = new Compactor(body, stream, tailLines, allowedKeys);
     // Compacts the accepted lines in place: what is written never overtakes what is read.
     for (int start = 0; start < body.length; ) {
       int newline = indexOf(body, (byte) '\n', start);
@@ -352,16 +392,32 @@ public class PushIngestService {
         continue;
       }
       int length = Math.min(end - start, maxLineBytes);
-      String line = null;
-      ParserChain.Parsed parsed = null;
-      if (chain != null) {
+      if (framer == null) {
+        lines.line(start, length, end - start, null);
+        lines.endRecord(null);
+      } else {
         int textLength = length > 0 && body[start + length - 1] == '\r' ? length - 1 : length;
-        line = new String(body, start, textLength, StandardCharsets.UTF_8);
-        parsed = chain.parse(line);
+        String line = new String(body, start, textLength, StandardCharsets.UTF_8);
+        FramedRecord done = framer.offer(line, start, chain.parse(line));
+        if (done != null && done.offset() == start) {
+          // This line is the record (framing none).
+          lines.line(start, length, end - start, line);
+          lines.endRecord(done);
+        } else {
+          // A joining framer completes the record before this line, which this line may start.
+          if (done != null) {
+            lines.endRecord(done);
+          }
+          lines.line(start, length, end - start, framer.lastJoined() ? null : line);
+        }
       }
-      lines.add(
-          start, length, end - start, parsed, props.suppress() ? message(parsed, line) : null);
       start = next;
+    }
+    if (framer != null) {
+      FramedRecord last = framer.flush();
+      if (last != null) {
+        lines.endRecord(last);
+      }
     }
     lines.flush();
     byte[] out = lines.out;
@@ -370,12 +426,18 @@ public class PushIngestService {
     int suppressed = lines.suppressed;
     int truncated = lines.truncated;
     StreamSpool.Append append;
-    try {
-      append = stream.spool().append(out, written, key, receivedAt);
-    } catch (IOException | RuntimeException e) {
-      // Nothing was spooled: the client retries, and its lines must not be suppressed as copies.
-      suppressor.release(allowedKeys);
-      throw e;
+    // With the append, so the next request on the stream sees this one's last decision.
+    synchronized (stream) {
+      try {
+        append = stream.spool().append(out, written, key, receivedAt);
+      } catch (IOException | RuntimeException e) {
+        // Nothing was spooled: the client retries, and its lines must not be suppressed as copies.
+        suppressor.release(allowedKeys);
+        throw e;
+      }
+      if (!append.duplicate() && lines.lastAllowed != null) {
+        stream.lastRecordAllowed = lines.lastAllowed;
+      }
     }
     if (append.duplicate()) {
       suppressor.release(allowedKeys);
@@ -397,6 +459,12 @@ public class PushIngestService {
         append.endOffset(),
         false,
         receivedAt);
+  }
+
+  /** The stream's framing for one request; the stream run frames the spool the same way. */
+  private RecordFramer framer(PushStream stream) {
+    FramingSpec spec = stream.framing() != null ? stream.framing() : framing.defaultSpec();
+    return spec.framer(framing.limits());
   }
 
   private static PushResult duplicate(PushStream stream, StreamSpool.Append original) {
@@ -446,21 +514,37 @@ public class PushIngestService {
 
   /**
    * Compacts a request's accepted lines in place, deciding suppression {@value #SUPPRESS_BATCH}
-   * lines at a time: one store round trip per batch (one pipelined Redis call, P6 D11), while the
-   * messages held stay bounded.
+   * records at a time: one store round trip per batch (one pipelined Redis call, P6 D11), while the
+   * messages held stay bounded. A record's lines are kept or dropped together (P7 D5).
    */
   private final class Compactor {
     final byte[] body;
     final String tenantId;
     final List<ParserChain.Parsed> tailLines;
     final List<String> allowedKeys;
-    final int[] starts = new int[SUPPRESS_BATCH];
-    final int[] lengths = new int[SUPPRESS_BATCH];
-    final int[] spans = new int[SUPPRESS_BATCH];
+
+    /** The stream's last decision before this request: leading continuation lines follow it. */
+    final Boolean previousAllowed;
+
+    // The lines of the records awaiting a decision, then of the open record.
+    int[] starts = new int[SUPPRESS_BATCH];
+    int[] lengths = new int[SUPPRESS_BATCH];
+    int[] spans = new int[SUPPRESS_BATCH];
+    int lineCount;
+
+    // The records awaiting a decision.
+    final int[] recordEnd = new int[SUPPRESS_BATCH];
     final int[] messageAt = new int[SUPPRESS_BATCH];
+    final Boolean[] forced = new Boolean[SUPPRESS_BATCH];
     final ParserChain.Parsed[] parsed = new ParserChain.Parsed[SUPPRESS_BATCH];
     final List<String> messages = new ArrayList<>();
-    int pending;
+    int records;
+
+    /** The open record's first line, for a record without a message. */
+    String headLine;
+
+    boolean first = true;
+    Boolean lastAllowed;
     byte[] out;
     int written;
     int accepted;
@@ -469,59 +553,102 @@ public class PushIngestService {
 
     Compactor(
         byte[] body,
-        String tenantId,
+        PushStream stream,
         List<ParserChain.Parsed> tailLines,
         List<String> allowedKeys) {
       this.body = body;
       this.out = body;
-      this.tenantId = tenantId;
+      this.tenantId = stream.tenantId();
+      this.previousAllowed = stream.lastRecordAllowed;
       this.tailLines = tailLines;
       this.allowedKeys = allowedKeys;
     }
 
     /**
-     * A line of {@code length} bytes kept of its {@code span}; {@code message} null: not judged.
+     * A line of the open record, {@code length} bytes kept of its {@code span}.
+     *
+     * @param text the line when it starts a record, else null
      */
-    void add(int start, int length, int span, ParserChain.Parsed line, String message) {
-      starts[pending] = start;
-      lengths[pending] = length;
-      spans[pending] = span;
-      parsed[pending] = line;
-      messageAt[pending] = message == null ? -1 : messages.size();
-      if (message != null) {
-        messages.add(message);
+    void line(int start, int length, int span, String text) {
+      if (lineCount == starts.length) {
+        starts = Arrays.copyOf(starts, lineCount * 2);
+        lengths = Arrays.copyOf(lengths, lineCount * 2);
+        spans = Arrays.copyOf(spans, lineCount * 2);
       }
-      if (++pending == SUPPRESS_BATCH) {
+      starts[lineCount] = start;
+      lengths[lineCount] = length;
+      spans[lineCount] = span;
+      lineCount++;
+      if (text != null) {
+        headLine = text;
+      }
+    }
+
+    /** The lines since the last record's end are {@code record}; null: kept without judging. */
+    void endRecord(FramedRecord record) {
+      int r = records;
+      recordEnd[r] = lineCount;
+      parsed[r] = record == null ? null : record.parsed();
+      forced[r] = null;
+      messageAt[r] = -1;
+      if (record != null) {
+        Map<String, Object> meta = record.parsed().record().getMeta();
+        if (first && RecordFramer.ORPHAN.equals(meta.get(RecordFramer.FRAMING_ATTRIBUTE))) {
+          // Continues the previous request's last record: follows its decision. Unknown (a
+          // restart): kept, as suppression fails open.
+          meta.put(RecordFramer.FRAMING_ATTRIBUTE, RecordFramer.CONTINUED);
+          forced[r] = previousAllowed != Boolean.FALSE;
+        } else if (props.suppress()) {
+          String message = message(record.parsed(), headLine);
+          if (message != null) {
+            messageAt[r] = messages.size();
+            messages.add(message);
+          }
+        }
+      }
+      first = false;
+      if (++records == SUPPRESS_BATCH) {
         flush();
       }
     }
 
+    /** Decides and compacts the records ended so far (called only at a record's end). */
     void flush() {
       List<SuppressionDecision> decisions =
           messages.isEmpty() ? List.of() : suppressor.checkAll(tenantId, messages, allowedKeys);
-      for (int i = 0; i < pending; i++) {
-        if (messageAt[i] >= 0 && !decisions.get(messageAt[i]).allowed()) {
-          suppressed++;
+      int i = 0;
+      for (int r = 0; r < records; r++) {
+        boolean allowed =
+            forced[r] != null
+                ? forced[r]
+                : messageAt[r] < 0 || decisions.get(messageAt[r]).allowed();
+        lastAllowed = allowed;
+        if (!allowed) {
+          suppressed += recordEnd[r] - i;
+          i = recordEnd[r];
           continue;
         }
-        if (tailLines != null && parsed[i] != null) {
-          tailLines.add(parsed[i]);
+        if (tailLines != null && parsed[r] != null) {
+          tailLines.add(parsed[r]);
         }
-        if (lengths[i] < spans[i]) {
-          truncated++;
+        for (; i < recordEnd[r]; i++) {
+          if (lengths[i] < spans[i]) {
+            truncated++;
+          }
+          if (written + lengths[i] + 1 > out.length) {
+            // Only the last line can lack its newline, and only it can need one more byte.
+            out = Arrays.copyOf(out, written + lengths[i] + 1);
+          }
+          System.arraycopy(body, starts[i], out, written, lengths[i]);
+          written += lengths[i];
+          out[written++] = '\n';
+          accepted++;
         }
-        if (written + lengths[i] + 1 > out.length) {
-          // Only the last line can lack its newline, and only it can need one more byte.
-          out = Arrays.copyOf(out, written + lengths[i] + 1);
-        }
-        System.arraycopy(body, starts[i], out, written, lengths[i]);
-        written += lengths[i];
-        out[written++] = '\n';
-        accepted++;
       }
-      Arrays.fill(parsed, 0, pending, null);
+      Arrays.fill(parsed, 0, records, null);
       messages.clear();
-      pending = 0;
+      records = 0;
+      lineCount = 0;
     }
   }
 

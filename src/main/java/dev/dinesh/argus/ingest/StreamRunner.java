@@ -173,6 +173,9 @@ public class StreamRunner implements SmartLifecycle {
     return running;
   }
 
+  /** Set by {@link #drain}: every run then reads its spool to the end (P7 D3). */
+  private volatile boolean draining;
+
   /**
    * Ingests every stream's spool to its end, ignoring {@code flush-interval}, until nothing is left
    * or {@code timeout} passes (P6 D12: on shutdown, so the lines are in the WAL before the instance
@@ -182,6 +185,7 @@ public class StreamRunner implements SmartLifecycle {
    */
   public boolean drain(Duration timeout) {
     long deadline = System.nanoTime() + timeout.toNanos();
+    draining = true;
     synchronized (this) {
       if (running) {
         scanner.shutdownNow();
@@ -314,13 +318,15 @@ public class StreamRunner implements SmartLifecycle {
       outcome =
           pipeline.run(
               new Request(
-                  stream.tenantId(),
-                  claim.path(),
-                  stream.streamId(),
-                  false,
-                  stream.parser(),
-                  claim.endOffset(),
-                  true),
+                      stream.tenantId(),
+                      claim.path(),
+                      stream.streamId(),
+                      false,
+                      stream.parser(),
+                      claim.endOffset(),
+                      true)
+                  .withFraming(stream.framing())
+                  .finalIf(claim.sealed() || draining),
               progress,
               stopping);
       return outcome;

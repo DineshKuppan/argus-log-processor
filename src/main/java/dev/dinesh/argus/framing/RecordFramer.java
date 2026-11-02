@@ -26,6 +26,12 @@ public interface RecordFramer {
 
   String ORPHAN = "orphan";
 
+  /**
+   * {@value #CONTINUED} on a pushed record whose lines continue the stream's previous request's
+   * last record: it follows that record's suppression decision ({@code P7_PLAN.md} D5).
+   */
+  String CONTINUED = "continued";
+
   /** OpenTelemetry's semantic convention for an exception's class name. */
   String EXCEPTION_TYPE_ATTRIBUTE = "exception.type";
 

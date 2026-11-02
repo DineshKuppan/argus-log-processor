@@ -12,6 +12,7 @@ import dev.dinesh.argus.checkpoint.CheckpointStore;
 import dev.dinesh.argus.config.IngestProperties;
 import dev.dinesh.argus.config.PushProperties;
 import dev.dinesh.argus.config.QuotaProperties;
+import dev.dinesh.argus.framing.FramingSpec;
 import dev.dinesh.argus.ingest.PushIngestService.PushRequest;
 import dev.dinesh.argus.ingest.PushIngestService.PushResult;
 import dev.dinesh.argus.ingest.PushRejectedException.Reason;
@@ -270,6 +271,87 @@ class PushIngestServiceTest {
     assertEquals(900, result.accepted());
     assertEquals(lines - 900, result.suppressed());
     assertEquals(kept.toString(), spooled("acme"));
+  }
+
+  private static PushRequest kv(String body) {
+    byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+    return new PushRequest(
+        "acme", "app", new ByteArrayInputStream(bytes), null, bytes.length, null, "kv", null);
+  }
+
+  private static final String HEAD = "level=ERROR msg=failed\n";
+  private static final String EXCEPTION = "java.lang.IllegalStateException: boom\n";
+  private static final String FRAME_1 = "\tat a.B.c(B.java:1)\n";
+  private static final String FRAME_2 = "\tat a.B.d(B.java:2)\n";
+
+  /** P7 D5: a stack trace is one record, suppressed whole, so a stored trace has no holes. */
+  @Test
+  void aRepeatedTraceIsSuppressedAsOneRecordAndADifferentTraceIsKept() throws IOException {
+    PushIngestService service = service();
+
+    PushResult first = service.push(kv(HEAD + EXCEPTION + FRAME_1));
+    PushResult copy = service.push(kv(HEAD + EXCEPTION + FRAME_1));
+    PushResult other = service.push(kv(HEAD + EXCEPTION + FRAME_2));
+
+    assertEquals(3, first.accepted());
+    assertEquals(0, copy.accepted());
+    assertEquals(3, copy.suppressed(), "every line of the copy, not frame by frame");
+    assertEquals(3, other.accepted(), "the same message with another trace is another record");
+    assertEquals(HEAD + EXCEPTION + FRAME_1 + HEAD + EXCEPTION + FRAME_2, spooled("acme"));
+  }
+
+  @Test
+  void framesThatStartARequestFollowTheDecisionOnTheRecordTheyContinue() throws IOException {
+    PushIngestService service = service();
+
+    service.push(kv(HEAD + EXCEPTION));
+    PushResult continued = service.push(kv(FRAME_1 + FRAME_2 + "level=INFO msg=next\n"));
+    PushResult copy = service.push(kv(HEAD + EXCEPTION));
+    PushResult afterCopy = service.push(kv(FRAME_1 + "level=INFO msg=after\n"));
+
+    assertEquals(3, continued.accepted());
+    assertEquals(0, continued.suppressed(), "frames of a kept record aren't judged as copies");
+    assertEquals(2, copy.suppressed());
+    assertEquals(1, afterCopy.accepted());
+    assertEquals(1, afterCopy.suppressed(), "frames of a suppressed record are dropped with it");
+    assertEquals(
+        HEAD + EXCEPTION + FRAME_1 + FRAME_2 + "level=INFO msg=next\n" + "level=INFO msg=after\n",
+        spooled("acme"));
+  }
+
+  @Test
+  void aTraceIsTailedAsOneEvent() throws IOException {
+    PushIngestService service = service();
+
+    service.push(kv(HEAD + EXCEPTION + FRAME_1 + "level=INFO msg=next\n"));
+
+    assertEquals(
+        List.of("failed\njava.lang.IllegalStateException: boom\n\tat a.B.c(B.java:1)", "next"),
+        tail.bodies());
+  }
+
+  @Test
+  void aNewStreamThatStartsWithFramesKeepsThem() throws IOException {
+    PushIngestService service = service();
+
+    PushResult result = service.push(kv(FRAME_1 + FRAME_1));
+
+    assertEquals(2, result.accepted());
+    assertEquals(FRAME_1 + FRAME_1, spooled("acme"));
+  }
+
+  @Test
+  void framingNoneDecidesEveryLineOnItsOwn() throws IOException {
+    PushIngestService service = service();
+    registry.getOrCreate("acme", "app").useFraming(FramingSpec.NONE);
+
+    service.push(kv(HEAD + EXCEPTION + FRAME_1));
+    PushResult copy = service.push(kv(HEAD + EXCEPTION + FRAME_1));
+
+    assertEquals(3, copy.suppressed(), "each line is a copy of a line of the first request");
+    PushResult frame = service.push(kv("level=INFO msg=x\n" + FRAME_1));
+    assertEquals(1, frame.accepted());
+    assertEquals(1, frame.suppressed(), "line by line, as before P7");
   }
 
   @Test
